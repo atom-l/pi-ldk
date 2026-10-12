@@ -6,9 +6,12 @@
  *    销毁时用 process.kill(-pid) 一次性结束整棵进程树:既不会误杀 pi 自身所在的
  *    进程组,也不会留下孤儿 / 僵尸进程。
  *  - 命令通过 stdin 逐行喂给同一个常驻 shell 进程,因此 cwd / 环境变量 / shell
- *    状态在多次命令之间保持(等价于一个持久终端)。
+ *    状态在多次命令之间保持(等价于一个持久终端)。非交互式 shell 从管道 stdin
+ *    逐行读取并执行,`cd` 等状态在同一进程内跨行保留。
  *  - 输出(stdout/stderr)实时汇入一个有界缓冲区;折叠时进程与缓冲区继续运行,
  *    重新打开即可看到折叠期间累积的输出。
+ *  - 兜底:每个进程实例注册一次 `process.on("exit")`,对仍存活的进程组发
+ *    SIGKILL,保证 pi 无论以何种方式退出都不遗留孤儿进程。
  *
  * 说明:这是「面向执行命令的行式终端」,不是完整 VT 终端仿真器(未引入 PTY/终端
  * 仿真库)。适合跑构建 / 开发服务 / git 等命令并持续观察输出;全屏交互式程序
@@ -30,6 +33,25 @@ export interface ShellSessionOptions {
 const MAX_BUFFER_LINES = 5000;
 /** 先 SIGTERM、超过该时间仍未退出则 SIGKILL 的宽限期。 */
 const KILL_GRACE_MS = 1500;
+
+/**
+ * 本模块加载到的所有存活会话。用于进程退出时兜底清理。
+ * 每次扩展(重新)加载都会得到一个新集合与一个新的 exit 钩子;
+ * 旧钩子仍持有旧集合,因此 reload 后旧一代进程也会在退出时被清理。
+ */
+const liveSessions = new Set<ShellSession>();
+let exitHooked = false;
+
+function trackSession(session: ShellSession): void {
+	liveSessions.add(session);
+	if (!exitHooked) {
+		exitHooked = true;
+		// 'exit' 钩子里只能做同步操作:process.kill 是同步的。
+		process.on("exit", () => {
+			for (const s of liveSessions) s.killNow();
+		});
+	}
+}
 
 export class ShellSession {
 	readonly name: string;
@@ -64,14 +86,15 @@ export class ShellSession {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.pid = this.child.pid;
+		trackSession(this);
 
-		this.pushLine(`[终端 ${this.name}] pid=${this.pid ?? "?"} · shell=${this.shell} · cwd=${this.cwd}`);
-		this.pushLine(`[提示] 折叠(进程继续运行)=Esc,销毁(终止进程)=Ctrl+X`);
+		this.appendLine(`[终端 ${this.name}] pid=${this.pid ?? "?"} · shell=${this.shell} · cwd=${this.cwd}`);
+		this.appendLine(`[提示] Esc=折叠(进程继续运行) · Ctrl+X=销毁(终止进程) · Ctrl+C=中断`);
 
 		this.child.stdout.on("data", (chunk: Buffer) => this.ingest(chunk.toString()));
 		this.child.stderr.on("data", (chunk: Buffer) => this.ingest(chunk.toString()));
 		this.child.on("error", (err) => {
-			this.pushLine(`[shell 启动失败] ${err.message}`);
+			this.appendLine(`[shell 启动失败] ${err.message}`);
 			this.status = "exited";
 			this.onOutput?.();
 		});
@@ -84,7 +107,8 @@ export class ShellSession {
 				clearTimeout(this.killTimer);
 				this.killTimer = null;
 			}
-			this.pushLine(`[进程已退出] ${signal ? `signal=${signal}` : `code=${code}`}`);
+			liveSessions.delete(this);
+			this.appendLine(`[进程已退出] ${signal ? `signal=${signal}` : `code=${code}`}`);
 			this.onOutput?.();
 		});
 	}
@@ -98,20 +122,30 @@ export class ShellSession {
 			let line = this.pending.slice(0, idx);
 			this.pending = this.pending.slice(idx + 1);
 			if (line.endsWith("\r")) line = line.slice(0, -1);
-			this.pushLine(line);
+			this.appendLine(line);
 		}
-		// 未换行的片段(如进度条)也即时可见:先塞一个临时行不划算,故只触发重绘。
+		// 未换行的片段(如 printf 无换行、进度条)保留在 pending,由 getView 作为
+		// 最后一行实时显示;后续到达的文本继续拼接,直到遇到换行才落为完整行。
 		this.onOutput?.();
 	}
 
 	private flushPending(): void {
 		if (this.pending) {
-			this.pushLine(this.pending);
+			this.appendLine(this.pending);
 			this.pending = "";
 		}
 	}
 
-	private pushLine(line: string): void {
+	/**
+	 * 公开 flush:把未换行的残留片段落为完整一行。
+	 * 在发送下一条命令前调用,避免上一条的无换行输出与下一条输出拼接串行。
+	 */
+	flush(): void {
+		this.flushPending();
+	}
+
+	/** 追加一行到缓冲(公开,供命令回显等外部注记使用)。 */
+	appendLine(line: string): void {
 		this.lines.push(line);
 		if (this.lines.length > MAX_BUFFER_LINES) {
 			this.lines.splice(0, this.lines.length - MAX_BUFFER_LINES);
@@ -121,21 +155,37 @@ export class ShellSession {
 	/** 清空可见缓冲(不重启进程),对应 Ctrl+L。 */
 	clear(): void {
 		this.lines = [];
+		this.pending = "";
 	}
 
-	/** 取距离末尾 fromEnd 处往上 rows 行的窗口(用于滚动回看)。 */
+	/**
+	 * 取距离末尾 fromEnd 处往上 rows 行的窗口(用于滚动回看)。
+	 * 贴底(fromEnd<=0)时把未换行的 pending 片段作为临时末行一并显示。
+	 */
 	getView(fromEnd: number, rows: number): string[] {
+		const atBottom = fromEnd <= 0;
 		const end = Math.max(0, this.lines.length - Math.max(0, fromEnd));
 		const start = Math.max(0, end - rows);
-		return this.lines.slice(start, end);
+		const view = this.lines.slice(start, end);
+		if (atBottom && this.pending) view.push(this.pending);
+		return view;
 	}
 
 	// -- 输入 / 进程控制 -----------------------------------------------------
 
-	/** 向 shell 追加一行命令执行。 */
-	send(text: string): void {
-		if (this.status !== "running" || !this.child.stdin.writable) return;
-		this.child.stdin.write(`${text}\n`);
+	/**
+	 * 向 shell 追加一行命令执行。返回是否成功送达(false = 进程已退出/不可写)。
+	 * 发送前先 flush 残留片段,保证不同命令的输出不拼接。
+	 */
+	send(text: string): boolean {
+		this.flushPending();
+		if (this.status !== "running" || !this.child.stdin.writable) return false;
+		try {
+			this.child.stdin.write(`${text}\n`);
+			return true;
+		} catch {
+			return false;
+		}
 	}
 
 	/** 向前台进程组发 SIGINT(对应 Ctrl+C)。 */
@@ -177,6 +227,7 @@ export class ShellSession {
 	dispose(): void {
 		if (this.disposed) return;
 		this.disposed = true;
+		liveSessions.delete(this);
 		if (this.killTimer) {
 			clearTimeout(this.killTimer);
 			this.killTimer = null;

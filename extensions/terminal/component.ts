@@ -5,7 +5,8 @@
  *   输出缓冲窗口(滚动回看) + 输入行(带光标) + 状态/帮助栏
  *
  * 按键:
- *   Enter          执行当前输入行
+ *   Enter          执行当前输入行(命令会回显进输出缓冲,便于对照结果)
+ *   ← / →          按码点移动光标(不拆散 emoji / 代理对)
  *   ↑ / ↓          历史命令
  *   PgUp / PgDn    滚动回看输出
  *   Ctrl+C         中断前台进程组 (SIGINT)
@@ -13,6 +14,7 @@
  *   Esc            折叠(进程继续运行,返回 pi 会话)
  *   Ctrl+X         销毁(需再按一次确认,终止进程组并清理会话)
  *   其余可打印字符 / 粘贴文本 → 进入输入行;含换行的粘贴逐行执行
+ *   未识别的控制 / 转义序列(如 Ctrl+← = \x1b[1;5D)整体忽略,不污染输入行
  */
 
 import type { Theme } from "@earendil-works/pi-coding-agent";
@@ -31,13 +33,17 @@ import type { ShellSession } from "./shell.ts";
 /** 折叠 / 销毁 两种结束交互的方式。 */
 export type TerminalAction = "fold" | "destroy";
 
-/** 输出窗口行数(不含输入行与帮助栏)。 */
+/** 输出窗口行数(不含分隔线、输入行与帮助栏)。 */
 const OUTPUT_ROWS = 18;
+
+/** 含控制字符 / 转义序列的输入(非纯可打印文本)。 */
+const CONTROL_OR_ESC = /[\x00-\x1f\x7f]/;
 
 export class TerminalComponent implements Component, Focusable {
 	focused = true;
 
 	private input = "";
+	/** 光标位置(UTF-16 码元下标)。 */
 	private cursor = 0;
 	private history: string[] = [];
 	private historyPos: number | null = null;
@@ -59,8 +65,9 @@ export class TerminalComponent implements Component, Focusable {
 		const lines: string[] = [];
 
 		// 输出窗口
-		const view = this.session.getView(this.scroll, OUTPUT_ROWS);
-		for (const raw of view) lines.push(truncateToWidth(raw, width));
+		for (const raw of this.session.getView(this.scroll, OUTPUT_ROWS)) {
+			lines.push(truncateToWidth(raw, width));
+		}
 
 		// 分隔 + 输入行(带光标标记,供 TUI 定位硬件光标 / IME)
 		lines.push(this.theme.style("─".repeat(Math.max(0, Math.min(width, 80))), { fg: "muted" }));
@@ -100,7 +107,7 @@ export class TerminalComponent implements Component, Focusable {
 				: this.theme.style(`■已退出(${this.session.exitSignal ?? this.session.exitCode ?? "?"})`, { fg: "muted" });
 		const scrollHint = this.scroll > 0 ? this.theme.style(` 回看-${this.scroll}行 `, { fg: "warning" }) : "";
 		const help = this.theme.style(
-			" Enter=执行 ↑↓=历史 PgUp/PgDn=滚动 Ctrl+C=中断 Ctrl+L=清屏 Esc=折叠 Ctrl+X=销毁 ",
+			" Enter=执行 ←→=光标 ↑↓=历史 PgUp/PgDn=滚动 Ctrl+C=中断 Ctrl+L=清屏 Esc=折叠 Ctrl+X=销毁 ",
 			{ fg: "muted" },
 		);
 		return truncateToWidth(`${st} ${this.session.name}${scrollHint} ${help}`, width);
@@ -175,12 +182,12 @@ export class TerminalComponent implements Component, Focusable {
 			return;
 		}
 		if (matchesKey(data, "left")) {
-			this.cursor = Math.max(0, this.cursor - 1);
+			this.cursor = this.prevCursor(this.cursor);
 			this.tui.requestRender();
 			return;
 		}
 		if (matchesKey(data, "right")) {
-			this.cursor = Math.min(this.input.length, this.cursor + 1);
+			this.cursor = this.nextCursor(this.cursor);
 			this.tui.requestRender();
 			return;
 		}
@@ -230,6 +237,10 @@ export class TerminalComponent implements Component, Focusable {
 			return;
 		}
 
+		// 未识别的控制 / 转义序列(Ctrl+← = \x1b[1;5D 等):整体忽略。
+		// 否则 insert 会剥掉 ESC 后把序列残片(如 "1;5D")插进输入行。
+		if (CONTROL_OR_ESC.test(data)) return;
+
 		// 可打印文本
 		this.insert(data);
 		this.tui.requestRender();
@@ -248,22 +259,33 @@ export class TerminalComponent implements Component, Focusable {
 		this.historyPos = null;
 	}
 
-	private backspace(): void {
-		if (this.cursor <= 0) return;
-		const before = this.input.slice(0, this.cursor);
+	/** 上一个码点起点(不拆散代理对)。 */
+	private prevCursor(pos: number): number {
+		if (pos <= 0) return 0;
+		const before = this.input.slice(0, pos);
 		const chars = Array.from(before);
 		const last = chars.pop();
-		const removeLen = last ? last.length : 1;
-		this.input = before.slice(0, this.cursor - removeLen) + this.input.slice(this.cursor);
-		this.cursor -= removeLen;
+		return pos - (last ? last.length : 1);
+	}
+
+	/** 下一个码点终点。 */
+	private nextCursor(pos: number): number {
+		if (pos >= this.input.length) return this.input.length;
+		const cp = Array.from(this.input.slice(pos))[0];
+		return pos + (cp ? cp.length : 1);
+	}
+
+	private backspace(): void {
+		if (this.cursor <= 0) return;
+		const target = this.prevCursor(this.cursor);
+		this.input = this.input.slice(0, target) + this.input.slice(this.cursor);
+		this.cursor = target;
 	}
 
 	private deleteForward(): void {
 		if (this.cursor >= this.input.length) return;
-		const after = this.input.slice(this.cursor);
-		const first = Array.from(after)[0];
-		const removeLen = first ? first.length : 1;
-		this.input = this.input.slice(0, this.cursor) + after.slice(removeLen);
+		const target = this.nextCursor(this.cursor);
+		this.input = this.input.slice(0, this.cursor) + this.input.slice(target);
 	}
 
 	private submit(): void {
@@ -278,7 +300,16 @@ export class TerminalComponent implements Component, Focusable {
 		}
 		if (this.history[this.history.length - 1] !== cmd) this.history.push(cmd);
 		if (this.history.length > 500) this.history.shift();
-		this.session.send(cmd);
+
+		// 先落盘上一条命令的无换行残留输出,再回显本条命令,
+		// 保证「残留片段 → 命令回显 → 本条输出」的顺序正确。
+		this.session.flush();
+		this.session.appendLine(`${this.shortCwd()} $ ${cmd}`);
+		if (!this.session.send(cmd)) {
+			// 进程已退出 / stdin 不可写:给出反馈而非静默丢弃。
+			this.session.appendLine(`[无法执行] 终端进程已退出,请销毁后重新打开`);
+		}
+		this.tui.requestRender();
 	}
 
 	private historyPrev(): void {

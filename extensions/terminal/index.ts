@@ -48,9 +48,17 @@ export default function (pi: ExtensionAPI) {
 		sessions.clear();
 	});
 
+	// /term 与 /terminal 共用同一处理逻辑。
 	pi.registerCommand("term", {
 		description: "呼出一个可折叠/销毁的终端 (term [open|new|list|destroy|help] [name])",
-		handler: async (raw: string, ctx: ExtensionCommandContext) => {
+		handler: termHandler,
+	});
+	pi.registerCommand("terminal", {
+		description: "同 /term:呼出可折叠/销毁的终端",
+		handler: termHandler,
+	});
+
+	async function termHandler(raw: string, ctx: ExtensionCommandContext): Promise<void> {
 			const { cmd, name } = parseArgs(raw);
 
 			switch (cmd) {
@@ -104,14 +112,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 			}
-		},
-	});
-
-	// 别名
-	pi.registerCommand("terminal", {
-		description: "同 /term",
-		handler: async (raw: string, ctx: ExtensionCommandContext) => ctx.ui.notify("请使用 /term", "info"),
-	});
+	}
 
 	async function pickSession(ctx: ExtensionCommandContext, title: string): Promise<string | undefined> {
 		const names = [...sessions.keys()];
