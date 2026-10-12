@@ -14,23 +14,22 @@
 
 ## 安装
 
-从本地路径安装：
+从远端仓库安装：
 
 ```bash
-pi install ./pi-ldk
+pi install git:github.com/atom-l/pi-ldk
+```
+
+可以指定版本 / 分支 / 提交（`git:<repo>@<ref>`）：
+
+```bash
+pi install git:github.com/atom-l/pi-ldk@main
 ```
 
 或者只在单次调用中试用，不写入 settings：
 
 ```bash
-pi -e ./pi-ldk
-```
-
-发布后可从 npm / git 安装：
-
-```bash
-pi install npm:ldk@0.1.0
-pi install git:github.com/<owner>/ldk@v0.1.0
+pi -e git:github.com/atom-l/pi-ldk
 ```
 
 ## 只加载部分扩展
@@ -41,7 +40,7 @@ pi install git:github.com/<owner>/ldk@v0.1.0
 {
   "packages": [
     {
-      "source": "./pi-ldk",
+      "source": "git:github.com/atom-l/pi-ldk",
       "extensions": ["extensions/sessions.ts", "extensions/image-gen"]
     }
   ]
