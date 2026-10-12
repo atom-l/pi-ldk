@@ -1,0 +1,28 @@
+{
+  "name": "ldk",
+  "version": "0.1.0",
+  "description": "LDK — a PI package bundling custom extensions (session commands, model attribution, MCP adapter, image generation).",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "extensions",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/mcp-adapter.ts",
+      "./extensions/model-attribution.ts",
+      "./extensions/sessions.ts",
+      "./extensions/image-gen"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
