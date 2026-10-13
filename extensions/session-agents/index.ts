@@ -480,9 +480,11 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		rebuildFromSession(ctx);
 		ensureStore();
+		updateModeStatus(ctx);
 	});
 	pi.on("session_tree", (_event, ctx) => {
 		rebuildFromSession(ctx);
+		updateModeStatus(ctx);
 	});
 	pi.on("session_shutdown", () => {
 		roles.clear();
@@ -530,11 +532,40 @@ export default function (pi: ExtensionAPI) {
 
 	// -- /agent-mode 命令 ----------------------------------------------------
 
+	/** 选项展示文本(选择器用)。 */
+	const MODE_LABELS: Record<WorkMode, string> = {
+		off: "off · 无 agent:在当前会话里线性完成任务",
+		agent: "agent · 积极拆解规划,用 agent/subsession 协作",
+		auto: "auto · 按任务复杂度自动决定(默认)",
+	};
+	const MODE_ORDER: WorkMode[] = ["off", "agent", "auto"];
+	/** 各模式切换后的说明(通知用)。 */
+	const MODE_DESC: Record<WorkMode, string> = {
+		off: "不再使用 agent/subsession,在当前会话里线性完成任务",
+		agent: "积极拆解任务并使用 agent/subsession 协作",
+		auto: "按任务复杂度自动决定是否使用 agent/subsession",
+	};
+
+	/** 把当前模式写入底栏状态位(非交互模式无底栏,静默忽略)。 */
+	function updateModeStatus(ctx: { ui?: { setStatus?: (key: string, text: string | undefined) => void } }): void {
+		try {
+			ctx.ui?.setStatus?.("agent-mode", `agent-mode:${workMode}`);
+		} catch {
+			/* 忽略 */
+		}
+	}
+
 	async function modeHandler(raw: string, ctx: ExtensionCommandContext): Promise<void> {
-		const wanted = normalizeMode(raw);
+		let wanted = normalizeMode(raw);
 		if (!wanted) {
-			ctx.ui.notify(`当前工作模式:${workMode}。用法:/agent-mode off|agent|auto`, "info");
-			return;
+			if (raw.trim()) ctx.ui.notify(`无法识别模式 "${raw.trim()}",请从选项中选择`, "warning");
+			// 弹出选项让用户切换,而非要求手动输入参数。
+			const options = MODE_ORDER.map((m) => `${m === workMode ? "▸ " : "  "}${MODE_LABELS[m]}`);
+			const pick = await ctx.ui.select(`切换工作模式(当前:${workMode})`, options);
+			if (!pick) return;
+			const idx = options.indexOf(pick);
+			wanted = idx >= 0 ? MODE_ORDER[idx] : undefined;
+			if (!wanted) return;
 		}
 		workMode = wanted;
 		persist({ op: "mode_set", mode: wanted });
@@ -544,17 +575,12 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			/* 旧版宿主可能无此 API,忽略:tool_call 拦截仍然生效 */
 		}
-		const desc =
-			wanted === "off"
-				? "不再使用 agent/subsession,在当前会话里线性完成任务"
-				: wanted === "agent"
-					? "积极拆解任务并使用 agent/subsession 协作"
-					: "按任务复杂度自动决定是否使用 agent/subsession";
-		ctx.ui.notify(`工作模式已切换为 ${wanted}:${desc}`, "info");
+		updateModeStatus(ctx);
+		ctx.ui.notify(`工作模式已切换为 ${wanted}:${MODE_DESC[wanted]}`, "info");
 	}
 
 	pi.registerCommand("agent-mode", {
-		description: "切换 agent 工作模式:off(无agent)/ agent(积极协作)/ auto(自适应,默认)",
+		description: "切换 agent 工作模式(off/agent/auto):弹出选项选择;也可 /agent-mode <模式> 直接指定",
 		handler: modeHandler,
 	});
 	pi.registerCommand("amode", {

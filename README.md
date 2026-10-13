@@ -122,11 +122,15 @@ agent 们的**公共桌面**。任务上下文(目标、验收、背景数据、
 | `auto` | **自适应模式**(新会话默认):根据任务与问题的复杂度,自行决定是否使用 agent |
 
 ```
-/agent-mode off     # 无 agent:线性完成任务
-/agent-mode agent   # 积极拆解协作
-/agent-mode auto    # 按复杂度自适应(默认)
-/agent-mode         # 不带参数 → 显示当前模式与用法
+/agent-mode         # 弹出选项选择(推荐:上下键选中即切)
+/agent-mode off     # 也支持直接指定:无 agent,线性完成任务
+/agent-mode agent   # 直接指定:积极拆解协作
+/agent-mode auto    # 直接指定:按复杂度自适应(默认)
 ```
+
+**当前模式常驻底栏**:以 `agent-mode:off|agent|auto` 显示在状态栏,随时可见;切换、
+resume、分支切换后自动同步。`/agent-mode` 不带参数时弹出选项列表(当前项带 ▸ 标记),
+选中即切换;也可直接传参数用于脚本 / 快捷方式;参数无法识别时回退到选项列表。
 
 三层保障确保模式真正生效:
 
