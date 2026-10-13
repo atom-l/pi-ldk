@@ -24,6 +24,7 @@ import type {
 	AgentToolResult,
 	CustomEntry,
 	ExtensionAPI,
+	ExtensionCommandContext,
 	ExtensionContext,
 	ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
@@ -52,6 +53,72 @@ const LOG_ENTRY_CHARS = 1_500;
 const DESK_ENTRY_CHARS = 400;
 
 const DESK_SECTIONS = ["findings", "decisions", "issues", "open", "artifacts", "notes"] as const;
+
+// ---------------------------------------------------------------------------
+// 工作模式
+// ---------------------------------------------------------------------------
+
+/**
+ * 工作模式:调节模型使用 agent / subsession 的积极性。
+ *   - off  : 无 agent 模式,在当前会话里线性完成任务,不派发给角色 agent;
+ *   - agent: 积极拆解规划,优先用 agent_* + subsession_* 协作;
+ *   - auto : 按任务复杂度自行判断(新会话默认)。
+ */
+export type WorkMode = "off" | "agent" | "auto";
+
+const WORK_MODES: readonly WorkMode[] = ["off", "agent", "auto"];
+const DEFAULT_WORK_MODE: WorkMode = "auto";
+
+/** off 模式下禁用的工具(即「agent 功能」;insight_* 记忆检索不受影响)。 */
+const AGENT_TOOLS: readonly string[] = [
+	"agent_create",
+	"agent_update",
+	"agent_list",
+	"agent_discard",
+	"subsession_create",
+	"subsession_run",
+	"subsession_finish",
+	"subsession_get",
+	"subsession_discard",
+];
+
+/** 归一化模式名(接受若干常见别名);无法识别返回 undefined。 */
+function normalizeMode(raw: string | undefined): WorkMode | undefined {
+	const v = (raw ?? "").trim().toLowerCase();
+	if (!v) return undefined;
+	if (v === "none" || v === "no-agent" || v === "noagent" || v === "linear") return "off";
+	if (v === "adaptive") return "auto";
+	return (WORK_MODES as readonly string[]).includes(v) ? (v as WorkMode) : undefined;
+}
+
+/** 三档模式下注入系统提示的指引。 */
+const WORK_MODE_GUIDANCE: Record<WorkMode, string> = {
+	off: [
+		"当前工作模式:off(无 agent 模式)。",
+		"- 不要调用 agent_* / subsession_* 工具(调用会被拒绝)。",
+		"- 需要拆分子任务时,就在当前会话里线性地逐步完成:自己读文件、改代码、跑命令,按顺序推进。",
+		"- 只用一次回答 / 一次连续工作交付结果,不派发给角色 agent,不建子会话。",
+		"- 仍可使用 insight_recall 查询历史经验(这是记忆检索,不是任务派发)。",
+	].join("\n"),
+	agent: [
+		"当前工作模式:agent(积极协作模式)。",
+		"- 遇到多步骤 / 多视角 / 可并行的任务,主动拆解:agent_create 建角色 → subsession_create 开子会话 → subsession_run 多轮协作 → subsession_finish 收敛结论。",
+		"- 先把任务上下文(目标 / 验收 / 约束 / 背景数据)放进子会话的 context,再指派角色分工;lead 角色负责协调。",
+		"- 即使是中等复杂度的任务,也倾向用子会话拆解而非自己一口气做完;完成后保留【结果】与【额外信息】,沉淀经验供 insight_recall 召回。",
+		"- 简单琐碎的查询(如查个文件名)不必开子会话,直接回答。",
+	].join("\n"),
+	auto: [
+		"当前工作模式:auto(自适应模式)。",
+		"- 根据任务复杂度自行判断是否使用 agent / subsession。",
+		"- 简单、单线程、上下文已在手的任务:直接在当前会话线性完成,不必开子会话。",
+		"- 复杂任务(预计超过 3 个独立环节 / 需要不同专长视角 / 可并行推进 / 需要风险评审)才用 agent_* + subsession_* 拆解协作。",
+		"- 使用 agent 时参考 agent 模式的做法;不使用时参考 off 模式的做法。",
+	].join("\n"),
+};
+
+function workModeSection(mode: WorkMode): string {
+	return `<session_agents_work_mode>\n${WORK_MODE_GUIDANCE[mode]}\n</session_agents_work_mode>`;
+}
 
 // ---------------------------------------------------------------------------
 // 类型
@@ -139,7 +206,8 @@ type StoreOp =
 	| { op: "sub_context"; name: string; context: string }
 	| { op: "sub_assign"; name: string; assignments: Assignment[] }
 	| { op: "sub_discard"; name: string }
-	| { op: "sub_discard_all" };
+	| { op: "sub_discard_all" }
+	| { op: "mode_set"; mode: WorkMode };
 
 interface ToolDetails {
 	action: string;
@@ -264,6 +332,8 @@ export default function (pi: ExtensionAPI) {
 	const locks = new Map<string, Promise<void>>();
 	const store = new InsightStore(join(getAgentDir(), "session-agents", "insights.jsonl"));
 	let storeLoaded = false;
+	/** 当前工作模式(新会话默认 auto;resume / 分支切换时由 mode_set 操作重放恢复)。 */
+	let workMode: WorkMode = DEFAULT_WORK_MODE;
 
 	function ensureStore(): void {
 		if (!storeLoaded) {
@@ -387,12 +457,18 @@ export default function (pi: ExtensionAPI) {
 			case "sub_discard_all":
 				subs.clear();
 				break;
+			case "mode_set": {
+				const mode = normalizeMode(op.mode);
+				if (mode) workMode = mode;
+				break;
+			}
 		}
 	}
 
 	function rebuildFromSession(ctx: ExtensionContext): void {
 		roles.clear();
 		subs.clear();
+		workMode = DEFAULT_WORK_MODE;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom") {
 				const custom = entry as CustomEntry<StoreOp>;
@@ -417,6 +493,9 @@ export default function (pi: ExtensionAPI) {
 	// -- 主动提供启发:任务开始时自动召回相关经验 ----------------------------
 
 	pi.on("before_agent_start", (event, ctx) => {
+		// 工作模式指引总是注入:直接调节模型使用 agent / subsession 的积极性。
+		event.systemPromptOptions.sections["session_agents_work_mode"] = workModeSection(workMode);
+
 		ensureStore();
 		if (store.size === 0) return;
 		const prompt = event.prompt ?? "";
@@ -434,6 +513,65 @@ export default function (pi: ExtensionAPI) {
 			`以下经验由历史子会话沉淀,按与当前输入的相关度自动召回。仅在确实相关时参考,不相关请忽略;\n` +
 			`需要更多背景或想精确检索时调用 insight_recall。\n${lines}\n</session_agents_experience>`;
 	});
+
+	// -- off 模式下硬拦截 agent 工具(提示词之外的可靠保障) ------------------
+
+	pi.on("tool_call", (event) => {
+		if (workMode === "off" && AGENT_TOOLS.includes(event.toolName)) {
+			return {
+				block: true,
+				reason:
+					`当前为 off(无 agent)工作模式,不能调用 ${event.toolName}。请在当前会话里线性地完成任务;` +
+					`需要启用 agent 协作时,提示用户使用 /agent-mode agent 切换。`,
+			};
+		}
+		return undefined;
+	});
+
+	// -- /agent-mode 命令 ----------------------------------------------------
+
+	async function modeHandler(raw: string, ctx: ExtensionCommandContext): Promise<void> {
+		const wanted = normalizeMode(raw);
+		if (!wanted) {
+			ctx.ui.notify(`当前工作模式:${workMode}。用法:/agent-mode off|agent|auto`, "info");
+			return;
+		}
+		workMode = wanted;
+		persist({ op: "mode_set", mode: wanted });
+		// 触发工具声明重算:off 模式下隐藏 agent_* / subsession_* 声明。
+		try {
+			pi.setActiveTools(pi.getActiveTools());
+		} catch {
+			/* 旧版宿主可能无此 API,忽略:tool_call 拦截仍然生效 */
+		}
+		const desc =
+			wanted === "off"
+				? "不再使用 agent/subsession,在当前会话里线性完成任务"
+				: wanted === "agent"
+					? "积极拆解任务并使用 agent/subsession 协作"
+					: "按任务复杂度自动决定是否使用 agent/subsession";
+		ctx.ui.notify(`工作模式已切换为 ${wanted}:${desc}`, "info");
+	}
+
+	pi.registerCommand("agent-mode", {
+		description: "切换 agent 工作模式:off(无agent)/ agent(积极协作)/ auto(自适应,默认)",
+		handler: modeHandler,
+	});
+	pi.registerCommand("amode", {
+		description: "同 /agent-mode",
+		handler: modeHandler,
+	});
+
+	// -- 工具声明裁剪:off 模式下隐藏 agent 工具 ----------------------------
+
+	function modeLoadout(loadout: {
+		registered: readonly { name: string }[];
+	}): { hiddenDeclarations: readonly string[] } | undefined {
+		if (workMode !== "off") return undefined;
+		return {
+			hiddenDeclarations: AGENT_TOOLS.filter((n) => loadout.registered.some((t) => t.name === n)),
+		};
+	}
 
 	// -- 模型 / 工具解析 -----------------------------------------------------
 
@@ -671,6 +809,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "agent_create",
+		prepareLoadout: modeLoadout,
 		label: "Role: create",
 		namespace: roleNamespace,
 		promptSnippet: "agent_*/subsession_*/insight_*: split large tasks across role agents in sub-session workspaces",
@@ -736,6 +875,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "agent_update",
+		prepareLoadout: modeLoadout,
 		label: "Role: update",
 		namespace: roleNamespace,
 		description: `Change a role agent: model, system prompt (fixed context), tool access, maxTurns, or append additional fixed context. Only the fields you pass change.`,
@@ -782,6 +922,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "agent_list",
+		prepareLoadout: modeLoadout,
 		label: "Role: list",
 		namespace: roleNamespace,
 		description: `List role agents and the models available for choosing a role's model. Call before agent_create when unsure which "provider/model-id" to pick.`,
@@ -821,6 +962,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "agent_discard",
+		prepareLoadout: modeLoadout,
 		label: "Role: discard",
 		namespace: roleNamespace,
 		description: `Discard role agents that are no longer needed: one by name, or all with all=true. Roles otherwise live until the end of the session.`,
@@ -854,6 +996,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "subsession_create",
+		prepareLoadout: modeLoadout,
 		label: "Sub-session: create",
 		namespace: roleNamespace,
 		promptGuidelines: [
@@ -927,6 +1070,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "subsession_run",
+		prepareLoadout: modeLoadout,
 		label: "Sub-session: run",
 		namespace: roleNamespace,
 		description: `Run one collaboration round in a sub-session. Each participating role agent works on the shared desk — seeing the task context, the desk state and the other agents' contributions — and posts its contribution; use desk notes to add context mid-flight. Agents not yet assigned are assigned automatically. Different sub-sessions can run as parallel tool calls; rounds within one sub-session are serialized. Returns a digest of each contribution plus the desk state. Iterate rounds with different instructions until the task is done, then call subsession_finish.`,
@@ -1068,6 +1212,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "subsession_finish",
+		prepareLoadout: modeLoadout,
 		label: "Sub-session: finish",
 		namespace: roleNamespace,
 		promptGuidelines: [
@@ -1160,6 +1305,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "subsession_get",
+		prepareLoadout: modeLoadout,
 		label: "Sub-session: get",
 		namespace: roleNamespace,
 		description: `Inspect sub-sessions. Without name, lists all. With name, returns the requested detail: "summary" (status, task, desk counts, assignments), "desk" (the shared desk), "log" (work log digest), or "result" (result + extras of a finished sub-session).`,
@@ -1216,6 +1362,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "subsession_discard",
+		prepareLoadout: modeLoadout,
 		label: "Sub-session: discard",
 		namespace: roleNamespace,
 		description: `Discard sub-sessions that are no longer needed: one by name, or all with all=true. Discarding frees their desk and work log; finished results already in the experience memory stay recallable via insight_recall.`,

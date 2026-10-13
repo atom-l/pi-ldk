@@ -110,6 +110,36 @@ agent 们的**公共桌面**。任务上下文(目标、验收、背景数据、
 - **可回溯**:每条记录带 kind、来源子会话、角色、时间、项目与命中词项;
 - 中英混合分词(拉丁整词 + CJK 一元/二元 gram),支持 kinds / scope / detail 过滤。
 
+### 工作模式
+
+针对「模型使用 agent / subsession 积极性不高」的问题,提供三种工作模式,用 `/agent-mode`
+(别名 `/amode`)切换:
+
+| 模式 | 行为 |
+|---|---|
+| `off` | **无 agent 模式**:模型不在会话中调用 agent 功能,而在当前会话里线性地完成任务 |
+| `agent` | **agent 模式**:积极分解规划任务,优先用 `agent_*` + `subsession_*` 协作完成 |
+| `auto` | **自适应模式**(新会话默认):根据任务与问题的复杂度,自行决定是否使用 agent |
+
+```
+/agent-mode off     # 无 agent:线性完成任务
+/agent-mode agent   # 积极拆解协作
+/agent-mode auto    # 按复杂度自适应(默认)
+/agent-mode         # 不带参数 → 显示当前模式与用法
+```
+
+三层保障确保模式真正生效:
+
+1. **提示词指引**:每次 `before_agent_start` 都注入 `<session_agents_work_mode>` 段落,
+   按当前模式明确告诉模型该怎么做(含 auto 模式的复杂度判断标准);
+2. **硬拦截**:off 模式下调用 `agent_*` / `subsession_*` 会被 `tool_call` 拦截拒绝,
+   并提示用户可切回 agent 模式(`insight_*` 记忆检索不受影响);
+3. **声明隐藏**:off 模式下 `prepareLoadout` 把 agent 工具从系统提示的工具列表里隐藏,
+   减少对模型的干扰。
+
+模式随会话持久化:切换写入 `mode_set` 操作,resume / 分支切换后按分支历史重放恢复;
+新建会话(无 `mode_set` 记录)一律为 `auto`。
+
 ### 工具一览
 
 | 工具 | 作用 |
