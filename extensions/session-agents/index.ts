@@ -504,7 +504,7 @@ export default function (pi: ExtensionAPI) {
 
 		ensureStore();
 		if (store.size === 0) return;
-		const prompt = event.prompt ?? "";
+		const prompt = event.messageType === "user" ? event.prompt : "";
 		if (tokenize(prompt).length < 3) return;
 		const hits = store.search(prompt, { limit: 3, cwd: ctx.cwd, minScore: 2 });
 		if (hits.length === 0) return;
@@ -812,6 +812,13 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	/** 等待某子会话在飞的后台作业收敛(finish 前收拢,避免收尾后仍被写入)。 */
+	async function drainJobsFor(subName: string): Promise<void> {
+		const running = [...jobs.values()].filter((j) => j.sub === subName && j.status === "running");
+		if (running.length === 0) return;
+		await Promise.allSettled(running.map((j) => j.promise));
+	}
+
 	/** 取消并清空全部后台作业(会话关闭 / 丢弃时兜底)。 */
 	function cancelAllJobs(): void {
 		for (const job of jobs.values()) {
@@ -859,7 +866,7 @@ export default function (pi: ExtensionAPI) {
 			// -- 阶段 1:解析参与者 + 占位轮号(短锁,保证轮号唯一) ----------
 			const prep = await withLock(`${name}:commit`, async () => {
 				const current = subs.get(name);
-				if (!current) return { error: `Sub-session "${name}" was discarded before the round started.` };
+				if (!current) return { ok: false as const, error: `Sub-session "${name}" was discarded before the round started.` };
 
 				if (params.context?.trim()) {
 					current.context.push(params.context.trim());
@@ -873,7 +880,7 @@ export default function (pi: ExtensionAPI) {
 					for (const raw of params.agents) {
 						const agent = raw.trim();
 						if (!roles.has(agent)) {
-							return { error: `Unknown role "${agent}". Existing roles: ${[...roles.keys()].join(", ") || "(none)"}` };
+							return { ok: false as const, error: `Unknown role "${agent}". Existing roles: ${[...roles.keys()].join(", ") || "(none)"}` };
 						}
 						let assignment = current.assignments.find((a) => a.agent === agent);
 						if (!assignment) {
@@ -887,16 +894,16 @@ export default function (pi: ExtensionAPI) {
 					participants = [...current.assignments];
 				}
 				if (participants.length === 0) {
-					return { error: `Sub-session "${name}" has no agents. Pass agents: ["role"] (roles are created with agent_create).` };
+					return { ok: false as const, error: `Sub-session "${name}" has no agents. Pass agents: ["role"] (roles are created with agent_create).` };
 				}
 				participants.sort((a, b) => Number(!!b.lead) - Number(!!a.lead));
 
 				// 先递增占位轮号,并发轮各自拿到唯一编号。
 				const round = current.rounds + 1;
 				current.rounds = round;
-				return { participants, round, current };
+				return { ok: true as const, participants, round, current };
 			});
-			if (!("participants" in prep)) return fail(prep.error, { action: "subsession_run" });
+			if (!prep.ok) return fail(prep.error, { action: "subsession_run" });
 			const { participants, round } = prep;
 			const snapshot = prep.current;
 
@@ -912,41 +919,13 @@ export default function (pi: ExtensionAPI) {
 					.filter(Boolean)
 					.join("\n");
 
-			let outcomes: Outcome[] = [];
-			if (params.parallelAgents) {
-				// 并行:全部用同一 desk 快照建提示,同时执行,完成后统一提交。
-				const settled = await Promise.allSettled(
-					participants.map((assignment) => {
-						const role = roles.get(assignment.agent);
-						if (!role) return Promise.resolve(null);
-						const systemPrompt = buildTurnPrompt(role, snapshot, assignment);
-						const instruction = buildInstruction(assignment, snapshot);
-						return runTurn(
-							{
-								model: optsModel(ctx, role.config.model),
-								systemPrompt,
-								instruction,
-								toolNames: [...role.config.tools, "desk_update"],
-								maxTurns: Math.min(
-									role.config.maxTurns,
-									Math.max(1, Math.min(MAX_TURNS_CAP, Math.round(params.maxTurnsPerAgent ?? MAX_TURNS_CAP))),
-								),
-							},
-							ctx,
-							signal,
-							onUpdate,
-							`role:${role.config.name}`,
-						).then((turn) => ({ assignment, role, turn, instruction }));
-					}),
-				);
-				outcomes = settled.filter((r): r is PromiseFulfilledResult<Outcome> => r.status === "fulfilled" && r.value !== null).map((r) => r.value);
-			} else {
-				// 串行:逐个执行;提示在本轮执行前构建,能看到前序 agent 的 desk 更新。
-				for (const assignment of participants) {
-					const role = roles.get(assignment.agent);
-					if (!role) continue;
-					const systemPrompt = buildTurnPrompt(role, subs.get(name) ?? snapshot, assignment);
-					const instruction = buildInstruction(assignment, subs.get(name) ?? snapshot);
+			// 单个参与者执行封装:任何错误都降级为 error 贡献,不拖垮整轮。
+			const runOne = async (assignment: Assignment, sub0: SubSessionState): Promise<Outcome | null> => {
+				const role = roles.get(assignment.agent);
+				if (!role) return null;
+				const instruction = buildInstruction(assignment, sub0);
+				try {
+					const systemPrompt = buildTurnPrompt(role, sub0, assignment);
 					const turn = await runTurn(
 						{
 							model: optsModel(ctx, role.config.model),
@@ -963,7 +942,34 @@ export default function (pi: ExtensionAPI) {
 						onUpdate,
 						`role:${role.config.name}`,
 					);
-					outcomes.push({ assignment, role, turn, instruction });
+					return { assignment, role, turn, instruction };
+				} catch (error) {
+					return {
+						assignment,
+						role,
+						instruction,
+						turn: {
+							text: "",
+							usage: emptyUsage(),
+							turns: 0,
+							toolCalls: 0,
+							stopReason: "error",
+							errorMessage: error instanceof Error ? error.message : String(error),
+						},
+					};
+				}
+			};
+
+			let outcomes: Outcome[] = [];
+			if (params.parallelAgents) {
+				// 并行:全部用同一 desk 快照建提示,同时执行,完成后统一提交。
+				const results = await Promise.all(participants.map((assignment) => runOne(assignment, snapshot)));
+				outcomes = results.filter((o): o is Outcome => o !== null);
+			} else {
+				// 串行:逐个执行;提示在本轮执行前构建,能看到前序 agent 的 desk 更新。
+				for (const assignment of participants) {
+					const outcome = await runOne(assignment, subs.get(name) ?? snapshot);
+					if (outcome) outcomes.push(outcome);
 				}
 			}
 
@@ -971,6 +977,16 @@ export default function (pi: ExtensionAPI) {
 			return withLock(`${name}:commit`, async () => {
 				const current = subs.get(name);
 				if (!current) return fail(`Sub-session "${name}" was discarded.`, { action: "subsession_run" });
+				if (current.status === "done") {
+					const notes = outcomes.map(
+						({ assignment, role, turn }) =>
+							`[${role.config.name}${assignment.focus ? ` · ${assignment.focus}` : ""}] ${truncate(turn.text || turn.errorMessage || "(no contribution)", 600)}`,
+					);
+					return ok(
+						`本轮 ${round} 的 agent 已完成,但子会话 "${name}" 已收尾(done),不再写入日志/桌面。以下为本轮产出(未纳入子会话):\n\n${notes.join("\n")}`,
+						{ action: "subsession_run", subsession: summarizeSub(current), round, superseded: true },
+					);
+				}
 				const appended: LogEntry[] = [];
 				const roundUsage = emptyUsage();
 				const digest: string[] = [];
@@ -1554,8 +1570,11 @@ export default function (pi: ExtensionAPI) {
 				return fail(`No sub-session named "${name}". Existing: ${[...subs.keys()].join(", ") || "(none)"}`, { action: "subsession_finish" });
 			}
 			if (sub.status === "done" && sub.result !== undefined) {
-				return ok(renderResult(sub), { action: "subsession_finish", subsession: summarizeSub(sub), result: sub.result, extras: sub.extras ?? "" });
+					return ok(renderResult(sub), { action: "subsession_finish", subsession: summarizeSub(sub), result: sub.result, extras: sub.extras ?? "" });
 			}
+
+			// 先收拢该子会话在飞的后台轮:确保合成纳入全部已完成成果,且收尾后不再被写入。
+			await drainJobsFor(name);
 
 			return withLock(name, async () => {
 				const current = subs.get(name);
