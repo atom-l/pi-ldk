@@ -153,7 +153,8 @@ resume、分支切换后自动同步。`/agent-mode` 不带参数时弹出选项
 | `agent_list` | 列出角色、子会话、可选模型清单 |
 | `agent_discard` | 丢弃角色(单个 / 全部) |
 | `subsession_create` | 创建子会话:task(目标与验收)、context(任务上下文)、assignments(指派角色)、synthesisModel |
-| `subsession_run` | 跑一轮协作:参与的角色依次工作(desk 写入 + 贡献),返回本轮摘要与桌面状态 |
+| `subsession_run` | 跑一轮协作:参与者在公共桌面工作并给出贡献,返回本轮摘要与桌面状态;调度方式可选(见下) |
+| `subsession_probe` | 查后台作业进度 / 取结果(status / done / failed,可带 `wait=<秒>` 限时等待) |
 | `subsession_finish` | 收尾合成,返回【结果】+【额外信息】,并沉淀经验到记忆 |
 | `subsession_get` | 查看子会话:summary / desk / log / result |
 | `subsession_discard` | 丢弃子会话(单个 / 全部) |
@@ -161,6 +162,41 @@ resume、分支切换后自动同步。`/agent-mode` 不带参数时弹出选项
 | `insight_add` | 主动记录一条经验 |
 
 另有内部工具 `desk_update`(exposure: deferred),仅供子会话内的 agent 写公共桌面。
+
+### 调度策略(由模型选择)
+
+`subsession_run` 的并发 / 阻塞行为**交给模型按问题特征自行选择**,而不是一刀切。三个开关相互独立:
+
+| 开关 | 默认 | 何时开 |
+|---|---|---|
+| `parallelAgents` | `false`(串行) | 本轮参与者工作互不依赖(如分别勘察 / 风险评审)且想压低时延时开启;若后续 agent 应先读到前序 agent 的 desk 更新再动手,保持串行 |
+| `concurrentRounds` | `false`(串行) | 同子会话的多轮可流水线重叠执行时开启;若轮次顺序影响 desk 可读性,保持串行。desk / log 提交始终一致 |
+| `background` | `false`(阻塞) | 不必当场等结果、想继续干别的事时开启,立即返回 job 句柄,稍后用 `subsession_probe` 收结果;需要立即拿到结果则保持阻塞 |
+
+典型组合:
+
+```
+# 串行 + 阻塞(默认):逐步推进,每轮都能看到前序 desk 更新
+subsession_run(name="auth", instruction="梳理现状")
+
+# 轮内并行:三个独立视角同时出结果,时延≈单个 agent
+subsession_run(name="review", instruction="分别从安全/性能/可维护性评审",
+               parallelAgents=true)
+
+# 后台派发:丢进后台继续干别的,稍后收割
+subsession_run(name="build", instruction="跑全量测试", background=true)
+   → { job: "job-3" }
+…(继续别的工作)…
+subsession_probe(job="job-3", wait=30)      # 限时等待并取结果
+```
+
+`subsession_probe` 用法:`job=<id>` 查单个作业、`name=<子会话>` 列出该子会话全部作业、
+都不传则列出全部;`wait=<秒>`(上限 300)表示愿意等多久——轮询还是等待,同样由模型
+自行取舍。作业状态:`running` / `done` / `failed` / `cancelled`;完成时返回与阻塞式
+`subsession_run` 完全相同的产物。
+
+生命周期:后台作业与工具调用生命周期解耦(自带 AbortController),会话关闭或
+`subsession_discard` 时自动取消,不留悬挂任务。
 
 ### 典型流程(模型侧)
 

@@ -77,6 +77,7 @@ const AGENT_TOOLS: readonly string[] = [
 	"agent_discard",
 	"subsession_create",
 	"subsession_run",
+	"subsession_probe",
 	"subsession_finish",
 	"subsession_get",
 	"subsession_discard",
@@ -415,7 +416,7 @@ export default function (pi: ExtensionAPI) {
 				if (sub) {
 					for (const entry of op.log ?? []) appendLog(sub, entry);
 					sub.desk = { ...emptyDesk(), ...(op.desk ?? {}) };
-					sub.rounds = op.rounds ?? sub.rounds + 1;
+					sub.rounds = Math.max(sub.rounds, op.rounds ?? sub.rounds + 1);
 					addUsage(sub.usage, op.usage);
 					sub.updatedAt = Date.now();
 				}
@@ -452,9 +453,11 @@ export default function (pi: ExtensionAPI) {
 				break;
 			}
 			case "sub_discard":
+				cancelJobsFor(op.name);
 				subs.delete(op.name);
 				break;
 			case "sub_discard_all":
+				cancelAllJobs();
 				subs.clear();
 				break;
 			case "mode_set": {
@@ -487,6 +490,7 @@ export default function (pi: ExtensionAPI) {
 		updateModeStatus(ctx);
 	});
 	pi.on("session_shutdown", () => {
+		cancelAllJobs();
 		roles.clear();
 		subs.clear();
 		locks.clear();
@@ -777,6 +781,242 @@ export default function (pi: ExtensionAPI) {
 		if (resolved.model) return resolved.model;
 		if (ctx.model) return ctx.model;
 		throw new Error(resolved.error ?? "no model available");
+	}
+
+	// -- 后台作业注册表(background 模式派发的协作轮) -----------------------
+
+	interface BackgroundJob {
+		id: string;
+		/** 子会话名。 */
+		sub: string;
+		round: number;
+		startedAt: number;
+		finishedAt?: number;
+		status: "running" | "done" | "failed" | "cancelled";
+		promise: Promise<void>;
+		result?: AgentToolResult<ToolDetails>;
+		error?: string;
+		/** 与工具调用生命周期解耦的取消信号(工具返回后仍可继续跑)。 */
+		controller: AbortController;
+	}
+	const jobs = new Map<string, BackgroundJob>();
+	let jobSeq = 0;
+
+	/** 丢弃某子会话的所有后台作业(取消并标记)。 */
+	function cancelJobsFor(subName: string): void {
+		for (const job of jobs.values()) {
+			if (job.sub !== subName || job.status !== "running") continue;
+			job.controller.abort();
+			job.status = "cancelled";
+			job.finishedAt = Date.now();
+		}
+	}
+
+	/** 取消并清空全部后台作业(会话关闭 / 丢弃时兜底)。 */
+	function cancelAllJobs(): void {
+		for (const job of jobs.values()) {
+			if (job.status === "running") {
+				job.controller.abort();
+				job.status = "cancelled";
+				job.finishedAt = Date.now();
+			}
+		}
+		jobs.clear();
+	}
+
+	// -- 协作轮核心:支持轮内并行 / 跨轮并发 ------------------------------
+
+	interface RunRoundParams {
+		name: string;
+		instruction: string;
+		agents?: string[];
+		maxTurnsPerAgent?: number;
+		context?: string;
+		/** 本轮参与者是否并行执行(默认 false 串行)。 */
+		parallelAgents?: boolean;
+		/** 是否允许与同子会话的其他轮重叠执行(默认 false 串行)。 */
+		concurrentRounds?: boolean;
+	}
+
+	async function runRound(
+		params: RunRoundParams,
+		ctx: ExtensionToolContext,
+		signal: AbortSignal | undefined,
+		onUpdate: ((partial: AgentToolResult<ToolDetails>) => void) | undefined,
+	): Promise<AgentToolResult<ToolDetails>> {
+		const name = params.name.trim();
+		const sub = subs.get(name);
+		if (!sub) {
+			return fail(`No sub-session named "${name}". Existing: ${[...subs.keys()].join(", ") || "(none)"}`, { action: "subsession_run" });
+		}
+		if (sub.status === "done") {
+			return fail(`Sub-session "${name}" is already finished. Its result is available from subsession_get (detail="result") or insight_recall.`, {
+				action: "subsession_run",
+			});
+		}
+
+		const body = async (): Promise<AgentToolResult<ToolDetails>> => {
+			// -- 阶段 1:解析参与者 + 占位轮号(短锁,保证轮号唯一) ----------
+			const prep = await withLock(`${name}:commit`, async () => {
+				const current = subs.get(name);
+				if (!current) return { error: `Sub-session "${name}" was discarded before the round started.` };
+
+				if (params.context?.trim()) {
+					current.context.push(params.context.trim());
+					persist({ op: "sub_context", name, context: params.context.trim() });
+				}
+
+				// 参与者:显式指定 > 全部分配者;lead 排在最前。
+				let participants: Assignment[];
+				if (params.agents?.length) {
+					participants = [];
+					for (const raw of params.agents) {
+						const agent = raw.trim();
+						if (!roles.has(agent)) {
+							return { error: `Unknown role "${agent}". Existing roles: ${[...roles.keys()].join(", ") || "(none)"}` };
+						}
+						let assignment = current.assignments.find((a) => a.agent === agent);
+						if (!assignment) {
+							assignment = { agent };
+							current.assignments.push(assignment);
+							persist({ op: "sub_assign", name, assignments: current.assignments });
+						}
+						participants.push(assignment);
+					}
+				} else {
+					participants = [...current.assignments];
+				}
+				if (participants.length === 0) {
+					return { error: `Sub-session "${name}" has no agents. Pass agents: ["role"] (roles are created with agent_create).` };
+				}
+				participants.sort((a, b) => Number(!!b.lead) - Number(!!a.lead));
+
+				// 先递增占位轮号,并发轮各自拿到唯一编号。
+				const round = current.rounds + 1;
+				current.rounds = round;
+				return { participants, round, current };
+			});
+			if (!("participants" in prep)) return fail(prep.error, { action: "subsession_run" });
+			const { participants, round } = prep;
+			const snapshot = prep.current;
+
+			// -- 阶段 2:执行 agent(parallelAgents 决定串行 / 并行) ----------
+			type Outcome = { assignment: Assignment; role: RoleState; turn: TurnResult; instruction: string };
+			const buildInstruction = (assignment: Assignment, sub0: SubSessionState) =>
+				[
+					`# 子会话 "${sub0.title}" 第 ${round} 轮`,
+					`本轮指令:${params.instruction}`,
+					assignment.focus ? `你的分工:${assignment.focus}` : "",
+					`用 desk_update 把关键发现 / 决策 / 异常 / 待决问题写上公共桌面,然后用一段文字给出你的贡献(结论、依据、建议)。`,
+				]
+					.filter(Boolean)
+					.join("\n");
+
+			let outcomes: Outcome[] = [];
+			if (params.parallelAgents) {
+				// 并行:全部用同一 desk 快照建提示,同时执行,完成后统一提交。
+				const settled = await Promise.allSettled(
+					participants.map((assignment) => {
+						const role = roles.get(assignment.agent);
+						if (!role) return Promise.resolve(null);
+						const systemPrompt = buildTurnPrompt(role, snapshot, assignment);
+						const instruction = buildInstruction(assignment, snapshot);
+						return runTurn(
+							{
+								model: optsModel(ctx, role.config.model),
+								systemPrompt,
+								instruction,
+								toolNames: [...role.config.tools, "desk_update"],
+								maxTurns: Math.min(
+									role.config.maxTurns,
+									Math.max(1, Math.min(MAX_TURNS_CAP, Math.round(params.maxTurnsPerAgent ?? MAX_TURNS_CAP))),
+								),
+							},
+							ctx,
+							signal,
+							onUpdate,
+							`role:${role.config.name}`,
+						).then((turn) => ({ assignment, role, turn, instruction }));
+					}),
+				);
+				outcomes = settled.filter((r): r is PromiseFulfilledResult<Outcome> => r.status === "fulfilled" && r.value !== null).map((r) => r.value);
+			} else {
+				// 串行:逐个执行;提示在本轮执行前构建,能看到前序 agent 的 desk 更新。
+				for (const assignment of participants) {
+					const role = roles.get(assignment.agent);
+					if (!role) continue;
+					const systemPrompt = buildTurnPrompt(role, subs.get(name) ?? snapshot, assignment);
+					const instruction = buildInstruction(assignment, subs.get(name) ?? snapshot);
+					const turn = await runTurn(
+						{
+							model: optsModel(ctx, role.config.model),
+							systemPrompt,
+							instruction,
+							toolNames: [...role.config.tools, "desk_update"],
+							maxTurns: Math.min(
+								role.config.maxTurns,
+								Math.max(1, Math.min(MAX_TURNS_CAP, Math.round(params.maxTurnsPerAgent ?? MAX_TURNS_CAP))),
+							),
+						},
+						ctx,
+						signal,
+						onUpdate,
+						`role:${role.config.name}`,
+					);
+					outcomes.push({ assignment, role, turn, instruction });
+				}
+			}
+
+			// -- 阶段 3:提交(短锁,保证并发轮的 log / usage / 计数不乱) ----
+			return withLock(`${name}:commit`, async () => {
+				const current = subs.get(name);
+				if (!current) return fail(`Sub-session "${name}" was discarded.`, { action: "subsession_run" });
+				const appended: LogEntry[] = [];
+				const roundUsage = emptyUsage();
+				const digest: string[] = [];
+				for (const { assignment, role, turn, instruction } of outcomes) {
+					const entry: LogEntry = {
+						agent: role.config.name,
+						focus: assignment.focus,
+						instruction,
+						contribution: turn.text || (turn.errorMessage ? `[error] ${turn.errorMessage}` : "(no contribution)"),
+						turns: turn.turns,
+						toolCalls: turn.toolCalls,
+						usage: turn.usage,
+						timestamp: Date.now(),
+					};
+					appendLog(current, entry);
+					appended.push(entry);
+					addUsage(roundUsage, turn.usage);
+					addUsage(role.usage, turn.usage);
+					role.runs += 1;
+					role.updatedAt = Date.now();
+					persist({ op: "role_stats", name: role.config.name, runs: role.runs, usage: role.usage });
+					digest.push(
+						`[${role.config.name}${assignment.lead ? " · lead" : ""}${assignment.focus ? ` · ${assignment.focus}` : ""}] ${turn.turns} turn(s), ${turn.toolCalls} tool call(s), stop:${turn.stopReason}, ${formatUsage(turn.usage)}\n${truncate(entry.contribution, 2_000)}`,
+					);
+				}
+
+				current.updatedAt = Date.now();
+				addUsage(current.usage, roundUsage);
+				persist({ op: "sub_run", name, log: appended, desk: current.desk, rounds: current.rounds, usage: roundUsage });
+
+				const header = `Sub-session "${name}" round ${round} · ${appended.length} contribution(s) · ${params.parallelAgents ? "parallel" : "serial"}${params.concurrentRounds ? " · concurrent" : ""} · ${formatUsage(roundUsage)}`;
+				const deskState = `Desk now:\n${renderDesk(current.desk)}`;
+				return ok(truncate(`${header}\n\n${digest.join("\n\n---\n\n")}\n\n${deskState}`, MAX_RESULT_CHARS), {
+					action: "subsession_run",
+					subsession: summarizeSub(current),
+					round,
+					parallelAgents: !!params.parallelAgents,
+					concurrentRounds: !!params.concurrentRounds,
+					contributions: appended.map((entry) => ({ agent: entry.agent, turns: entry.turns, toolCalls: entry.toolCalls })),
+				}, roundUsage);
+			});
+		};
+
+		// concurrentRounds=false:整轮占用子会话锁,轮与轮串行(既有行为);
+		// concurrentRounds=true:不占整轮锁,仅提交阶段互斥,允许同子会话多轮重叠。
+		return params.concurrentRounds ? body() : withLock(name, body);
 	}
 
 	// -- 内部工具:公共桌面写入(仅子会话内的 agent 使用) --------------------
@@ -1099,7 +1339,7 @@ export default function (pi: ExtensionAPI) {
 		prepareLoadout: modeLoadout,
 		label: "Sub-session: run",
 		namespace: roleNamespace,
-		description: `Run one collaboration round in a sub-session. Each participating role agent works on the shared desk — seeing the task context, the desk state and the other agents' contributions — and posts its contribution; use desk notes to add context mid-flight. Agents not yet assigned are assigned automatically. Different sub-sessions can run as parallel tool calls; rounds within one sub-session are serialized. Returns a digest of each contribution plus the desk state. Iterate rounds with different instructions until the task is done, then call subsession_finish.`,
+		description: `Run one collaboration round in a sub-session. Each participating role agent works on the shared desk — seeing the task context, the desk state and the other agents' contributions — and posts its contribution; use desk notes to add context mid-flight. Agents not yet assigned are assigned automatically. Scheduling is yours to choose: parallelAgents runs this round's agents concurrently, concurrentRounds lets this round overlap with other rounds of the same sub-session (default both off = serial), and background returns immediately with a job id instead of blocking (collect later with subsession_probe). Different sub-sessions can also run as parallel tool calls. Returns a digest of each contribution plus the desk state. Iterate rounds with different instructions until the task is done, then call subsession_finish.`,
 		parameters: Type.Object({
 			name: Type.String({ description: "Sub-session name." }),
 			instruction: Type.String({ description: "What this round should achieve (the shared round instruction for participating agents)." }),
@@ -1108,6 +1348,24 @@ export default function (pi: ExtensionAPI) {
 			),
 			maxTurnsPerAgent: Type.Optional(Type.Number({ description: `Cap on model turns per agent this round (cap ${MAX_TURNS_CAP}).` })),
 			context: Type.Optional(Type.String({ description: "Additional task context to place on the shared desk for this round and later rounds." })),
+			parallelAgents: Type.Optional(
+				Type.Boolean({
+					description:
+						"Run this round's participating agents concurrently instead of one-by-one. Choose true when the agents' work is independent (e.g. separate recon / review angles) and you want lower latency; keep false (default) when later agents should read earlier agents' desk updates before acting.",
+				}),
+			),
+			concurrentRounds: Type.Optional(
+				Type.Boolean({
+					description:
+						"Let this round overlap with other rounds of the same sub-session instead of queueing behind them. Choose true to pipeline independent rounds; keep false (default) when round order matters for desk readability. Desk/log commits stay consistent either way.",
+				}),
+			),
+			background: Type.Optional(
+				Type.Boolean({
+					description:
+						"Dispatch this round and return immediately with a job id instead of blocking until it finishes. Choose true to keep working on other things meanwhile and collect the result later with subsession_probe; keep false (default) when you need the result right now.",
+				}),
+			),
 		}),
 		annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
 		execute: async (_toolCallId, params, signal, onUpdate, ctx) => {
@@ -1122,117 +1380,156 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 
-			return withLock(name, async () => {
-				const current = subs.get(name);
-				if (!current) return fail(`Sub-session "${name}" was discarded before the round started.`, { action: "subsession_run" });
+			const roundParams: RunRoundParams = {
+				name,
+				instruction: params.instruction,
+				agents: params.agents,
+				maxTurnsPerAgent: params.maxTurnsPerAgent,
+				context: params.context,
+				parallelAgents: params.parallelAgents,
+				concurrentRounds: params.concurrentRounds,
+			};
 
-				if (params.context?.trim()) {
-					current.context.push(params.context.trim());
-					persist({ op: "sub_context", name, context: params.context.trim() });
-				}
-
-				// 参与者:显式指定 > 全部分配者;lead 排在最前。
-				let participants: Assignment[];
-				if (params.agents?.length) {
-					participants = [];
-					for (const raw of params.agents) {
-						const agent = raw.trim();
-						if (!roles.has(agent)) {
-							return fail(`Unknown role "${agent}". Existing roles: ${[...roles.keys()].join(", ") || "(none)"}`, {
-								action: "subsession_run",
-							});
+			// 后台派发:立即返回作业句柄,不阻塞本次调用;稍后用 subsession_probe 收结果。
+			if (params.background) {
+				const id = `job-${++jobSeq}`;
+				const controller = new AbortController();
+				const job: BackgroundJob = {
+					id,
+					sub: name,
+					round: (subs.get(name)?.rounds ?? 0) + 1,
+					startedAt: Date.now(),
+					status: "running",
+					promise: Promise.resolve(),
+					controller,
+				};
+				job.promise = runRound(roundParams, ctx, controller.signal, undefined)
+					.then((result) => {
+						job.result = result;
+						job.status = result.isError ? "failed" : "done";
+						if (result.isError) {
+							const first = result.content?.find((b) => b.type === "text");
+							job.error = first && first.type === "text" ? first.text : "failed";
 						}
-						let assignment = current.assignments.find((a) => a.agent === agent);
-						if (!assignment) {
-							assignment = { agent };
-							current.assignments.push(assignment);
-							persist({ op: "sub_assign", name, assignments: current.assignments });
-						}
-						participants.push(assignment);
-					}
-				} else {
-					participants = [...current.assignments];
-				}
-				if (participants.length === 0) {
-					return fail(`Sub-session "${name}" has no agents. Pass agents: ["role"] (roles are created with agent_create).`, {
-						action: "subsession_run",
+						job.finishedAt = Date.now();
+					})
+					.catch((error) => {
+						job.error = error instanceof Error ? error.message : String(error);
+						job.status = "failed";
+						job.finishedAt = Date.now();
 					});
+				jobs.set(id, job);
+				return ok(
+					`已后台派发子会话 "${name}" 协作轮 — job=${id}
+` +
+						`本次调用立即返回,任务在后台继续执行。
+` +
+						`取结果:subsession_probe(job="${id}")(可带 wait=<秒> 等一会再看);
+` +
+						`查全部:subsession_probe(name="${name}")。现在可以继续做别的事。`,
+					{ action: "subsession_run", background: true, job: id, subsession: summarizeSub(sub) },
+				);
+			}
+
+			// 前台:阻塞直到本轮完成(轮内可选并行、跨轮可选并发)。
+			return runRound(roundParams, ctx, signal, onUpdate);
+		},
+	});
+
+	pi.registerTool({
+		name: "subsession_probe",
+		prepareLoadout: modeLoadout,
+		label: "Sub-session: probe",
+		namespace: roleNamespace,
+		description: `Inspect or collect the results of background sub-session rounds dispatched with subsession_run(background:true). Returns a job's status (running / done / failed / cancelled) and, when finished, the same digest a blocking run would have returned. Omit name and job to list every background job; give name to list that sub-session's jobs; give job to read one. Use wait=<seconds> to block briefly for completion before returning — the choice between polling and waiting is yours.`,
+		parameters: Type.Object({
+			name: Type.Optional(Type.String({ description: "Sub-session name; omit to consider all sub-sessions." })),
+			job: Type.Optional(Type.String({ description: 'Specific job id returned by subsession_run(background:true), e.g. "job-1".' })),
+			wait: Type.Optional(
+				Type.Number({ description: "Seconds to wait for the job to finish before returning (0 = don't wait, return current status immediately). Max 300." }),
+			),
+		}),
+		annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+		execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
+			const wanted = params.job?.trim();
+			const nameFilter = params.name?.trim();
+			const all = [...jobs.values()]
+				.filter((j) => (!nameFilter || j.sub === nameFilter) && (!wanted || j.id === wanted))
+				.sort((a, b) => a.startedAt - b.startedAt);
+
+			if (wanted && all.length === 0) {
+				return fail(`No background job "${wanted}". Dispatch one with subsession_run(background:true).`, { action: "subsession_probe" });
+			}
+			if (all.length === 0) {
+				return ok(
+					`当前没有后台作业${nameFilter ? `(子会话 "${nameFilter}")` : ""}。用 subsession_run(background:true) 派发。`,
+					{ action: "subsession_probe", jobs: [] },
+				);
+			}
+
+			// 取目标作业:指定 job > 该子会话最新一个。
+			const target = wanted ? all[0] : (all.filter((j) => j.sub === (nameFilter ?? all[all.length - 1].sub)).pop() ?? all[all.length - 1]);
+
+			// wait>0:限时等待完成(轮询 promise,而非无限阻塞)。
+			const waitSec = Math.max(0, Math.min(300, Math.round(params.wait ?? 0)));
+			if (waitSec > 0 && target.status === "running") {
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				const timeout = new Promise<void>((resolve) => {
+					timer = setTimeout(resolve, waitSec * 1000);
+				});
+				try {
+					await Promise.race([target.promise, timeout]);
+				} finally {
+					if (timer) clearTimeout(timer);
 				}
-				participants.sort((a, b) => Number(!!b.lead) - Number(!!a.lead));
+			}
 
-				const round = current.rounds + 1;
-				const appended: LogEntry[] = [];
-				const roundUsage = emptyUsage();
-				const digest: string[] = [];
+			const jobsSummary = all.map((j) => ({
+				id: j.id,
+				sub: j.sub,
+				round: j.round,
+				status: j.status,
+				seconds: ((j.finishedAt ?? Date.now()) - j.startedAt) / 1000,
+			}));
 
-				for (const assignment of participants) {
-					const role = roles.get(assignment.agent);
-					if (!role) continue;
-					const systemPrompt = buildTurnPrompt(role, current, assignment);
-					const instruction = [
-						`# 子会话 "${current.title}" 第 ${round} 轮`,
-						`本轮指令:${params.instruction}`,
-						assignment.focus ? `你的分工:${assignment.focus}` : "",
-						`用 desk_update 把关键发现 / 决策 / 异常 / 待决问题写上公共桌面,然后用一段文字给出你的贡献(结论、依据、建议)。`,
-					]
-						.filter(Boolean)
-						.join("\n");
+			if (target.status === "running") {
+				return ok(
+					`作业 ${target.id}(子会话 "${target.sub}" 第 ${target.round} 轮)仍在运行,已跑 ${(((Date.now() - target.startedAt) / 1000) | 0)}s。\n` +
+						`可继续做别的事,稍后再 subsession_probe(job="${target.id}");或用 wait=<秒> 限时等待。`,
+					{ action: "subsession_probe", job: target.id, status: target.status, jobs: jobsSummary },
+				);
+			}
+			if (target.status === "cancelled") {
+				return ok(`作业 ${target.id} 已取消(子会话被丢弃 / 会话关闭)。`, {
+					action: "subsession_probe",
+					job: target.id,
+					status: target.status,
+					jobs: jobsSummary,
+				});
+			}
+			if (target.status === "failed") {
+				return fail(`作业 ${target.id} 失败:${target.error ?? "unknown"}`, {
+					action: "subsession_probe",
+					job: target.id,
+					status: target.status,
+					jobs: jobsSummary,
+				});
+			}
 
-					const turn = await runTurn(
-						{
-							model: optsModel(ctx, role.config.model),
-							systemPrompt,
-							instruction,
-							toolNames: [...role.config.tools, "desk_update"],
-							maxTurns: Math.min(
-								role.config.maxTurns,
-								Math.max(1, Math.min(MAX_TURNS_CAP, Math.round(params.maxTurnsPerAgent ?? MAX_TURNS_CAP))),
-							),
-						},
-						ctx,
-						signal,
-						onUpdate,
-						`role:${role.config.name}`,
-					);
-
-					const entry: LogEntry = {
-						agent: role.config.name,
-						focus: assignment.focus,
-						instruction,
-						contribution: turn.text || (turn.errorMessage ? `[error] ${turn.errorMessage}` : "(no contribution)"),
-						turns: turn.turns,
-						toolCalls: turn.toolCalls,
-						usage: turn.usage,
-						timestamp: Date.now(),
-					};
-					appendLog(current, entry);
-					appended.push(entry);
-					addUsage(roundUsage, turn.usage);
-					addUsage(role.usage, turn.usage);
-					role.runs += 1;
-					role.updatedAt = Date.now();
-					persist({ op: "role_stats", name: role.config.name, runs: role.runs, usage: role.usage });
-					persist({ op: "role_stats", name: role.config.name, runs: role.runs, usage: role.usage });
-
-					digest.push(
-						`[${role.config.name}${assignment.lead ? " · lead" : ""}${assignment.focus ? ` · ${assignment.focus}` : ""}] ${turn.turns} turn(s), ${turn.toolCalls} tool call(s), stop:${turn.stopReason}, ${formatUsage(turn.usage)}\n${truncate(entry.contribution, 2_000)}`,
-					);
-				}
-
-				current.rounds = round;
-				current.updatedAt = Date.now();
-				addUsage(current.usage, roundUsage);
-				persist({ op: "sub_run", name, log: appended, desk: current.desk, rounds: round, usage: roundUsage });
-
-				const header = `Sub-session "${name}" round ${round} · ${appended.length} contribution(s) · ${formatUsage(roundUsage)}`;
-				const deskState = `Desk now:\n${renderDesk(current.desk)}`;
-				return ok(truncate(`${header}\n\n${digest.join("\n\n---\n\n")}\n\n${deskState}`, MAX_RESULT_CHARS), {
-					action: "subsession_run",
-					subsession: summarizeSub(current),
-					round,
-					contributions: appended.map((entry) => ({ agent: entry.agent, turns: entry.turns, toolCalls: entry.toolCalls })),
-				}, roundUsage);
-			});
+			// done:返回与阻塞式 subsession_run 相同的产物。
+			const result = target.result;
+			const text = result?.content?.find((b) => b.type === "text");
+			return ok(
+				`作业 ${target.id}(子会话 "${target.sub}" 第 ${target.round} 轮)已完成(${(((target.finishedAt ?? Date.now()) - target.startedAt) / 1000).toFixed(1)}s):\n\n${text && text.type === "text" ? text.text : "(no output)"}`,
+				{
+					action: "subsession_probe",
+					job: target.id,
+					status: target.status,
+					jobs: jobsSummary,
+					...(result?.details ?? {}),
+				},
+				result?.usage,
+			);
 		},
 	});
 
