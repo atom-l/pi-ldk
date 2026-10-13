@@ -61,27 +61,56 @@ export class TerminalComponent implements Component, Focusable {
 
 	// -- 渲染 ---------------------------------------------------------------
 
+	/** 边框线(用 borderAccent 配色,让终端面板从聊天流里凸显出来)。 */
+	private border(text: string): string {
+		return this.theme.style(text, { fg: "borderAccent" });
+	}
+
 	render(width: number): string[] {
 		const lines: string[] = [];
+		const inner = Math.max(8, width - 2);
 
-		// 输出窗口
+		// 顶边框 + 标题行(名称 + 状态)
+		lines.push(this.border(`╭${"─".repeat(inner)}╮`));
+		lines.push(this.renderTitle(inner));
+		lines.push(this.border(`├${"─".repeat(inner)}┤`));
+
+		// 输出窗口(带左右边框)
 		for (const raw of this.session.getView(this.scroll, OUTPUT_ROWS)) {
-			lines.push(truncateToWidth(raw, width));
+			lines.push(this.frameRow(raw, inner));
 		}
 
-		// 分隔 + 输入行(带光标标记,供 TUI 定位硬件光标 / IME)
-		lines.push(this.theme.style("─".repeat(Math.max(0, Math.min(width, 80))), { fg: "muted" }));
-		lines.push(this.renderPrompt(width));
+		// 输入区
+		lines.push(this.border(`├${"─".repeat(inner)}┤`));
+		lines.push(this.renderPrompt(inner));
+		lines.push(this.renderStatus(inner));
 
-		// 状态 / 帮助栏
-		lines.push(this.renderStatus(width));
+		// 底边框
+		lines.push(this.border(`╰${"─".repeat(inner)}╯`));
 
 		return lines;
 	}
 
-	private renderPrompt(width: number): string {
+	/** 把一段内容包进左右边框,内部按可视宽度补齐到 inner 列。 */
+	private frameRow(content: string, inner: number): string {
+		const padded = truncateToWidth(content, inner, "…", true);
+		return this.border("│") + padded + this.border("│");
+	}
+
+	private renderTitle(inner: number): string {
+		const st =
+			this.session.status === "running"
+				? this.theme.style("● 运行中", { fg: "success" })
+				: this.theme.style(`■ 已退出(${this.session.exitSignal ?? this.session.exitCode ?? "?"})`, { fg: "error" });
+		const mark = this.theme.style("▸ TERMINAL", { fg: "borderAccent", bold: true });
+		const name = this.theme.style(`· ${this.session.name}`, { fg: "text" });
+		const scroll = this.scroll > 0 ? this.theme.style(` · 回看 ${this.scroll} 行`, { fg: "warning" }) : "";
+		return this.frameRow(` ${mark} ${name} ${st}${scroll} `, inner);
+	}
+
+	private renderPrompt(inner: number): string {
 		const prompt = `${this.shortCwd()} $ `;
-		const avail = Math.max(8, width - visibleWidth(prompt) - 1);
+		const avail = Math.max(6, inner - visibleWidth(prompt) - 1);
 
 		// 光标超出可视范围时,窗口右移到能容纳光标处。
 		let start = 0;
@@ -91,26 +120,23 @@ export class TerminalComponent implements Component, Focusable {
 
 		const head = this.theme.style(prompt, { fg: "accent", bold: true });
 		const body = shown.slice(0, cursorIdx) + CURSOR_MARKER + shown.slice(cursorIdx);
-		return truncateToWidth(head + body, width);
+		// 手动补齐,避免 CURSOR_MARKER 被截断逻辑触碰。
+		const pad = Math.max(0, inner - visibleWidth(prompt) - visibleWidth(shown));
+		return this.border("│") + head + body + " ".repeat(pad) + this.border("│");
 	}
 
-	private renderStatus(width: number): string {
+	private renderStatus(inner: number): string {
 		if (this.confirmDestroy) {
-			return truncateToWidth(
-				this.theme.style(" 再按 Ctrl+X 确认销毁(终止进程) · 按 Esc 取消 ", { fg: "error", bold: true }),
-				width,
+			return this.frameRow(
+				this.theme.style(" ⚠ 再按 Ctrl+X 确认销毁(终止进程) · 按 Esc 取消 ", { fg: "error", bold: true }),
+				inner,
 			);
 		}
-		const st =
-			this.session.status === "running"
-				? this.theme.style("●运行中", { fg: "success" })
-				: this.theme.style(`■已退出(${this.session.exitSignal ?? this.session.exitCode ?? "?"})`, { fg: "muted" });
-		const scrollHint = this.scroll > 0 ? this.theme.style(` 回看-${this.scroll}行 `, { fg: "warning" }) : "";
 		const help = this.theme.style(
-			" Enter=执行 ←→=光标 ↑↓=历史 PgUp/PgDn=滚动 Ctrl+C=中断 Ctrl+L=清屏 Esc=折叠 Ctrl+X=销毁 ",
+			"Enter=执行 ←→=光标 ↑↓=历史 PgUp/PgDn=滚动 Ctrl+C=中断 Ctrl+L=清屏 Esc=折叠 Ctrl+X=销毁",
 			{ fg: "muted" },
 		);
-		return truncateToWidth(`${st} ${this.session.name}${scrollHint} ${help}`, width);
+		return this.frameRow(` ${help} `, inner);
 	}
 
 	private shortCwd(): string {
