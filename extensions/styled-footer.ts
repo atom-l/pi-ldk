@@ -4,9 +4,9 @@
  * 用 `ctx.ui.setFooter` 接管整个底栏,替换 pi 默认的「全 dim 三行」样式,提供有层次的
  * 富文本状态栏:
  *
- *   ~/proj/api ▸ main ▸ coding                          ← 位置:路径(实)·分支(accent)·会话名(暗)
+ *   /workspaces/proj/api ⎇ main ▸ coding               ← 位置:full path(青)·分支(紫)·会话名(琥珀)
  *   ↑2.1M ↓45k R8.2M $1.23 ▮▮▮▮▯▯▯▯ 45%·200k   gpt-5 · high   ← 统计 + 上下文进度条 + 右对齐 model
- *   ▌agent-mode:auto  ▌wd:proj                          ← 扩展状态徽章(带色条,不再是裸文本)
+ *   ▌agent-mode:auto  ▌wd:/workspaces/proj/api          ← 扩展状态徽章(带色条,full path)
  *
  * 数据来源(与默认底栏一致,信息不丢):
  *   - footerData.getGitBranch() / getExtensionStatuses() / getAvailableProviderCount()
@@ -33,14 +33,26 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
-/** 家目录缩写为 ~。 */
-function shortenPath(p: string): string {
-	const home = process.env.HOME || process.env.USERPROFILE;
-	if (!home) return p;
-	const resolvedHome = home.replace(/\/+$/, "");
-	if (p === resolvedHome) return "~";
-	if (p.startsWith(resolvedHome + "/")) return "~" + p.slice(resolvedHome.length);
-	return p;
+/** thinking 档位 → 主题色 token(每档独立配色,便于视觉区分)。 */
+function thinkingColor(level: string): string {
+	switch (level) {
+		case "minimal":
+			return "thinkingMinimal";
+		case "low":
+			return "thinkingLow";
+		case "medium":
+			return "thinkingMedium";
+		case "high":
+			return "thinkingHigh";
+		case "xhigh":
+			return "thinkingXhigh";
+		case "max":
+			return "thinkingMax";
+		case "off":
+			return "thinkingOff";
+		default:
+			return "thinkingText";
+	}
 }
 
 /** 清洗单行状态文本:去换行 / 制表 / 控制字符,折叠空格。 */
@@ -61,10 +73,10 @@ function badgeColor(key: string, text: string): string {
 		if (v.includes("agent") && !v.includes("auto")) return "accent";
 		return "success"; // auto
 	}
-	if (k.startsWith("workdir") || k.startsWith("wd")) return "accent";
-	if (k.includes("image") || k.includes("gen")) return "success";
-	if (k.includes("term")) return "muted";
-	return "text";
+	if (k.startsWith("workdir") || k.startsWith("wd")) return "bashMode";
+	if (k.includes("image") || k.includes("gen")) return "thinkingMax";
+	if (k.includes("term")) return "syntaxVariable";
+	return "syntaxKeyword";
 }
 
 // ---------------------------------------------------------------------------
@@ -175,12 +187,12 @@ export default function (pi: ExtensionAPI): void {
 
 				// -- 第 1 行:位置(路径 · 分支 · 会话名) ------------------------
 				function renderLocation(width: number): string {
-					const cwd = shortenPath(latestCtx?.cwd ?? process.cwd());
-					const parts: string[] = [theme.fg("text", cwd)];
+					const cwd = latestCtx?.cwd ?? process.cwd();
+					const parts: string[] = [theme.fg("syntaxVariable", cwd)];
 					const branch = footerData.getGitBranch();
 					if (branch) parts.push(theme.fg("accent", `⎇ ${branch}`));
 					const name = (latestCtx?.sessionManager as { getSessionName?: () => string })?.getSessionName?.();
-					if (name) parts.push(theme.fg("muted", `▸ ${name}`));
+					if (name) parts.push(theme.fg("syntaxString", `▸ ${name}`));
 					return truncateToWidth(parts.join(dim(" · ")), width, dim("…"));
 				}
 
@@ -189,14 +201,14 @@ export default function (pi: ExtensionAPI): void {
 					const ctx = latestCtx;
 					const s = ctx ? statsFor(ctx) : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, cacheHit: undefined };
 					const statsParts: string[] = [];
-					if (s.input) statsParts.push(theme.fg("muted", "↑") + theme.fg("text", formatTokens(s.input)));
-					if (s.output) statsParts.push(theme.fg("muted", "↓") + theme.fg("text", formatTokens(s.output)));
-					if (s.cacheRead) statsParts.push(theme.fg("muted", "R") + theme.fg("text", formatTokens(s.cacheRead)));
-					if (s.cacheWrite) statsParts.push(theme.fg("muted", "W") + theme.fg("text", formatTokens(s.cacheWrite)));
+					if (s.input) statsParts.push(theme.fg("syntaxKeyword", `↑${formatTokens(s.input)}`));
+					if (s.output) statsParts.push(theme.fg("bashMode", `↓${formatTokens(s.output)}`));
+					if (s.cacheRead) statsParts.push(theme.fg("thinkingXhigh", `R${formatTokens(s.cacheRead)}`));
+					if (s.cacheWrite) statsParts.push(theme.fg("thinkingMax", `W${formatTokens(s.cacheWrite)}`));
 					if (s.cacheHit !== undefined && (s.cacheRead || s.cacheWrite)) {
-						statsParts.push(theme.fg("muted", "CH") + theme.fg("success", `${s.cacheHit.toFixed(0)}%`));
+						statsParts.push(theme.fg("success", `CH${s.cacheHit.toFixed(0)}%`));
 					}
-					if (s.cost) statsParts.push(theme.fg("success", `$${s.cost.toFixed(2)}`));
+					if (s.cost) statsParts.push(theme.fg("warning", `$${s.cost.toFixed(2)}`));
 
 					// 上下文进度条 + 百分比
 					const cu = ctx?.getContextUsage();
@@ -215,10 +227,10 @@ export default function (pi: ExtensionAPI): void {
 
 					// 右侧:model · thinking(多 provider 时前置 provider)
 					const model = ctx?.model;
-					let right = model ? theme.fg("accent", model.id) : dim("no-model");
+					let right = model ? theme.fg("thinkingMedium", model.id) : dim("no-model");
 					const thinking = ctx?.thinkingLevel;
 					if (model?.reasoning) {
-						right += dim(" · ") + (thinking && thinking !== "off" ? theme.fg("muted", thinking) : dim("thinking off"));
+						right += dim(" · ") + (thinking && thinking !== "off" ? theme.fg(thinkingColor(thinking), thinking) : dim("thinking off"));
 					}
 					if (model && footerData.getAvailableProviderCount() > 1) {
 						right = dim("(") + theme.fg("muted", model.provider) + dim(") ") + right;

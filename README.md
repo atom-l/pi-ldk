@@ -158,7 +158,7 @@ resume、分支切换后自动同步。`/agent-mode` 不带参数时弹出选项
 /workdir ~/proj/api      # 绝对路径;~ 会展开为家目录
 ```
 
-**当前工作目录常驻底栏**:以 `wd:<目录名>` 显示在状态栏;切换、resume、分支切换后自动同步。
+**当前工作目录常驻底栏**:以 `wd:<完整路径>` 显示在状态栏(full path,不缩写);切换、resume、分支切换后自动同步。
 `/workdir` 不带参数时弹出选项列表——就近列出当前目录的**子目录**供快选(便于聚焦到子项目),
 也可选「输入路径…」手输,或「重置为默认目录」回到会话启动目录。
 
@@ -179,15 +179,20 @@ resume / 分支切换后按分支历史重放恢复;目标路径不存在、或�
 提供有层次的富文本状态栏:
 
 ```
-~/proj/api · ⎇ main · ▸ coding                                   ← 位置:路径·分支·会话名
+/workspaces/proj/api · ⎇ main · ▸ coding                          ← 位置:full path·分支·会话名
 ↑2.1M ↓45k R8.2M W12k CH80% $1.24 ▮▮▮▮▮▯▯▯▯▯ 45%·200k   (openai) gpt-5 · high
-▌ agent-mode:auto   ▌ wd:proj                                    ← 扩展状态徽章
+▌ agent-mode:auto   ▌ wd:/workspaces/proj/api                     ← 扩展状态徽章(full path)
 ```
 
-- **位置行**:工作路径(浅色)· git 分支(强调色)· 会话名(暗色);
+- **位置行**:工作路径(**full path**,青色)· git 分支(紫)· 会话名(琥珀);
 - **统计行**:token 用量 ↑↓RW、缓存命中 CH、花费 $,接**上下文进度条**(▮▮▯ 十格 + 百分比,
   按阈值变色:>90% 红 / >70% 黄 / 其余绿)+ 右对齐 model 与 thinking 档位(多 provider 时前置 provider);
 - **徽章行**:各扩展 `setStatus` 的状态以 `▌ 文本` 徽章呈现(按语义配色),不再是裸文本堆叠。
+
+**配色分层**:各模块用**互不相同**的色相,便于视觉直接区分——路径(青 `syntaxVariable`)、
+分支(紫 `accent`)、会话名(琥珀 `syntaxString`)、model(深紫 `thinkingMedium`)、↑(蓝)、
+↓(青绿)、R(洋红)、W(橙)、CH(绿)、花费(黄),避免同色混淆(如早先分支/model/工作目录
+三处同紫、CH/花费同绿)。
 
 渲染按会话条目数缓存(`invalidate` 重算),避免每帧全量扫描。**纯渲染层改动**:不改变任何会话状态、
 `.pi` 解析、进程 cwd;`session_shutdown` 时还原默认底栏。

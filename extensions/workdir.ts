@@ -30,7 +30,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { statSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve, sep, basename, dirname } from "node:path";
+import { isAbsolute, join, resolve, sep, dirname } from "node:path";
 
 /** 会话条目类型(用于持久化与回放)。 */
 const ENTRY_TYPE = "session-workdir-v1";
@@ -79,12 +79,6 @@ function listSubdirs(dir: string): string[] {
 	} catch {
 		return [];
 	}
-}
-
-/** 短标签:取末段目录名;根目录退化为完整路径。 */
-function shortLabel(p: string): string {
-	const base = basename(p);
-	return base || p;
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +153,7 @@ export default function (pi: ExtensionAPI): void {
 	/** 把当前工作目录写入底栏状态位(非交互模式无底栏,静默忽略)。 */
 	function updateStatus(ctx: { ui?: { setStatus?: (key: string, text: string | undefined) => void } }): void {
 		try {
-			ctx.ui?.setStatus?.("workdir", workDir ? `wd:${shortLabel(workDir)}` : undefined);
+			ctx.ui?.setStatus?.("workdir", workDir ? `wd:${workDir}` : undefined);
 		} catch {
 			/* 忽略 */
 		}
