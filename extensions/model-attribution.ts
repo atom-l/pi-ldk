@@ -301,6 +301,6 @@ export default function modelAttributionExtension(pi: ExtensionAPI): void {
     const message = event.message;
     if (message.role !== "assistant") return;
     const cleaned = stripEchoedAttributionTag(message as unknown as MessageLike);
-    if (cleaned !== message) return { message: cleaned as unknown as typeof message };
+    if ((cleaned as unknown) !== (message as unknown)) return { message: cleaned as unknown as typeof message };
   });
 }

@@ -72,7 +72,7 @@ function truncate(text: string, max: number): string {
 }
 
 /** Extract text from a message content (string or content-block array). */
-function textOf(content: string | unknown[] | undefined): string {
+function textOf(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	const parts: string[] = [];
