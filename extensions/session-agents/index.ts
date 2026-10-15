@@ -41,7 +41,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { Api, AssistantMessage, Message, Model, Tool, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
-import { matchesKey, Text, wrapTextWithAnsi, type Component, type Focusable } from "@earendil-works/pi-tui";
+import { matchesKey, Text, truncateToWidth, wrapTextWithAnsi, type Component, type Focusable } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { InsightStore, INSIGHT_KINDS, tokenize, type InsightKind, type InsightRecord } from "./insights.ts";
 
@@ -115,6 +115,8 @@ const TRACE_PROMPT_CHARS = 400;
 const TRACE_LOG_CAP = 120;
 /** 展开视图里每个 trace 最多展示的步数。 */
 const TRACE_RENDER_STEPS = 120;
+/** /agent-trace 面板定时器的自停上限(防 pi 侧拆除未 dispose 时永久空转)。 */
+const TRACE_OVERLAY_MAX_MS = 30 * 60 * 1000;
 
 const DESK_SECTIONS = ["findings", "decisions", "issues", "open", "artifacts", "notes"] as const;
 
@@ -940,19 +942,9 @@ export default function (pi: ExtensionAPI) {
 		signal: AbortSignal | undefined,
 		onUpdate: ((partial: AgentToolResult<ToolDetails>) => void) | undefined,
 		label: string,
-		traceCtx: { sub: string; round: number; agent: string },
+		agentTrace: AgentTrace,
 	): Promise<TurnResult> {
 		const usage = emptyUsage();
-		const agentTrace = registerTrace({
-			sub: traceCtx.sub,
-			round: traceCtx.round,
-			agent: traceCtx.agent,
-			label,
-			model: `${opts.model.provider}/${opts.model.id}`,
-			status: "running",
-			startedAt: Date.now(),
-			steps: [],
-		});
 		// liveDetails:随执行推进刷新的 trace 快照,随 onUpdate 下发给阻塞式调用的渲染器。
 		const liveDetails = (): ToolDetails => ({ action: "run", traces: [{ ...agentTrace, steps: [...agentTrace.steps] }] });
 		const { tools: toolDefs, error: toolError } = resolveTools(ctx, opts.toolNames);
@@ -996,13 +988,27 @@ export default function (pi: ExtensionAPI) {
 
 			const calls = response.content.filter((block) => block.type === "toolCall");
 			const wantsTools = response.stopReason === "toolUse" && calls.length > 0 && toolDefs.length > 0;
+			// 记录“模型请求了但本轮未执行”的工具调用,保持内部记录完整(便于排障)。
+			const noteUnexecuted = (reason: string): void => {
+				for (const c of calls) {
+					pushStep(agentTrace, {
+						kind: "tool_call",
+						turn,
+						toolName: c.name,
+						args: truncate(`${JSON.stringify(c.arguments) ?? ""} [未执行:${reason}]`, TRACE_ARGS_CHARS),
+						timestamp: Date.now(),
+					});
+				}
+			};
 			if (!wantsTools) {
+				if (calls.length > 0) noteUnexecuted("未进入工具执行");
 				answer = textOf(response);
 				stopReason = response.stopReason;
 				errorMessage = response.errorMessage;
 				break;
 			}
 			if (turn === opts.maxTurns) {
+				noteUnexecuted(`达到 maxTurns=${opts.maxTurns}`);
 				answer = `${textOf(response)}\n\n[reached maxTurns=${opts.maxTurns} before a final answer]`;
 				stopReason = "maxTurns";
 				break;
@@ -1013,7 +1019,7 @@ export default function (pi: ExtensionAPI) {
 					kind: "tool_call",
 					turn,
 					toolName: call.name,
-					args: truncate(JSON.stringify(call.arguments), TRACE_ARGS_CHARS),
+					args: truncate(JSON.stringify(call.arguments) ?? "", TRACE_ARGS_CHARS),
 					timestamp: Date.now(),
 				});
 				onUpdate?.({
@@ -1078,6 +1084,8 @@ export default function (pi: ExtensionAPI) {
 		/** 子会话名。 */
 		sub: string;
 		round: number;
+		/** 轮号已由 runRound 在锁内分配(否则仍为估计值,不挂 trace)。 */
+		roundReady?: boolean;
 		startedAt: number;
 		finishedAt?: number;
 		status: "running" | "done" | "failed" | "cancelled";
@@ -1156,6 +1164,8 @@ export default function (pi: ExtensionAPI) {
 		parallelAgents?: boolean;
 		/** 是否允许与同子会话的其他轮重叠执行(默认 false 串行)。 */
 		concurrentRounds?: boolean;
+		/** 在锁内分配到真实轮号后回调(后台派发用它回填 job.round,避免估计值串号)。 */
+		onRoundAllocated?: (round: number) => void;
 	}
 
 	async function runRound(
@@ -1218,6 +1228,7 @@ export default function (pi: ExtensionAPI) {
 			});
 			if (!prep.ok) return fail(prep.error, { action: "subsession_run" });
 			const { participants, round } = prep;
+			params.onRoundAllocated?.(round);
 			const snapshot = prep.current;
 
 			// -- 阶段 2:执行 agent(parallelAgents 决定串行 / 并行) ----------
@@ -1237,6 +1248,17 @@ export default function (pi: ExtensionAPI) {
 				const role = roles.get(assignment.agent);
 				if (!role) return null;
 				const instruction = buildInstruction(assignment, sub0);
+				// 预建 trace 并注册:runTurn 写入各阶段;异常时在此收尾,避免留下孤儿 running trace。
+				const agentTrace = registerTrace({
+					sub: name,
+					round,
+					agent: role.config.name,
+					label: `role:${role.config.name}`,
+					model: role.config.model,
+					status: "running",
+					startedAt: Date.now(),
+					steps: [],
+				});
 				try {
 					const systemPrompt = buildTurnPrompt(role, sub0, assignment);
 					const turn = await runTurn(
@@ -1254,35 +1276,19 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						onUpdate,
 						`role:${role.config.name}`,
-						{ sub: name, round, agent: role.config.name },
+						agentTrace,
 					);
 					return { assignment, role, turn, instruction };
 				} catch (error) {
-					const fallback = registerTrace({
-						sub: name,
-						round,
-						agent: role.config.name,
-						label: `role:${role.config.name}`,
-						model: role.config.model,
-						status: "error",
-						startedAt: Date.now(),
-						endedAt: Date.now(),
-						steps: [],
-					});
-					pushStep(fallback, { kind: "error", turn: 0, text: error instanceof Error ? error.message : String(error), timestamp: Date.now() });
+					const msg = error instanceof Error ? error.message : String(error);
+					agentTrace.status = "error";
+					agentTrace.endedAt = Date.now();
+					pushStep(agentTrace, { kind: "error", turn: 0, text: msg, timestamp: Date.now() });
 					return {
 						assignment,
 						role,
 						instruction,
-						turn: {
-							text: "",
-							usage: emptyUsage(),
-							turns: 0,
-							toolCalls: 0,
-							stopReason: "error",
-							errorMessage: error instanceof Error ? error.message : String(error),
-							trace: fallback,
-						},
+						turn: { text: "", usage: emptyUsage(), turns: 0, toolCalls: 0, stopReason: "error", errorMessage: msg, trace: agentTrace },
 					};
 				}
 			};
@@ -1303,7 +1309,7 @@ export default function (pi: ExtensionAPI) {
 			// -- 阶段 3:提交(短锁,保证并发轮的 log / usage / 计数不乱) ----
 			return withLock(`${name}:commit`, async () => {
 				const current = subs.get(name);
-				if (!current) return fail(`Sub-session "${name}" was discarded.`, { action: "subsession_run" });
+				if (!current) return fail(`Sub-session "${name}" was discarded.`, { action: "subsession_run", traces: outcomes.map((o) => o.turn.trace) });
 				if (current.status === "done") {
 					const notes = outcomes.map(
 						({ assignment, role, turn }) =>
@@ -1311,7 +1317,7 @@ export default function (pi: ExtensionAPI) {
 					);
 					return ok(
 						`本轮 ${round} 的 agent 已完成,但子会话 "${name}" 已收尾(done),不再写入日志/桌面。以下为本轮产出(未纳入子会话):\n\n${notes.join("\n")}`,
-						{ action: "subsession_run", subsession: summarizeSub(current), round, superseded: true },
+						{ action: "subsession_run", subsession: summarizeSub(current), round, superseded: true, traces: outcomes.map((o) => o.turn.trace) },
 					);
 				}
 				const appended: LogEntry[] = [];
@@ -1352,7 +1358,7 @@ export default function (pi: ExtensionAPI) {
 					round,
 					parallelAgents: !!params.parallelAgents,
 					concurrentRounds: !!params.concurrentRounds,
-					traces: tracesFor(name, round, 12),
+					traces: outcomes.map((o) => o.turn.trace),
 					contributions: appended.map((entry) => ({ agent: entry.agent, turns: entry.turns, toolCalls: entry.toolCalls })),
 				}, roundUsage);
 			});
@@ -1754,8 +1760,14 @@ export default function (pi: ExtensionAPI) {
 					promise: Promise.resolve(),
 					controller,
 				};
+				// runRound 在锁内分配到真实轮号后回填 job.round,避免估计值在并发派发下串号。
+				roundParams.onRoundAllocated = (r) => {
+					job.round = r;
+					job.roundReady = true;
+				};
 				job.promise = runRound(roundParams, ctx, controller.signal, undefined)
 					.then((result) => {
+						if (job.status !== "running") return; // 已取消/收尾:不覆写状态
 						job.result = result;
 						job.status = result.isError ? "failed" : "done";
 						if (result.isError) {
@@ -1765,6 +1777,7 @@ export default function (pi: ExtensionAPI) {
 						job.finishedAt = Date.now();
 					})
 					.catch((error) => {
+						if (job.status !== "running") return; // 已取消/收尾:不覆写状态
 						job.error = error instanceof Error ? error.message : String(error);
 						job.status = "failed";
 						job.finishedAt = Date.now();
@@ -1838,16 +1851,17 @@ export default function (pi: ExtensionAPI) {
 			const jobsSummary = all.map((j) => ({
 				id: j.id,
 				sub: j.sub,
-				round: j.round,
+				round: j.roundReady ? j.round : "pending",
 				status: j.status,
 				seconds: ((j.finishedAt ?? Date.now()) - j.startedAt) / 1000,
 			}));
 
+			const roundDesc = target.roundReady ? `第 ${target.round} 轮` : "(轮号待分配)";
 			if (target.status === "running") {
 				return ok(
-					`作业 ${target.id}(子会话 "${target.sub}" 第 ${target.round} 轮)仍在运行,已跑 ${(((Date.now() - target.startedAt) / 1000) | 0)}s。\n` +
+					`作业 ${target.id}(子会话 "${target.sub}" ${roundDesc})仍在运行,已跑 ${(((Date.now() - target.startedAt) / 1000) | 0)}s。\n` +
 						`可继续做别的事,稍后再 subsession_probe(job="${target.id}");或用 wait=<秒> 限时等待。`,
-					{ action: "subsession_probe", job: target.id, status: target.status, traces: tracesFor(target.sub, target.round, 12), jobs: jobsSummary },
+					{ action: "subsession_probe", job: target.id, status: target.status, traces: target.roundReady ? tracesFor(target.sub, target.round, 12) : [], jobs: jobsSummary },
 				);
 			}
 			if (target.status === "cancelled") {
@@ -1855,7 +1869,7 @@ export default function (pi: ExtensionAPI) {
 					action: "subsession_probe",
 					job: target.id,
 					status: target.status,
-					traces: tracesFor(target.sub, target.round, 12),
+					traces: target.roundReady ? tracesFor(target.sub, target.round, 12) : [],
 					jobs: jobsSummary,
 				});
 			}
@@ -1864,7 +1878,7 @@ export default function (pi: ExtensionAPI) {
 					action: "subsession_probe",
 					job: target.id,
 					status: target.status,
-					traces: tracesFor(target.sub, target.round, 12),
+					traces: target.roundReady ? tracesFor(target.sub, target.round, 12) : [],
 					jobs: jobsSummary,
 				});
 			}
@@ -1873,7 +1887,7 @@ export default function (pi: ExtensionAPI) {
 			const result = target.result;
 			const text = result?.content?.find((b) => b.type === "text");
 			return ok(
-				`作业 ${target.id}(子会话 "${target.sub}" 第 ${target.round} 轮)已完成(${(((target.finishedAt ?? Date.now()) - target.startedAt) / 1000).toFixed(1)}s):\n\n${text && text.type === "text" ? text.text : "(no output)"}`,
+				`作业 ${target.id}(子会话 "${target.sub}" ${roundDesc})已完成(${(((target.finishedAt ?? Date.now()) - target.startedAt) / 1000).toFixed(1)}s):\n\n${text && text.type === "text" ? text.text : "(no output)"}`,
 				{
 					action: "subsession_probe",
 					job: target.id,
@@ -2174,11 +2188,16 @@ export default function (pi: ExtensionAPI) {
 			...next(),
 			renderResult: (result, options, theme) => {
 				const details = result.details as
-					| { traces?: AgentTrace[]; subsession?: { name?: string }; status?: string; background?: boolean }
+					| { traces?: AgentTrace[]; subsession?: { name?: string }; round?: number; job?: string; status?: string; background?: boolean }
 					| undefined;
 				// 结果自带 trace 快照;后台派发 / 运行中的结果没有,则回落到该子会话的实时 trace。
 				let traces = details?.traces ?? [];
-				if (traces.length === 0 && details?.subsession?.name) traces = tracesFor(details.subsession.name);
+				if (traces.length === 0 && details?.subsession?.name) {
+					const job = typeof details.job === "string" ? jobs.get(details.job) : undefined;
+					const wantRound = typeof details.round === "number" ? details.round : job?.roundReady ? job.round : undefined;
+					// 仅在能确定轮号时才回落,避免把别轮 trace 挂到本条目。
+					if (wantRound !== undefined) traces = tracesFor(details.subsession.name, wantRound);
+				}
 				const contentText = (result.content ?? [])
 					.map((block) => (block.type === "text" ? block.text : ""))
 					.filter(Boolean)
@@ -2206,13 +2225,25 @@ export default function (pi: ExtensionAPI) {
 		private readonly done: () => void;
 		private readonly requestRender: () => void;
 		private readonly timer: ReturnType<typeof setInterval>;
+		private readonly startedAt = Date.now();
+		private disposed = false;
 		private offset = 0;
 
 		constructor(tui: { requestRender: (force?: boolean) => void }, theme: Theme, done: () => void) {
 			this.theme = theme;
 			this.done = done;
-			this.requestRender = () => tui.requestRender();
-			this.timer = setInterval(() => this.requestRender(), 500);
+			this.requestRender = () => {
+				if (!this.disposed) tui.requestRender();
+			};
+			// 定时刷新;dispose 负责清埋。即使 pi 侧拆除未调 dispose,也在 MAX_MS 后自停,
+			// 避免定时器永久空转(资源泄漏)。
+			this.timer = setInterval(() => {
+				if (Date.now() - this.startedAt > TRACE_OVERLAY_MAX_MS) {
+					clearInterval(this.timer); // 只停定时刷新;保持输入驱动的 requestRender 存活,避免面板冻结
+					return;
+				}
+				this.requestRender();
+			}, 500);
 		}
 
 		handleInput(data: string): void {
@@ -2221,11 +2252,11 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (matchesKey(data, "up")) this.offset += 1;
-			else if (matchesKey(data, "down")) this.offset = Math.max(0, this.offset - 1);
+			else if (matchesKey(data, "down")) this.offset -= 1;
 			else if (matchesKey(data, "pageUp")) this.offset += 12;
-			else if (matchesKey(data, "pageDown")) this.offset = Math.max(0, this.offset - 12);
-			else if (matchesKey(data, "home")) this.offset = 1_000_000;
-			else if (matchesKey(data, "end")) this.offset = 0;
+			else if (matchesKey(data, "pageDown")) this.offset -= 12;
+			else if (matchesKey(data, "home")) this.offset = Number.MAX_SAFE_INTEGER; // 到顶(render 钳位)
+			else if (matchesKey(data, "end")) this.offset = 0; // 到底(实时尾部)
 			else return;
 			this.requestRender();
 		}
@@ -2233,12 +2264,14 @@ export default function (pi: ExtensionAPI) {
 		invalidate(): void {}
 
 		dispose(): void {
+			this.disposed = true;
 			clearInterval(this.timer);
 		}
 
 		render(width: number): string[] {
 			const th = this.theme;
-			const traces = [...traceLog].reverse();
+			// 时间正序(旧→新):默认窗口落在尾部=最新 trace 的最新步骤=实时进度。
+			const traces = [...traceLog];
 			const logical: string[] = [
 				th.fg("accent", th.bold("子会话内部会话记录 · 运行追踪")) +
 					th.fg("dim", "  (Esc/q 关闭 · ↑↓/PgUp/PgDn/Home/End 滚动 · 500ms 自动刷新)"),
@@ -2249,9 +2282,13 @@ export default function (pi: ExtensionAPI) {
 			const wrapped: string[] = [];
 			for (const line of logical) wrapped.push(...wrapTextWithAnsi(line || " ", width));
 			const WINDOW = 26;
-			const end = Math.max(0, wrapped.length - this.offset);
+			// offset=0 显示尾部;offset↑ 向上翻。钳到 [0, maxOffset],避免 home 翻成空白窗口。
+			const maxOffset = Math.max(0, wrapped.length - WINDOW);
+			const off = Math.max(0, Math.min(this.offset, maxOffset));
+			this.offset = off;
+			const end = wrapped.length - off;
 			const start = Math.max(0, end - WINDOW);
-			const footer = th.fg("dim", `── ${traces.length} 个 trace · 行 ${start + 1}-${end}/${wrapped.length} ──`);
+			const footer = truncateToWidth(th.fg("dim", `── ${traces.length} 个 trace · 行 ${start + 1}-${end}/${wrapped.length} ──`), width);
 			return [footer, ...wrapped.slice(start, end), footer];
 		}
 	}
