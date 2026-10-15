@@ -146,6 +146,40 @@ resume、分支切换后自动同步。`/agent-mode` 不带参数时弹出选项
 模式随会话持久化:切换写入 `mode_set` 操作,resume / 分支切换后按分支历史重放恢复;
 新建会话(无 `mode_set` 记录)一律为 `auto`。
 
+### 模型能力评分
+
+为让主模型在创建角色 / 指派任务时有选型依据,`models.json` 各模型条目支持 `capabilities`
+字段:维度名 → 1-100 的整数评分,数值越高能力越强。
+
+```json
+{
+  "id": "glm-5.3",
+  "capabilities": {
+    "通用知识与推理": 92,
+    "数学与形式推理": 90,
+    "代码能力": 91,
+    "任务规划能力": 88,
+    "速度": 60
+  }
+}
+```
+
+- **默认维度**:`通用知识与推理`、`数学与形式推理`、`代码能力`、`任务规划能力`、`速度`;
+  展示时默认维度在前,自定义维度按写入顺序在后;
+- **自由扩展**:维度名不限,只要名称能让模型看懂是什么能力(如 `长文本翻译`、`指令遵循`);
+  分数自动收敛到 1-100 整数,非法项忽略;`modelOverrides` 条目(key 为模型 id)同样支持
+  `capabilities`,与该模型 models[] 已有评分**按维度合并**(同名维度以 override 为准),
+  可用于给内置 provider 的模型补评分;
+- **不评多模态与长上下文**:输入模态(`input`)与上下文窗口(`contextWindow`)本就是
+  models.json 的既有配置,菜单直接展示,不做重复评分;
+- **生效方式**:`before_agent_start` 注入系统提示的 `<session_agents_models>` 模型菜单
+  (off 模式不注入;会话模型优先,带评分者次之,封顶 24 条),`agent_list` 同步列出评分
+  与关键元数据(模态 / reasoning / 窗口 / 输出上限 / 价格);models.json 修改即时生效,
+  无需重启。
+
+评分是主观校准值,由用户自行标定;主模型按维度选型:勘察 / 批量读文件的角色优先「速度」,
+写代码 / 评审看「代码能力」,任务拆解与最终合成看「任务规划能力」与「通用知识与推理」。
+
 ### 会话工作目录
 
 给会话划定一个**概念上的工作范围**:声明当前会话在某个目录上工作,并引导模型把注意力
@@ -201,11 +235,11 @@ resume / 分支切换后按分支历史重放恢复;目标路径不存在、或�
 
 | 工具 | 作用 |
 |---|---|
-| `agent_create` | 创建角色:name、description、systemPrompt(固定上下文)、model、tools、maxTurns |
+| `agent_create` | 创建角色:name、description、systemPrompt(固定上下文)、model(按能力评分选型)、tools、maxTurns |
 | `agent_update` | 修改角色配置或追加固定上下文 |
-| `agent_list` | 列出角色、子会话、可选模型清单 |
+| `agent_list` | 列出角色、子会话、可选模型清单(含能力评分与关键元数据) |
 | `agent_discard` | 丢弃角色(单个 / 全部) |
-| `subsession_create` | 创建子会话:task(目标与验收)、context(任务上下文)、assignments(指派角色)、synthesisModel |
+| `subsession_create` | 创建子会话:task(目标与验收)、context(任务上下文)、assignments(指派角色)、synthesisModel(按能力评分选强推理模型) |
 | `subsession_run` | 跑一轮协作:参与者在公共桌面工作并给出贡献,返回本轮摘要与桌面状态;调度方式可选(见下) |
 | `subsession_probe` | 查后台作业进度 / 取结果(status / done / failed,可带 `wait=<秒>` 限时等待) |
 | `subsession_finish` | 收尾合成,返回【结果】+【额外信息】,并沉淀经验到记忆 |

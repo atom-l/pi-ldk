@@ -12,6 +12,10 @@
  *   3. 经验记忆(工具 insight_*):结果与额外信息沉淀为跨会话的记忆记录,
  *      提供类 RAG 的快速召回 / 回溯(BM25,无模型调用),并在后续任务开始时
  *      主动把相关经验作为"启发提示"注入系统提示。
+ *   4. 模型能力评分(models.json 各模型的 capabilities):各维度 1-100 分,
+ *      默认维度为通用知识与推理 / 数学与形式推理 / 代码能力 / 任务规划能力 /
+ *      速度,用户可自由扩展维度名;注入系统提示的 <session_agents_models>
+ *      模型菜单并进入 agent_list,为主模型创建角色 / 选模时提供参考。
  *
  * 生命周期:角色与子会话的生命周期等于会话(内存态 + custom entry 持久化,
  * resume / 分支切换后恢复);经验记忆存放在 agent 目录下的 JSONL,跨会话存活。
@@ -19,6 +23,7 @@
  * 本扩展是 ldk 包(pi-ldk)的一部分,入口由 package.json 的 pi.extensions 声明。
  */
 
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type {
 	AgentToolResult,
@@ -47,6 +52,19 @@ const MAX_TURN_LOG = 80;
 const TURN_LOG_KEEP = 60;
 const MAX_DESK_ENTRIES = 24;
 const MAX_MODEL_LISTING = 120;
+/** 模型能力评分的默认维度(models.json 的 capabilities 可自由新增维度名)。 */
+const DEFAULT_CAPABILITY_DIMS: readonly string[] = [
+	"通用知识与推理",
+	"数学与形式推理",
+	"代码能力",
+	"任务规划能力",
+	"速度",
+];
+/** 能力评分取值范围(闭区间,越界值收敛)。 */
+const CAPABILITY_MIN = 1;
+const CAPABILITY_MAX = 100;
+/** 注入系统提示的模型菜单条数上限(agent_list 仍列 MAX_MODEL_LISTING 个)。 */
+const INJECTED_MODEL_LIMIT = 24;
 /** 工作日志摘要里每条贡献的字符上限。 */
 const LOG_ENTRY_CHARS = 1_500;
 /** 桌面每条记录的字符上限。 */
@@ -118,7 +136,7 @@ const WORK_MODE_GUIDANCE: Record<WorkMode, string> = {
 };
 
 function workModeSection(mode: WorkMode): string {
-	return `<session_agents_work_mode>\n${WORK_MODE_GUIDANCE[mode]}\n</session_agents_work_mode>`;
+	return WORK_MODE_GUIDANCE[mode];
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +214,6 @@ interface SubSessionState {
 type StoreOp =
 	| { op: "role_create"; role: RoleState }
 	| { op: "role_update"; name: string; patch: Partial<RoleConfig>; appendContext?: string }
-	| { op: "role_stats"; name: string; runs: number; usage: Usage }
 	| { op: "role_stats"; name: string; runs: number; usage: Usage }
 	| { op: "role_discard"; name: string }
 	| { op: "role_discard_all" }
@@ -324,6 +341,133 @@ function fail(message: string, details: ToolDetails): AgentToolResult<ToolDetail
 }
 
 // ---------------------------------------------------------------------------
+// 模型能力评分(models.json 各模型条目的 capabilities 字段)
+// ---------------------------------------------------------------------------
+
+/** 一个模型的能力评分表:维度名 → 1-100 分。 */
+type Capabilities = Record<string, number>;
+
+/** capabilities 原始值清洗:非法项丢弃,数值收敛到 [1,100] 整数。 */
+function sanitizeCapabilities(raw: unknown): Capabilities | undefined {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+	const out: Capabilities = {};
+	for (const [dimension, value] of Object.entries(raw as Record<string, unknown>)) {
+		const name = dimension.trim();
+		if (!name || typeof value !== "number" || !Number.isFinite(value)) continue;
+		out[name] = Math.min(CAPABILITY_MAX, Math.max(CAPABILITY_MIN, Math.round(value)));
+	}
+	return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** models.json 的 mtime 缓存:文件编辑后无需重启会话即可生效。 */
+let capabilityCache: { mtimeMs: number; map: Map<string, Capabilities> } | undefined;
+
+/** 读取 agent 目录 models.json(models[] 与 modelOverrides)里的能力评分表。 */
+function loadCapabilities(): Map<string, Capabilities> {
+	const file = join(getAgentDir(), "models.json");
+	let mtimeMs = 0;
+	try {
+		mtimeMs = statSync(file).mtimeMs;
+	} catch {
+		return new Map();
+	}
+	if (capabilityCache && capabilityCache.mtimeMs === mtimeMs) return capabilityCache.map;
+	const map = new Map<string, Capabilities>();
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+		const providers = (parsed as { providers?: Record<string, unknown> } | null)?.providers;
+		if (providers && typeof providers === "object") {
+			for (const [providerId, providerValue] of Object.entries(providers)) {
+				const provider = providerValue as { models?: unknown[]; modelOverrides?: Record<string, unknown> } | null;
+				for (const entry of provider?.models ?? []) {
+					const id = (entry as { id?: unknown } | null)?.id;
+					if (typeof id !== "string" || !id) continue;
+					const caps = sanitizeCapabilities((entry as { capabilities?: unknown }).capabilities);
+					if (caps) map.set(`${providerId}/${id}`, caps);
+				}
+				for (const [modelId, override] of Object.entries(provider?.modelOverrides ?? {})) {
+					// pi 的 override key 为模型 id;容错处理误写成 "provider/model-id" 的情况。
+					const bareId = modelId.includes("/") ? modelId.slice(modelId.lastIndexOf("/") + 1) : modelId;
+					if (!bareId) continue;
+					const caps = sanitizeCapabilities((override as { capabilities?: unknown } | null)?.capabilities);
+					if (!caps) continue;
+					const key = `${providerId}/${bareId}`;
+					// 维度级合并:models[] 已有评分作为基底,override 同名维度覆盖。
+					const base = map.get(key);
+					map.set(key, base ? { ...base, ...caps } : caps);
+				}
+			}
+		}
+	} catch {
+		// 解析失败:按无评分处理,注册表对象上的 capabilities 字段仍可兜底。
+	}
+	capabilityCache = { mtimeMs, map };
+	return map;
+}
+
+/** 模型的能力评分:models.json 优先,注册表模型对象上的 capabilities 字段兜底。 */
+function capabilitiesOf(
+	model: Model<Api>,
+	capsMap: Map<string, Capabilities> = loadCapabilities(),
+): Capabilities | undefined {
+	return (
+		capsMap.get(`${model.provider}/${model.id}`) ??
+		sanitizeCapabilities((model as { capabilities?: unknown }).capabilities)
+	);
+}
+
+/** 渲染能力评分一行:默认维度在前(固定顺序),自定义维度按写入顺序在后。 */
+function formatCapabilities(caps: Capabilities | undefined): string {
+	if (!caps) return "(未配置)";
+	const dims = [
+		...DEFAULT_CAPABILITY_DIMS.filter((dim) => dim in caps),
+		...Object.keys(caps).filter((dim) => !DEFAULT_CAPABILITY_DIMS.includes(dim)),
+	];
+	if (dims.length === 0) return "(未配置)";
+	return dims.map((dim) => `${dim}:${caps[dim]}`).join(" ");
+}
+
+/** 模型卡片一行:provider/id + 关键元数据(模态/推理/窗口/价格)+ 能力评分。 */
+function formatModelCard(model: Model<Api>, capsMap: Map<string, Capabilities> = loadCapabilities()): string {
+	const bits: string[] = [];
+	if (model.name && model.name !== model.id) bits.push(model.name);
+	const inputs = (model.input ?? []).join("+");
+	if (inputs) bits.push(inputs);
+	if (model.reasoning) bits.push("reasoning");
+	if (model.contextWindow) bits.push(`ctx ${model.contextWindow.toLocaleString("en-US")}`);
+	if (model.maxTokens) bits.push(`out ${model.maxTokens.toLocaleString("en-US")}`);
+	const cost = model.cost as { input?: number; output?: number } | undefined;
+	if (cost && (cost.input ?? 0) + (cost.output ?? 0) > 0) bits.push(`$${cost.input ?? 0}/${cost.output ?? 0}/M`);
+	return `${model.provider}/${model.id}${bits.length ? ` · ${bits.join(" · ")}` : ""} · 能力评分 ${formatCapabilities(capabilitiesOf(model, capsMap))}`;
+}
+
+/** 注入系统提示的模型菜单段落:会话模型优先,带评分者次之,其余补足。 */
+function modelsMenuSection(ctx: {
+	modelRegistry: { getAvailable(): readonly Model<Api>[] };
+	model?: Model<Api>;
+}): string | undefined {
+	const models = ctx.modelRegistry.getAvailable();
+	if (models.length === 0) return undefined;
+	const sessionKey = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
+	const capsMap = loadCapabilities();
+	const hasCaps = (m: Model<Api>): boolean => !!capabilitiesOf(m, capsMap);
+	const ordered = [
+		...(sessionKey ? models.filter((m) => `${m.provider}/${m.id}` === sessionKey) : []),
+		...models.filter((m) => hasCaps(m) && `${m.provider}/${m.id}` !== sessionKey),
+		...models.filter((m) => !hasCaps(m) && `${m.provider}/${m.id}` !== sessionKey),
+	].slice(0, INJECTED_MODEL_LIMIT);
+	if (ordered.length === 0) return undefined;
+	// pi 会自动给每个 section 包 <name> 标签(system-prompt.js),内容里不再自带标签。
+	return [
+		"给角色选底层模型(agent_create 的 model、subsession_create 的 synthesisModel)时参考的模型菜单。",
+		`能力评分 1-100,来自 models.json 各模型的 capabilities,数值越高越强;默认维度:${DEFAULT_CAPABILITY_DIMS.join("、")},`,
+		"维度名可由用户自由扩展;标注「(未配置)」表示该模型尚未评分,完整清单与实时定价用 agent_list(includeModels)查询。",
+		"选型经验:勘察 / 批量读文件的角色优先「速度」;写代码 / 评审看「代码能力」;任务拆解与最终合成看「任务规划能力」与「通用知识与推理」。",
+		...ordered.map((m) => `- ${formatModelCard(m, capsMap)}`),
+	].join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // 扩展
 // ---------------------------------------------------------------------------
 
@@ -373,14 +517,6 @@ export default function (pi: ExtensionAPI) {
 				if (role) {
 					role.config = { ...role.config, ...op.patch, name: role.config.name };
 					if (op.appendContext) role.contexts.push(op.appendContext);
-				}
-				break;
-			}
-			case "role_stats": {
-				const role = roles.get(op.name);
-				if (role) {
-					role.runs = op.runs;
-					role.usage = op.usage;
 				}
 				break;
 			}
@@ -502,6 +638,12 @@ export default function (pi: ExtensionAPI) {
 		// 工作模式指引总是注入:直接调节模型使用 agent / subsession 的积极性。
 		event.systemPromptOptions.sections["session_agents_work_mode"] = workModeSection(workMode);
 
+		// 模型能力菜单(非 off 模式注入):给主模型创建角色 / 选模时参考。
+		if (workMode !== "off") {
+			const menu = modelsMenuSection(ctx);
+			if (menu) event.systemPromptOptions.sections["session_agents_models"] = menu;
+		}
+
 		ensureStore();
 		if (store.size === 0) return;
 		const prompt = event.messageType === "user" ? event.prompt : "";
@@ -515,9 +657,8 @@ export default function (pi: ExtensionAPI) {
 			)
 			.join("\n");
 		event.systemPromptOptions.sections["session_agents_experience"] =
-			`<session_agents_experience>\n` +
 			`以下经验由历史子会话沉淀,按与当前输入的相关度自动召回。仅在确实相关时参考,不相关请忽略;\n` +
-			`需要更多背景或想精确检索时调用 insight_recall。\n${lines}\n</session_agents_experience>`;
+			`需要更多背景或想精确检索时调用 insight_recall。\n${lines}`;
 	});
 
 	// -- off 模式下硬拦截 agent 工具(提示词之外的可靠保障) ------------------
@@ -631,10 +772,11 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function formatModelList(ctx: ExtensionContext): string[] {
+		const capsMap = loadCapabilities();
 		return ctx.modelRegistry
 			.getAvailable()
 			.slice(0, MAX_MODEL_LISTING)
-			.map((m) => `${m.provider}/${m.id}`);
+			.map((m) => formatModelCard(m, capsMap));
 	}
 
 	function resolveTools(ctx: ExtensionToolContext, names: string[]): { tools: Tool[]; error?: string } {
@@ -1098,6 +1240,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Split large tasks by creating a sub-session (subsession_create) whose context space holds the task context, then assign role agents to it — do not dispatch tasks straight to agents.",
 			"Roles carry fixed context (knowledge, perspective) and a chosen model; reuse roles across sub-sessions and discard what is no longer needed.",
+			"Pick each role's model by the capability scores shown in the model menu (<session_agents_models>) or agent_list: fast cheap models for recon and batch reading, strong models for reasoning, coding, judgment, and synthesis.",
 			"When a sub-session finishes, keep both the result and the extra info; recall them later with insight_recall when related work comes up.",
 		],
 		description: `Create a reusable role agent: a persona with its own fixed context (knowledge, viewpoint, working style) and its own underlying model. Roles do not receive tasks directly — assign them to a sub-session (subsession_create / subsession_run), where they collaborate on a shared desk. Give each role a narrow, opinionated system prompt and a model that fits its job (cheap fast models for recon, strong models for judgment).`,
@@ -1108,7 +1251,10 @@ export default function (pi: ExtensionAPI) {
 				description: "The role's fixed context: expertise, perspective, working style, output contract. Becomes the role's system prompt in every sub-session turn.",
 			}),
 			model: Type.Optional(
-				Type.String({ description: 'Model "provider/model-id" for this role (see agent_list). Omit for the session model.' }),
+				Type.String({
+					description:
+						'Model "provider/model-id" for this role, picked by the capability scores in the model menu / agent_list. Omit for the session model.',
+				}),
 			),
 			context: Type.Optional(Type.String({ description: "Extra fixed context for the role (reference material, conventions)." })),
 			tools: Type.Optional(
@@ -1164,7 +1310,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			name: Type.String({ description: "Existing role name." }),
 			description: Type.Optional(Type.String({ description: "New one-line description." })),
-			model: Type.Optional(Type.String({ description: 'New model "provider/model-id".' })),
+			model: Type.Optional(Type.String({ description: 'New model "provider/model-id" (capability scores in agent_list).' })),
 			systemPrompt: Type.Optional(Type.String({ description: "Replacement fixed context / system prompt." })),
 			appendContext: Type.Optional(Type.String({ description: "Additional fixed context appended to the role." })),
 			tools: Type.Optional(Type.Array(Type.String(), { description: "Replacement tool list; [] removes tool access." })),
@@ -1207,7 +1353,7 @@ export default function (pi: ExtensionAPI) {
 		prepareLoadout: modeLoadout,
 		label: "Role: list",
 		namespace: roleNamespace,
-		description: `List role agents and the models available for choosing a role's model. Call before agent_create when unsure which "provider/model-id" to pick.`,
+		description: `List role agents and the models available for choosing a role's model, each with capability scores (1-100) from models.json capabilities. Call before agent_create when unsure which "provider/model-id" to pick.`,
 		parameters: Type.Object({
 			includeModels: Type.Optional(Type.Boolean({ description: "Include available models. Default true." })),
 		}),
@@ -1234,7 +1380,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (includeModels) {
 				lines.push("");
-				lines.push(`Available models ("provider/model-id", showing ${models.length}):`);
+				lines.push(`Available models ("provider/model-id", showing ${models.length}; 能力评分 1-100 = models.json 的 capabilities):`);
 				for (const model of models) lines.push(`  ${model}`);
 				if (ctx.model) lines.push(`Session model: ${ctx.model.provider}/${ctx.model.id} (default for new roles)`);
 			}
@@ -1303,7 +1449,10 @@ export default function (pi: ExtensionAPI) {
 				),
 			),
 			synthesisModel: Type.Optional(
-				Type.String({ description: 'Model "provider/model-id" used for final synthesis (subsession_finish). Defaults to the lead role\'s model, then the session model.' }),
+				Type.String({
+					description:
+						'Model "provider/model-id" used for final synthesis (subsession_finish). Defaults to the lead role\'s model, then the session model. Pick a strong reasoner per the capability scores in the model menu / agent_list.',
+				}),
 			),
 		}),
 		annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
