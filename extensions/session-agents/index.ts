@@ -17,6 +17,11 @@
  *      速度,用户可自由扩展维度名;注入系统提示的 <session_agents_models>
  *      模型菜单并进入 agent_list,为主模型创建角色 / 选模时提供参考。
  *
+ * 用户可见性:子会话内每个 agent 轮次的「运行时内部会话记录」(指令 / 中间
+ * assistant 消息 / 工具调用 / 工具结果)被捕获为 trace,只写进 tool result 的
+ * details(渲染用,不进模型上下文),因此对主模型与其他子会话不可见,但对
+ * 用户可见:点击 / ctrl+e 展开工具结果即可查看,或用 /agent-trace 实时追踪。
+ *
  * 生命周期:角色与子会话的生命周期等于会话(内存态 + custom entry 持久化,
  * resume / 分支切换后恢复);经验记忆存放在 agent 目录下的 JSONL,跨会话存活。
  *
@@ -32,9 +37,11 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	ExtensionToolContext,
+	Theme,
 } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { Api, AssistantMessage, Message, Model, Tool, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
+import { matchesKey, Text, wrapTextWithAnsi, type Component, type Focusable } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { InsightStore, INSIGHT_KINDS, tokenize, type InsightKind, type InsightRecord } from "./insights.ts";
 
@@ -69,6 +76,45 @@ const INJECTED_MODEL_LIMIT = 24;
 const LOG_ENTRY_CHARS = 1_500;
 /** 桌面每条记录的字符上限。 */
 const DESK_ENTRY_CHARS = 400;
+
+// -- 运行时内部会话记录(trace)------------------------------------------
+// 子会话内每个 agent 轮次的内部对话记录(系统提示后的指令 / 中间 assistant
+// 消息 / 工具调用 / 工具结果)。它只进 tool result 的 details(渲染用,不进
+// 模型上下文),因此对主模型与其他子会话不可见,但对用户可见(点击展开)。
+/** 单条 trace 记录。 */
+interface TraceStep {
+	kind: "prompt" | "assistant" | "tool_call" | "tool_result" | "error" | "done";
+	turn: number;
+	text?: string;
+	toolName?: string;
+	args?: string;
+	output?: string;
+	isError?: boolean;
+	timestamp: number;
+}
+
+/** 一个 agent 在一轮里的内部会话记录。 */
+interface AgentTrace {
+	id: number;
+	sub: string;
+	round: number;
+	agent: string;
+	label: string;
+	model: string;
+	status: "running" | "done" | "error";
+	startedAt: number;
+	endedAt?: number;
+	steps: TraceStep[];
+}
+
+/** trace 渲染 / 存储的裁剪上限(避免撑爆会话与 UI)。 */
+const TRACE_STEPS_CAP = 200;
+const TRACE_ARGS_CHARS = 220;
+const TRACE_OUTPUT_CHARS = 600;
+const TRACE_PROMPT_CHARS = 400;
+const TRACE_LOG_CAP = 120;
+/** 展开视图里每个 trace 最多展示的步数。 */
+const TRACE_RENDER_STEPS = 120;
 
 const DESK_SECTIONS = ["findings", "decisions", "issues", "open", "artifacts", "notes"] as const;
 
@@ -276,6 +322,14 @@ function truncateBlocks(content: ToolResultMessage["content"]): ToolResultMessag
 	return content.map((block) => (block.type === "text" ? { ...block, text: truncate(block.text, MAX_BLOCK_CHARS) } : block));
 }
 
+/** 提取一组内容块里的纯文本(用于 trace 记录工具结果)。 */
+function blocksText(content: readonly { type: string; text?: string }[]): string {
+	return content
+		.filter((block) => block.type === "text" && typeof block.text === "string")
+		.map((block) => block.text as string)
+		.join(" ");
+}
+
 function textOf(message: AssistantMessage): string {
 	return message.content
 		.filter((block): block is { type: "text"; text: string } => block.type === "text")
@@ -330,6 +384,50 @@ function renderAssignments(sub: SubSessionState): string {
 	return sub.assignments
 		.map((a) => `${a.agent}${a.lead ? " (lead)" : ""}${a.focus ? ` — ${a.focus}` : ""}`)
 		.join("; ");
+}
+
+/** 把若干 trace 渲染成用户可读的内部会话记录(带 ANSI 语义色)。 */
+function renderTraceSteps(traces: readonly AgentTrace[], theme: Theme): string {
+	if (traces.length === 0) return theme.fg("muted", "(暂无内部会话记录)");
+	const lines: string[] = [];
+	for (const tr of traces) {
+		const elapsed = ((tr.endedAt ?? Date.now()) - tr.startedAt) / 1000;
+		const status =
+			tr.status === "running" ? theme.fg("warning", "运行中") : tr.status === "error" ? theme.fg("error", "error") : theme.fg("success", "done");
+		lines.push(theme.fg("toolTitle", theme.bold(`━━ ${tr.label} · ${tr.agent} ━━`)));
+		lines.push(theme.fg("dim", `  model ${tr.model} · sub ${tr.sub} #${tr.round} · ${status} ${elapsed.toFixed(1)}s`));
+		let shown = 0;
+		for (const step of tr.steps) {
+			if (shown++ >= TRACE_RENDER_STEPS) {
+				lines.push(theme.fg("muted", `  …(还有 ${tr.steps.length - TRACE_RENDER_STEPS} 步未展示)`));
+				break;
+			}
+			switch (step.kind) {
+				case "prompt":
+					lines.push(`${theme.fg("accent", `  ▶ prompt (turn ${step.turn})`)} ${theme.fg("muted", step.text ?? "")}`);
+					break;
+				case "assistant":
+					lines.push(`${theme.fg("success", `  ● assistant (turn ${step.turn})`)} ${step.text ?? ""}`);
+					break;
+				case "tool_call":
+					lines.push(`${theme.fg("warning", `  ⚙ ${step.toolName ?? "tool"}`)} ${theme.fg("muted", step.args ?? "")}`);
+					break;
+				case "tool_result":
+					lines.push(
+						`${step.isError ? theme.fg("error", "  ✖ result") : theme.fg("dim", "  ◀ result")} ${step.toolName ?? ""}: ${theme.fg("muted", step.output ?? "")}`,
+					);
+					break;
+				case "error":
+					lines.push(`${theme.fg("error", `  ✖ error (turn ${step.turn})`)} ${step.text ?? ""}`);
+					break;
+				case "done":
+					lines.push(theme.fg("dim", `  ■ done: ${step.text ?? ""}`));
+					break;
+			}
+		}
+		lines.push("");
+	}
+	return lines.join("\n");
 }
 
 function ok(content: string, details: ToolDetails, usage?: Usage): AgentToolResult<ToolDetails> {
@@ -832,6 +930,8 @@ export default function (pi: ExtensionAPI) {
 		toolCalls: number;
 		stopReason: string;
 		errorMessage?: string;
+		/** 本轮内部会话记录(已注册进 traceLog,可被用户查看)。 */
+		trace: AgentTrace;
 	}
 
 	async function runTurn(
@@ -840,14 +940,31 @@ export default function (pi: ExtensionAPI) {
 		signal: AbortSignal | undefined,
 		onUpdate: ((partial: AgentToolResult<ToolDetails>) => void) | undefined,
 		label: string,
+		traceCtx: { sub: string; round: number; agent: string },
 	): Promise<TurnResult> {
 		const usage = emptyUsage();
+		const agentTrace = registerTrace({
+			sub: traceCtx.sub,
+			round: traceCtx.round,
+			agent: traceCtx.agent,
+			label,
+			model: `${opts.model.provider}/${opts.model.id}`,
+			status: "running",
+			startedAt: Date.now(),
+			steps: [],
+		});
+		// liveDetails:随执行推进刷新的 trace 快照,随 onUpdate 下发给阻塞式调用的渲染器。
+		const liveDetails = (): ToolDetails => ({ action: "run", traces: [{ ...agentTrace, steps: [...agentTrace.steps] }] });
 		const { tools: toolDefs, error: toolError } = resolveTools(ctx, opts.toolNames);
 		if (toolError) {
-			return { text: "", usage, turns: 0, toolCalls: 0, stopReason: "error", errorMessage: toolError };
+			agentTrace.status = "error";
+			agentTrace.endedAt = Date.now();
+			pushStep(agentTrace, { kind: "error", turn: 0, text: toolError, timestamp: Date.now() });
+			return { text: "", usage, turns: 0, toolCalls: 0, stopReason: "error", errorMessage: toolError, trace: agentTrace };
 		}
 		const allowed = new Set(toolDefs.map((tool) => tool.name));
 		const messages: Message[] = [{ role: "user", content: opts.instruction, timestamp: Date.now() }];
+		pushStep(agentTrace, { kind: "prompt", turn: 0, text: truncate(opts.instruction, TRACE_PROMPT_CHARS), timestamp: Date.now() });
 		let answer = "";
 		let stopReason = "stop";
 		let errorMessage: string | undefined;
@@ -866,10 +983,16 @@ export default function (pi: ExtensionAPI) {
 			} catch (error) {
 				stopReason = "error";
 				errorMessage = error instanceof Error ? error.message : String(error);
+				pushStep(agentTrace, { kind: "error", turn, text: errorMessage, timestamp: Date.now() });
 				break;
 			}
 			messages.push(response);
 			addUsage(usage, response.usage);
+			pushStep(agentTrace, { kind: "assistant", turn, text: truncate(textOf(response), TRACE_OUTPUT_CHARS), timestamp: Date.now() });
+			onUpdate?.({
+				content: [{ type: "text", text: `[${label}] turn ${turn}/${opts.maxTurns}` }],
+				details: liveDetails(),
+			});
 
 			const calls = response.content.filter((block) => block.type === "toolCall");
 			const wantsTools = response.stopReason === "toolUse" && calls.length > 0 && toolDefs.length > 0;
@@ -886,9 +1009,16 @@ export default function (pi: ExtensionAPI) {
 			}
 			for (const call of calls) {
 				toolCalls += 1;
+				pushStep(agentTrace, {
+					kind: "tool_call",
+					turn,
+					toolName: call.name,
+					args: truncate(JSON.stringify(call.arguments), TRACE_ARGS_CHARS),
+					timestamp: Date.now(),
+				});
 				onUpdate?.({
 					content: [{ type: "text", text: `[${label}] turn ${turn}/${opts.maxTurns} · ${call.name}` }],
-					details: { action: "run" },
+					details: liveDetails(),
 				});
 				let resultMessage: ToolResultMessage;
 				if (!allowed.has(call.name)) {
@@ -912,9 +1042,25 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 				messages.push(resultMessage);
+				pushStep(agentTrace, {
+					kind: "tool_result",
+					turn,
+					toolName: call.name,
+					output: truncate(blocksText(resultMessage.content), TRACE_OUTPUT_CHARS),
+					isError: resultMessage.isError,
+					timestamp: Date.now(),
+				});
 			}
 		}
-		return { text: answer, usage, turns, toolCalls, stopReason, errorMessage };
+		agentTrace.status = stopReason === "error" ? "error" : "done";
+		agentTrace.endedAt = Date.now();
+		pushStep(agentTrace, {
+			kind: "done",
+			turn: turns,
+			text: `stop=${stopReason}${errorMessage ? ` · ${errorMessage}` : ""} · ${formatUsage(usage)}`,
+			timestamp: Date.now(),
+		});
+		return { text: answer, usage, turns, toolCalls, stopReason, errorMessage, trace: agentTrace };
 	}
 
 	/** 角色 agent 的模型:角色配置优先,缺省回退会话模型。 */
@@ -943,6 +1089,31 @@ export default function (pi: ExtensionAPI) {
 	}
 	const jobs = new Map<string, BackgroundJob>();
 	let jobSeq = 0;
+
+	// -- 运行时内部会话记录注册表 --------------------------------------------
+	// 所有 agent 轮次的内部对话都进这里(ring buffer)。它们只进 tool result 的
+	// details(渲染用),不进模型上下文;用户可通过展开工具结果或 /agent-trace 查看。
+	let traceSeq = 0;
+	const traceLog: AgentTrace[] = [];
+
+	function registerTrace(trace: Omit<AgentTrace, "id">): AgentTrace {
+		const full: AgentTrace = { ...trace, id: ++traceSeq };
+		traceLog.push(full);
+		if (traceLog.length > TRACE_LOG_CAP) traceLog.splice(0, traceLog.length - TRACE_LOG_CAP);
+		return full;
+	}
+
+	function pushStep(trace: AgentTrace, step: TraceStep): void {
+		trace.steps.push(step);
+		if (trace.steps.length > TRACE_STEPS_CAP) trace.steps.splice(0, trace.steps.length - TRACE_STEPS_CAP);
+	}
+
+	/** 某子会话(可选某轮)的 trace,按时间升序,最多 keep 条。 */
+	function tracesFor(sub: string, round?: number, keep = 8): AgentTrace[] {
+		return traceLog
+			.filter((t) => t.sub === sub && (round === undefined || t.round === round))
+			.slice(-keep);
+	}
 
 	/** 丢弃某子会话的所有后台作业(取消并标记)。 */
 	function cancelJobsFor(subName: string): void {
@@ -1083,9 +1254,22 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						onUpdate,
 						`role:${role.config.name}`,
+						{ sub: name, round, agent: role.config.name },
 					);
 					return { assignment, role, turn, instruction };
 				} catch (error) {
+					const fallback = registerTrace({
+						sub: name,
+						round,
+						agent: role.config.name,
+						label: `role:${role.config.name}`,
+						model: role.config.model,
+						status: "error",
+						startedAt: Date.now(),
+						endedAt: Date.now(),
+						steps: [],
+					});
+					pushStep(fallback, { kind: "error", turn: 0, text: error instanceof Error ? error.message : String(error), timestamp: Date.now() });
 					return {
 						assignment,
 						role,
@@ -1097,6 +1281,7 @@ export default function (pi: ExtensionAPI) {
 							toolCalls: 0,
 							stopReason: "error",
 							errorMessage: error instanceof Error ? error.message : String(error),
+							trace: fallback,
 						},
 					};
 				}
@@ -1167,6 +1352,7 @@ export default function (pi: ExtensionAPI) {
 					round,
 					parallelAgents: !!params.parallelAgents,
 					concurrentRounds: !!params.concurrentRounds,
+					traces: tracesFor(name, round, 12),
 					contributions: appended.map((entry) => ({ agent: entry.agent, turns: entry.turns, toolCalls: entry.toolCalls })),
 				}, roundUsage);
 			});
@@ -1661,7 +1847,7 @@ export default function (pi: ExtensionAPI) {
 				return ok(
 					`作业 ${target.id}(子会话 "${target.sub}" 第 ${target.round} 轮)仍在运行,已跑 ${(((Date.now() - target.startedAt) / 1000) | 0)}s。\n` +
 						`可继续做别的事,稍后再 subsession_probe(job="${target.id}");或用 wait=<秒> 限时等待。`,
-					{ action: "subsession_probe", job: target.id, status: target.status, jobs: jobsSummary },
+					{ action: "subsession_probe", job: target.id, status: target.status, traces: tracesFor(target.sub, target.round, 12), jobs: jobsSummary },
 				);
 			}
 			if (target.status === "cancelled") {
@@ -1669,6 +1855,7 @@ export default function (pi: ExtensionAPI) {
 					action: "subsession_probe",
 					job: target.id,
 					status: target.status,
+					traces: tracesFor(target.sub, target.round, 12),
 					jobs: jobsSummary,
 				});
 			}
@@ -1677,6 +1864,7 @@ export default function (pi: ExtensionAPI) {
 					action: "subsession_probe",
 					job: target.id,
 					status: target.status,
+					traces: tracesFor(target.sub, target.round, 12),
 					jobs: jobsSummary,
 				});
 			}
@@ -1830,6 +2018,7 @@ export default function (pi: ExtensionAPI) {
 				return ok(`Work log of "${name}" (last ${limit}):\n${renderLogDigest(sub, limit)}`, {
 					action: "subsession_get",
 					subsession: summarizeSub(sub),
+					traces: tracesFor(name, undefined, 12),
 					log: sub.log.slice(-limit).map((entry) => ({ agent: entry.agent, contribution: truncate(entry.contribution, 1_000), turns: entry.turns })),
 				});
 			}
@@ -1846,7 +2035,7 @@ export default function (pi: ExtensionAPI) {
 					`Desk: ${DESK_SECTIONS.map((s) => `${s} ${sub.desk[s].length}`).join(" · ")}`,
 					sub.status === "done" ? `Result: ${oneLine(sub.result ?? "", 300)}` : `Use subsession_run to work, subsession_finish to conclude.`,
 				].join("\n"),
-				{ action: "subsession_get", subsession: summarizeSub(sub) },
+				{ action: "subsession_get", subsession: summarizeSub(sub), traces: tracesFor(name, undefined, 12) },
 			);
 		},
 	});
@@ -1973,6 +2162,113 @@ export default function (pi: ExtensionAPI) {
 			});
 		},
 	});
+
+	// -- 用户查看:工具结果渲染(点击展开)+ /agent-trace 实时追踪 -----------
+
+	/** 带内部会话记录展示的子会话工具:折叠=摘要,展开=内部 trace。 */
+	const TRACE_VIEW_TOOLS = new Set(["subsession_run", "subsession_probe", "subsession_get"]);
+
+	pi.registerToolRenderer((toolName, next) => {
+		if (!TRACE_VIEW_TOOLS.has(toolName)) return next();
+		return {
+			...next(),
+			renderResult: (result, options, theme) => {
+				const details = result.details as
+					| { traces?: AgentTrace[]; subsession?: { name?: string }; status?: string; background?: boolean }
+					| undefined;
+				// 结果自带 trace 快照;后台派发 / 运行中的结果没有,则回落到该子会话的实时 trace。
+				let traces = details?.traces ?? [];
+				if (traces.length === 0 && details?.subsession?.name) traces = tracesFor(details.subsession.name);
+				const contentText = (result.content ?? [])
+					.map((block) => (block.type === "text" ? block.text : ""))
+					.filter(Boolean)
+					.join("\n");
+				const hint = traces.length ? theme.fg("muted", "▸ 点击 / ctrl+e 展开查看内部会话记录") : "";
+				if (options.isPartial) {
+					const live = traces.length ? `\n${renderTraceSteps(traces, theme)}` : "";
+					return new Text(`${theme.fg("warning", "⏳ 子会话运行中…")}${live}`, 0, 0);
+				}
+				if (!options.expanded) {
+					return new Text(`${contentText}${hint ? `\n${hint}` : ""}`, 0, 0);
+				}
+				const traceBlock = traces.length
+					? `\n\n${theme.fg("toolTitle", theme.bold("═══ 内部会话记录(runtime trace)═══"))}\n${renderTraceSteps(traces, theme)}`
+					: `\n\n${theme.fg("muted", "(本次没有可展示的内部会话记录)")}`;
+				return new Text(`${contentText}${traceBlock}`, 0, 0);
+			},
+		};
+	});
+
+	/** /agent-trace 的实时追踪面板:展示 traceLog 里所有子会话运行的内部记录。 */
+	class TraceOverlay implements Component, Focusable {
+		focused = false;
+		private readonly theme: Theme;
+		private readonly done: () => void;
+		private readonly requestRender: () => void;
+		private readonly timer: ReturnType<typeof setInterval>;
+		private offset = 0;
+
+		constructor(tui: { requestRender: (force?: boolean) => void }, theme: Theme, done: () => void) {
+			this.theme = theme;
+			this.done = done;
+			this.requestRender = () => tui.requestRender();
+			this.timer = setInterval(() => this.requestRender(), 500);
+		}
+
+		handleInput(data: string): void {
+			if (matchesKey(data, "escape") || matchesKey(data, "q")) {
+				this.done();
+				return;
+			}
+			if (matchesKey(data, "up")) this.offset += 1;
+			else if (matchesKey(data, "down")) this.offset = Math.max(0, this.offset - 1);
+			else if (matchesKey(data, "pageUp")) this.offset += 12;
+			else if (matchesKey(data, "pageDown")) this.offset = Math.max(0, this.offset - 12);
+			else if (matchesKey(data, "home")) this.offset = 1_000_000;
+			else if (matchesKey(data, "end")) this.offset = 0;
+			else return;
+			this.requestRender();
+		}
+
+		invalidate(): void {}
+
+		dispose(): void {
+			clearInterval(this.timer);
+		}
+
+		render(width: number): string[] {
+			const th = this.theme;
+			const traces = [...traceLog].reverse();
+			const logical: string[] = [
+				th.fg("accent", th.bold("子会话内部会话记录 · 运行追踪")) +
+					th.fg("dim", "  (Esc/q 关闭 · ↑↓/PgUp/PgDn/Home/End 滚动 · 500ms 自动刷新)"),
+			];
+			for (const tr of traces) logical.push(...renderTraceSteps([tr], th).split("\n"));
+			if (traces.length === 0) logical.push(th.fg("muted", "(当前没有子会话运行记录)"));
+			// wrap 到宽度:保证每行 <= width(组件契约)。
+			const wrapped: string[] = [];
+			for (const line of logical) wrapped.push(...wrapTextWithAnsi(line || " ", width));
+			const WINDOW = 26;
+			const end = Math.max(0, wrapped.length - this.offset);
+			const start = Math.max(0, end - WINDOW);
+			const footer = th.fg("dim", `── ${traces.length} 个 trace · 行 ${start + 1}-${end}/${wrapped.length} ──`);
+			return [footer, ...wrapped.slice(start, end), footer];
+		}
+	}
+
+	const traceHandler = async (_args: string, ctx: ExtensionCommandContext): Promise<void> => {
+		if (ctx.mode !== "tui" || !ctx.hasUI) {
+			ctx.ui.notify("agent-trace 需要交互式 TUI(当前模式不可用)", "warning");
+			return;
+		}
+		await ctx.ui.custom<void>((tui, theme, _kb, done) => new TraceOverlay(tui, theme, () => done()), { overlay: true });
+	};
+
+	pi.registerCommand("agent-trace", {
+		description: "查看子会话运行时的内部会话记录(实时追踪阻塞 / 后台子会话)",
+		handler: traceHandler,
+	});
+	pi.registerCommand("atrace", { description: "同 /agent-trace", handler: traceHandler });
 
 	// -- 内部:提示词 / 摘要 / 解析 ------------------------------------------
 
