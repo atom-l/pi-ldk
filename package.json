@@ -1,6 +1,6 @@
 {
   "name": "ldk",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "LDK — a PI package bundling custom extensions (session commands, model attribution, MCP adapter, image generation, embedded terminal, session working directory, styled footer, session agents).",
   "keywords": [
     "pi-package"
