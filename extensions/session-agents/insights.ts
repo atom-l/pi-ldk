@@ -86,22 +86,34 @@ export class InsightStore {
 	private termFreq = new Map<string, Map<string, number>>();
 	private docLen = new Map<string, number>();
 	private seq = 0;
+	/** 加载文件失败(不可读等)时为 true:此时索引为空,迁移去重不可信,应跳过迁移。 */
+	private loadFailed = false;
 
 	constructor(private readonly filePath: string) {}
 
 	load(): void {
 		if (!existsSync(this.filePath)) return;
-		for (const line of readFileSync(this.filePath, "utf8").split("\n")) {
-			if (!line.trim()) continue;
-			try {
-				const record = JSON.parse(line) as InsightRecord;
-				if (record?.id && typeof record.text === "string" && !this.termFreq.has(record.id)) {
-					this.indexRecord(record);
+		try {
+			for (const line of readFileSync(this.filePath, "utf8").split("\n")) {
+				if (!line.trim()) continue;
+				try {
+					const record = JSON.parse(line) as InsightRecord;
+					if (record?.id && typeof record.text === "string" && !this.termFreq.has(record.id)) {
+						this.indexRecord(record);
+					}
+				} catch {
+					// 跳过损坏的行
 				}
-			} catch {
-				// 跳过损坏的行
 			}
+		} catch {
+			// 文件整体不可读:降级为空记忆,交由调用方决定是否跳过迁移。
+			this.loadFailed = true;
 		}
+	}
+
+	/** 上次 load() 是否失败(文件不可读)。迁移据此跳过,避免去重失效造成重复追加。 */
+	get hadLoadFailure(): boolean {
+		return this.loadFailed;
 	}
 
 	get size(): number {
@@ -124,7 +136,9 @@ export class InsightStore {
 
 	nextId(): string {
 		this.seq += 1;
-		return `ins-${Date.now().toString(36)}-${this.seq.toString(36)}`;
+		// 随机段避免 store 重建 / 多进程在同一毫秒内产生相同 id(会因 load 按 id 去重而丢记录)。
+		const rand = Math.random().toString(36).slice(2, 7).padEnd(5, "0");
+		return `ins-${Date.now().toString(36)}-${this.seq.toString(36)}-${rand}`;
 	}
 
 	/** 追加写入 JSONL 并更新索引。 */

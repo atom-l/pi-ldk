@@ -623,23 +623,30 @@ export default function (pi: ExtensionAPI) {
 
 	/** 旧位置(getAgentDir 下)的记录一次性迁入当前文件:按 id 去重、幂等;旧文件保持原样不删不改。 */
 	function migrateLegacyInsights(path: string): void {
-		const legacy = join(getAgentDir(), "session-agents", "insights.jsonl");
-		if (legacy === path || !existsSync(legacy)) return;
-		const seen = new Set<string>();
-		const records: InsightRecord[] = [];
-		for (const line of readFileSync(legacy, "utf8").split("\n")) {
-			if (!line.trim()) continue;
-			try {
-				const record = JSON.parse(line) as InsightRecord;
-				if (record?.id && typeof record.text === "string" && !store.has(record.id) && !seen.has(record.id)) {
-					seen.add(record.id);
-					records.push(record);
+		// 迁移失败(旧文件不可读 / 目标不可写 / 磁盘满)只静默降级,不影响主流程。
+		try {
+			const legacy = join(getAgentDir(), "session-agents", "insights.jsonl");
+			if (legacy === path || !existsSync(legacy)) return;
+			// 目标文件加载失败时索引为空,去重不可信,跳过以免重复追加。
+			if (store.hadLoadFailure) return;
+			const seen = new Set<string>();
+			const records: InsightRecord[] = [];
+			for (const line of readFileSync(legacy, "utf8").split("\n")) {
+				if (!line.trim()) continue;
+				try {
+					const record = JSON.parse(line) as InsightRecord;
+					if (record?.id && typeof record.text === "string" && !store.has(record.id) && !seen.has(record.id)) {
+						seen.add(record.id);
+						records.push(record);
+					}
+				} catch {
+					// 跳过损坏的行
 				}
-			} catch {
-				// 跳过损坏的行
 			}
+			store.add(records);
+		} catch {
+			// 旧记忆迁移是尽力而为的增强:失败留在旧位置即可,不向调用方抛。
 		}
-		store.add(records);
 	}
 
 	// -- 状态持久化与恢复 ---------------------------------------------------
