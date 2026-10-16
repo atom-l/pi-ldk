@@ -45,8 +45,9 @@
  * never rewritten.
  *
  * Query hygiene: a model in a hurry pastes the user's request into a query parameter and the
- * search runs on the raw sentence. A `tool_call` guard detects that (a verbatim copy of the
- * prompt, or request framing such as "帮我查…") and blocks the call with the fix; the parameter's
+ * search runs on the raw sentence. A `tool_call` guard detects that (a verbatim copy — or a
+ * near-complete excerpt — of the prompt, or request framing such as "帮我查…") and blocks the
+ * call with the fix; the parameter's
  * own schema description decides what it wants, so a parameter that asks for the user's question
  * is left alone. A blocked call may be repeated once unchanged, so a deliberate pass goes through.
  *   - `url`, `headers`, `env`, `cwd`, `oauth`, `enabled`, `timeout`, `toolExposure`,
@@ -477,7 +478,8 @@ export function looksLikeRawRequest(value: string, prompt: string | undefined): 
 	if (prompt) {
 		const a = normalizeForCompare(text);
 		const b = normalizeForCompare(prompt);
-		if (a.length >= 6 && (a === b || (b.length >= 6 && a.includes(b)))) return true;
+		const covered = b.includes(a) && a.length / b.length >= 0.6;
+		if (a.length >= 6 && (a === b || (b.length >= 6 && a.includes(b)) || covered)) return true;
 	}
 	return REQUEST_FRAME_PATTERN.test(text) || REQUEST_INLINE_PATTERN.test(text);
 }
@@ -1098,6 +1100,8 @@ interface AdapterState {
 	activated: boolean;
 	/** Call proxies this extension registered, by server name. */
 	proxyDefinitions: Map<string, ToolDefinition>;
+	/** Config+tool fingerprint per server name, so unchanged proxies are not re-registered. */
+	proxyKeys: Map<string, string>;
 	/** The latest user prompt, used by the query guard to spot a verbatim paste. */
 	lastPrompt: string;
 	/** Calls the query guard already bounced once; an identical retry is then allowed. */
@@ -1354,7 +1358,7 @@ export default function mcpAdapterExtension(pi: ExtensionAPI) {
 	// how they work. Inject a `mcp_usage` section and two guidelines before every prompt; pi diffs
 	// sections, so a stable guide is recorded once and stays cached.
 	pi.on("before_agent_start", (event) => {
-		state.lastPrompt = typeof event.prompt === "string" ? event.prompt.trim() : "";
+		state.lastPrompt = event.messageType === "user" ? event.prompt.trim() : "";
 		state.guardSeen.clear();
 		const guide = buildMcpUsageGuide(state.report, pi);
 		if (guide.length === 0) return;
@@ -1374,7 +1378,7 @@ export default function mcpAdapterExtension(pi: ExtensionAPI) {
 	pi.on("tool_call", (event) => {
 		const toolName = event.toolName;
 		if (!toolName.startsWith("mcp__") && !toolName.startsWith("mcp_call__")) return;
-		const input = isRecord(event.input) ? event.input : {};
+		const input: RawEntry = isRecord(event.input) ? event.input : {};
 		const nestedTool =
 			typeof input.tool === "string" ? input.tool : typeof input.tool_name === "string" ? input.tool_name : undefined;
 		const offenses = findRawRequestParams(

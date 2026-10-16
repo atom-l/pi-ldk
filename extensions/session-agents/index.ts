@@ -2085,7 +2085,7 @@ export default function (pi: ExtensionAPI) {
 		prepareLoadout: modeLoadout,
 		label: "Sub-session: discard",
 		namespace: roleNamespace,
-		description: `Discard sub-sessions that are no longer needed: one by name, or all with all=true. Discarding frees their desk and work log; finished results already in the experience memory stay recallable via insight_recall.`,
+		description: `Discard sub-sessions that are no longer needed: one by name, or all with all=true. Discarding frees their desk and work log; it also cancels the discarded sub-session(s)' in-flight background jobs. Finished results already in the experience memory stay recallable via insight_recall.`,
 		parameters: Type.Object({
 			name: Type.Optional(Type.String({ description: "Sub-session name to discard." })),
 			all: Type.Optional(Type.Boolean({ description: "Discard every sub-session." })),
@@ -2094,6 +2094,7 @@ export default function (pi: ExtensionAPI) {
 		execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
 			if (params.all) {
 				const count = subs.size;
+				cancelAllJobs();
 				subs.clear();
 				persist({ op: "sub_discard_all" });
 				return ok(`Discarded all ${count} sub-session(s).`, { action: "subsession_discard", subsessions: [] });
@@ -2103,6 +2104,7 @@ export default function (pi: ExtensionAPI) {
 			if (!subs.has(name)) {
 				return fail(`No sub-session named "${name}". Existing: ${[...subs.keys()].join(", ") || "(none)"}`, { action: "subsession_discard" });
 			}
+			cancelJobsFor(name);
 			subs.delete(name);
 			persist({ op: "sub_discard", name });
 			return ok(`Discarded sub-session "${name}". Remaining: ${[...subs.keys()].join(", ") || "(none)"}.`, {
@@ -2217,7 +2219,7 @@ export default function (pi: ExtensionAPI) {
 					| { traces?: AgentTrace[]; subsession?: { name?: string }; round?: number; job?: string; status?: string; background?: boolean }
 					| undefined;
 				// 结果自带 trace 快照;后台派发 / 运行中的结果没有,则回落到该子会话的实时 trace。
-				let traces = details?.traces ?? [];
+				let traces: AgentTrace[] = Array.isArray(details?.traces) ? details.traces : [];
 				if (traces.length === 0 && details?.subsession?.name) {
 					const job = typeof details.job === "string" ? jobs.get(details.job) : undefined;
 					const wantRound = typeof details.round === "number" ? details.round : job?.roundReady ? job.round : undefined;
@@ -2315,7 +2317,7 @@ export default function (pi: ExtensionAPI) {
 			const end = wrapped.length - off;
 			const start = Math.max(0, end - WINDOW);
 			const footer = truncateToWidth(th.fg("dim", `── ${traces.length} 个 trace · 行 ${start + 1}-${end}/${wrapped.length} ──`), width);
-			return [footer, ...wrapped.slice(start, end), footer];
+			return [...wrapped.slice(start, end), footer];
 		}
 	}
 

@@ -223,6 +223,28 @@ export class ShellSession {
 		}
 	}
 
+	/**
+	 * 用户主动销毁终端:kill()(SIGTERM→宽限期→SIGKILL)后等进程退出再 dispose,
+	 * 兜底在宽限期+500ms 后强制清理。session_shutdown / 进程退出兜底仍用 killNow/dispose。
+	 */
+	disposeGracefully(): void {
+		if (this.disposed) return;
+		// 已退出/已杀的会话不再走 SIGTERM 宽限等待,直接释放。
+		if (this.status !== "running") {
+			this.dispose();
+			return;
+		}
+		this.kill();
+		let fallback: ReturnType<typeof setTimeout> | null = null;
+		const finish = () => {
+			if (fallback) clearTimeout(fallback);
+			this.dispose();
+		};
+		this.child.once("exit", finish);
+		fallback = setTimeout(finish, KILL_GRACE_MS + 500);
+		fallback.unref();
+	}
+
 	/** 彻底释放:硬杀 + 清理定时器 / 监听 / stdio。幂等。 */
 	dispose(): void {
 		if (this.disposed) return;

@@ -40,7 +40,13 @@ async function resolveAuth(ctx: ExtensionContext, entry: ImageModelEntry): Promi
 				auth = {
 					apiKey: resolved.apiKey ?? auth.apiKey,
 					baseUrl: resolved.baseUrl ?? auth.baseUrl,
-					headers: { ...(resolved.headers ?? {}), ...auth.headers },
+					// ProviderHeaders is Record<string, string | null>; `null` means "suppress the
+					// default header", so drop those entries instead of sending the literal "null".
+					headers: Object.fromEntries(
+						Object.entries({ ...(resolved.headers ?? {}), ...(auth.headers ?? {}) }).filter(
+							(entry): entry is [string, string] => typeof entry[1] === "string",
+						),
+					),
 				};
 			}
 		}

@@ -6,7 +6,8 @@
  *   /term open [name]    打开(或新建)指定会话
  *   /term new <name>     新建并打开指定会话
  *   /term list           列出所有终端会话及状态
- *   /term destroy <name> 销毁会话(终止进程组,不留僵尸/孤儿进程)
+ *   /term destroy <name> 销毁会话(先 SIGTERM、宽限期后 SIGKILL 终止整棵进程树,
+ *                          不留僵尸/孤儿进程)
  *   /term help           用法
  *
  * 交互(终端内):
@@ -88,7 +89,7 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					if (!(await ctx.ui.confirm("销毁终端", `终止进程(pid=${s.pid ?? "?"})并清理会话 "${target}"?`))) return;
-					s.dispose();
+					s.disposeGracefully();
 					sessions.delete(target);
 					ctx.ui.notify(`终端 "${target}" 已销毁`, "info");
 					return;
@@ -148,9 +149,9 @@ export default function (pi: ExtensionAPI) {
 		active.onOutput = null;
 
 		if (action === "destroy") {
-			active.dispose();
+			active.disposeGracefully();
 			sessions.delete(active.name);
-			ctx.ui.notify(`终端 "${active.name}" 已销毁(进程已终止)`, "info");
+			ctx.ui.notify(`终端 "${active.name}" 已销毁(进程终止中)`, "info");
 		} else {
 			// fold 或直接关闭:进程继续运行。
 			ctx.ui.notify(`终端 "${active.name}" 已折叠,进程继续运行。再次 /term ${active.name === "main" ? "" : active.name}返回。`, "info");

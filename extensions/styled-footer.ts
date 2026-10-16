@@ -64,18 +64,20 @@ function sanitize(text: string): string {
 // 扩展状态徽章配色
 // ---------------------------------------------------------------------------
 
-/** 依扩展 key / 值给徽章挑一个前景色 token(theme.fg 接受的 token 名)。 */
+/** 依扩展 key / 值给徽章挑一个前景色 token(theme.fg 接受的 token 名)。
+ * 兼容两种输入:扩展状态 key(如 "workdir" / "image-gen")与状态文本前缀(如 "wd:...")。 */
 function badgeColor(key: string, text: string): string {
 	const k = key.toLowerCase();
-	if (k.startsWith("agent-mode") || k.startsWith("amode")) {
-		const v = text.toLowerCase();
-		if (v.includes("off")) return "warning";
-		if (v.includes("agent") && !v.includes("auto")) return "accent";
+	const t = text.toLowerCase();
+	const hit = (prefix: string) => k.startsWith(prefix) || t.startsWith(prefix);
+	if (hit("agent-mode") || hit("amode")) {
+		if (t.includes("off")) return "warning";
+		if (t.includes("agent") && !t.includes("auto")) return "accent";
 		return "success"; // auto
 	}
-	if (k.startsWith("workdir") || k.startsWith("wd")) return "bashMode";
-	if (k.includes("image") || k.includes("gen")) return "thinkingMax";
-	if (k.includes("term")) return "syntaxVariable";
+	if (hit("workdir") || hit("wd")) return "bashMode";
+	if (k.includes("image") || k.includes("gen") || t.startsWith("image") || t.startsWith("gen")) return "thinkingMax";
+	if (k.includes("term") || t.startsWith("term")) return "syntaxVariable";
 	return "syntaxKeyword";
 }
 
@@ -258,9 +260,9 @@ export default function (pi: ExtensionAPI): void {
 					if (statuses.size === 0) return "";
 					const badges = Array.from(statuses.entries())
 						.sort(([a], [b]) => a.localeCompare(b))
-						.map(([, text]) => {
+						.map(([key, text]) => {
 							const clean = sanitize(text);
-							const color = badgeColor(text, clean);
+							const color = badgeColor(key, clean);
 							return theme.fg(color, "▌") + " " + theme.fg(color, clean);
 						});
 					return truncateToWidth(badges.join(dim("   ")), width, dim("…"));

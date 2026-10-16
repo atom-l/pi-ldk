@@ -9,7 +9,7 @@
 | 会话命令 | `extensions/sessions.ts` | `/session-new`、`/session-list`、`/session-delete`、`/session-delete-all`、`/session-merge` 及对应短别名。 |
 | 模型归属 | `extensions/model-attribution.ts` | 给历史中的助手回复打上生成它的 provider/model 标签，避免中途切换模型时把早前的回复误认成自己的。 |
 | MCP 适配器 | `extensions/mcp-adapter.ts` | 从 `.pi/mcp-adapter.json` 和 `~/.pi/agent/mcp-adapter.json` 读取 MCP server 配置并注册给 PI。 |
-| 图片生成 | `extensions/image-gen/` | `generate_image` 工具及图片模型处理逻辑。 |
+| 图片生成 | `extensions/image-gen/` | `generate_image` 工具、`/imagine` 命令及图片模型处理逻辑。 |
 | 子会话工作台 | `extensions/session-agents/` | 角色 agent + 子会话(公共桌面)+ 经验记忆的大型任务拆分框架,详见[子会话工作台](#子会话工作台)。 |
 | 嵌入终端 | `extensions/terminal/` | 会话内呼出终端执行命令,可折叠(进程继续运行)或销毁(终止进程组),详见[嵌入终端](#嵌入终端)。 |
 | 会话工作目录 | `extensions/workdir.ts` | 会话级「概念工作目录」:声明会话在某目录上工作,引导模型聚焦该目录、尽量不关注父目录/兄弟目录,详见[会话工作目录](#会话工作目录)。 |
@@ -248,7 +248,7 @@ resume / 分支切换后按分支历史重放恢复;目标路径不存在、或�
 | `subsession_probe` | 查后台作业进度 / 取结果(status / done / failed,可带 `wait=<秒>` 限时等待) |
 | `subsession_finish` | 收尾合成,返回【结果】+【额外信息】,并沉淀经验到记忆 |
 | `subsession_get` | 查看子会话:summary / desk / log / result |
-| `subsession_discard` | 丢弃子会话(单个 / 全部) |
+| `subsession_discard` | 丢弃子会话(单个 / 全部),同时取消该子会话在飞的后台作业 |
 | `insight_recall` | 类 RAG 检索历史结果与额外信息(query / kinds / limit / scope / detail) |
 | `insight_add` | 主动记录一条经验 |
 
@@ -376,8 +376,10 @@ insight_recall  query="OAuth 迁移 风险"      # 后续任务需要时召回
 | `/term open [name]` | 打开(或新建)指定会话;`/term <name>` 也可直接用名字打开 |
 | `/term new <name>` | 新建并打开指定会话 |
 | `/term list` | 列出所有终端会话及状态 |
-| `/term destroy <name>` | 销毁会话(确认后终止进程组,不留僵尸 / 孤儿进程) |
+| `/term destroy <name>` | 销毁会话(确认后先 `SIGTERM`、宽限期后 `SIGKILL` 终止进程组,不留僵尸 / 孤儿进程) |
+| `/term kill <name>` | 同 `/term destroy`(别名) |
 | `/term help` | 用法 |
+| `/terminal …` | 与 `/term` 完全相同的别名(如 `/terminal list`) |
 
 ### 交互(终端内)
 

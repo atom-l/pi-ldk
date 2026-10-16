@@ -77,6 +77,12 @@ function directRequestOnce(urlStr: string, opts: RequestOptions): Promise<RawRes
 		const req = lib(url, { method: opts.method ?? "GET", headers: opts.headers }, (res) => {
 			const chunks: Buffer[] = [];
 			res.on("data", (chunk) => chunks.push(chunk));
+			// Truncated/aborted responses never emit "end"; settle here so the promise cannot hang.
+			res.on("error", reject);
+			res.on("aborted", () => reject(new Error("response aborted")));
+			res.on("close", () => {
+				if (!res.complete) reject(new Error("response closed before complete"));
+			});
 			res.on("end", () =>
 				resolvePromise({
 					status: res.statusCode ?? 0,
@@ -957,7 +963,7 @@ export async function generateImages(options: GenerateOptions): Promise<Generate
 		outputDir: options.outputDir ?? gen.outputDir ?? GEN_DEFAULTS.outputDir,
 		fileName: options.fileName,
 		prompt: options.prompt,
-		signal: options.signal,
+		signal, // merged timeout+caller signal, so timeoutMs also covers the download phase
 	});
 	if (saved.length === 0) {
 		throw new Error(`Images were returned but could not be saved: ${errors.join("; ")}`);

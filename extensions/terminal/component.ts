@@ -113,9 +113,25 @@ export class TerminalComponent implements Component, Focusable {
 		const avail = Math.max(6, inner - visibleWidth(prompt) - 1);
 
 		// 光标超出可视范围时,窗口右移到能容纳光标处。
+		// 窗口边界按显示列宽切(CJK / emoji 每码点多列,按 UTF-16 码元切会把右框线顶出):
+		// 先右移 start 保证「光标前缀」不超 avail 列,再从 start 起按列逐码点累加取 shown。
 		let start = 0;
 		if (this.cursor > avail) start = this.cursor - avail;
-		const shown = this.input.slice(start, start + avail);
+		const c0 = this.input.charCodeAt(start);
+		if (start > 0 && c0 >= 0xdc00 && c0 <= 0xdfff) start -= 1; // 不切开代理对
+		while (start < this.cursor && visibleWidth(this.input.slice(start, this.cursor)) > avail) {
+			start += (this.input.codePointAt(start) ?? 0) > 0xffff ? 2 : 1;
+		}
+		let end = start;
+		let cols = 0;
+		while (end < this.input.length) {
+			const step = (this.input.codePointAt(end) ?? 0) > 0xffff ? 2 : 1;
+			const w = visibleWidth(this.input.slice(end, end + step));
+			if (cols + w > avail) break;
+			cols += w;
+			end += step;
+		}
+		const shown = this.input.slice(start, end);
 		const cursorIdx = this.cursor - start;
 
 		const head = this.theme.style(prompt, { fg: "accent", bold: true });
