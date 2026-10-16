@@ -335,7 +335,7 @@ insight_recall  query="OAuth 迁移 风险"      # 后续任务需要时召回
 | 数据 | 生命周期 | 存储 |
 |---|---|---|
 | 角色、子会话(desk/log/结果) | 与会话相同 | 会话 custom entry(不进模型上下文),resume / 分支切换后重放恢复 |
-| 经验记忆 | **跨会话** | `~/.pi/agent/session-agents/insights.jsonl` |
+| 经验记忆 | **跨会话** | 当前 pi 会话的配置目录下 `session-agents/insights.jsonl`(会话 `sessionDir` 为 `<项目>/.pi/sessions` 时即 `<项目>/.pi/session-agents/insights.jsonl`;默认布局下为 `~/.pi/agent/session-agents/insights.jsonl`) |
 
 模型可随时 `agent_discard` / `subsession_discard` 主动释放;子会话被丢弃后,
 其已沉淀的经验仍可通过 `insight_recall` 召回。
@@ -355,7 +355,12 @@ insight_recall  query="OAuth 迁移 风险"      # 后续任务需要时召回
 - agent 单条工具结果注入历史时截断到 32 KB;单次工具结果返回给调用模型
   截断到 48 KB(完整内容保留在子会话工作日志中)。
 - 子会话工作日志超过 80 条时自动裁剪旧条目(保留最近 60 条)。
-- 经验记忆按项目 cwd 隔离(`scope:"all"` 可跨项目检索);记忆文件只追加,
+- 经验记忆按项目 cwd 隔离(`scope:"all"` 可跨项目检索);记忆文件存到**当前会话
+  的配置目录**下 `session-agents/insights.jsonl`(跟随会话的 `sessionDir`:
+  session 文件在 `<项目>/.pi/sessions` 时写入 `<项目>/.pi/session-agents/insights.jsonl`,
+  默认布局下仍是 `~/.pi/agent/session-agents/insights.jsonl`);旧位置
+  (`~/.pi/agent/session-agents/insights.jsonl`)的记录会在首次加载时自动迁移
+  (按 id 去重、幂等,旧文件保留不删),记忆文件只追加,
   可手动清理或用 `subsession_discard` 控制沉淀节奏。
 - 授予角色工具时注意权限:嵌套工具调用与模型调用走同样的权限钩子,但
   也可以授予 `agent_create` / `subsession_*` 让角色自行再拆解任务(无深度

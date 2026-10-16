@@ -28,7 +28,7 @@
  * 本扩展是 ldk 包(pi-ldk)的一部分,入口由 package.json 的 pi.extensions 声明。
  */
 
-import { readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type {
 	AgentToolResult,
@@ -43,7 +43,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { Api, AssistantMessage, Message, Model, Tool, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
 import { matchesKey, Text, truncateToWidth, wrapTextWithAnsi, type Component, type Focusable } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { InsightStore, INSIGHT_KINDS, tokenize, type InsightKind, type InsightRecord } from "./insights.ts";
+import { InsightStore, INSIGHT_KINDS, resolveInsightsFile, tokenize, type InsightKind, type InsightRecord } from "./insights.ts";
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -591,16 +591,55 @@ export default function (pi: ExtensionAPI) {
 	const roles = new Map<string, RoleState>();
 	const subs = new Map<string, SubSessionState>();
 	const locks = new Map<string, Promise<void>>();
-	const store = new InsightStore(join(getAgentDir(), "session-agents", "insights.jsonl"));
-	let storeLoaded = false;
+	/** 经验记忆:文件位置跟随当前会话的配置目录,首次使用时惰性建立(见 ensureStore)。 */
+	let store!: InsightStore;
+	let storePath = "";
 	/** 当前工作模式(新会话默认 auto;resume / 分支切换时由 mode_set 操作重放恢复)。 */
 	let workMode: WorkMode = DEFAULT_WORK_MODE;
 
-	function ensureStore(): void {
-		if (!storeLoaded) {
-			store.load();
-			storeLoaded = true;
+	/** ensureStore 需要的上下文:扩展 ctx 与工具 ctx 都满足该结构。 */
+	type StoreContext = {
+		cwd: string;
+		sessionManager?: {
+			getSessionFile?: () => string | undefined;
+			getSessionDir?: () => string;
+		};
+	};
+
+	/** 确保 store 指向当前会话配置目录下的记忆文件;路径变化(会话切换)时重建重载 + 幂等迁移旧记录。 */
+	function ensureStore(ctx: StoreContext): void {
+		const path = resolveInsightsFile({
+			sessionFile: ctx.sessionManager?.getSessionFile?.(),
+			sessionDir: ctx.sessionManager?.getSessionDir?.(),
+			cwd: ctx.cwd,
+			agentDir: getAgentDir(),
+		});
+		if (store && path === storePath) return;
+		store = new InsightStore(path);
+		store.load();
+		storePath = path;
+		migrateLegacyInsights(path);
+	}
+
+	/** 旧位置(getAgentDir 下)的记录一次性迁入当前文件:按 id 去重、幂等;旧文件保持原样不删不改。 */
+	function migrateLegacyInsights(path: string): void {
+		const legacy = join(getAgentDir(), "session-agents", "insights.jsonl");
+		if (legacy === path || !existsSync(legacy)) return;
+		const seen = new Set<string>();
+		const records: InsightRecord[] = [];
+		for (const line of readFileSync(legacy, "utf8").split("\n")) {
+			if (!line.trim()) continue;
+			try {
+				const record = JSON.parse(line) as InsightRecord;
+				if (record?.id && typeof record.text === "string" && !store.has(record.id) && !seen.has(record.id)) {
+					seen.add(record.id);
+					records.push(record);
+				}
+			} catch {
+				// 跳过损坏的行
+			}
 		}
+		store.add(records);
 	}
 
 	// -- 状态持久化与恢复 ---------------------------------------------------
@@ -734,7 +773,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		rebuildFromSession(ctx);
-		ensureStore();
+		ensureStore(ctx);
 		updateModeStatus(ctx);
 	});
 	pi.on("session_tree", (_event, ctx) => {
@@ -770,7 +809,7 @@ export default function (pi: ExtensionAPI) {
 			if (menu) event.systemPromptOptions.sections["session_agents_models"] = menu;
 		}
 
-		ensureStore();
+		ensureStore(ctx);
 		if (store.size === 0) return;
 		const prompt = event.messageType === "user" ? event.prompt : "";
 		if (tokenize(prompt).length < 3) return;
@@ -2001,12 +2040,12 @@ export default function (pi: ExtensionAPI) {
 				current.result = parsed.result;
 				current.extras = parsed.extras;
 				current.updatedAt = Date.now();
-				const insights = collectInsights(parsed.insights, current, ctx.cwd);
+				const insights = collectInsights(parsed.insights, current, ctx.cwd, ctx);
 				addUsage(current.usage, usage);
 				persist({ op: "sub_finish", name, result: parsed.result, extras: parsed.extras, desk: current.desk, usage });
 
 				if (insights.length > 0) {
-					ensureStore();
+					// store 已在 collectInsights 内确保初始化。
 					store.add(insights);
 				}
 
@@ -2135,7 +2174,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		annotations: { readOnlyHint: true, destructiveHint: false },
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-			ensureStore();
+			ensureStore(ctx);
 			const kinds = (params.kinds ?? []).map((kind) => kind.trim()).filter((kind): kind is InsightKind => (INSIGHT_KINDS as string[]).includes(kind));
 			const hits = store.search(params.query, {
 				limit: params.limit ?? 6,
@@ -2184,7 +2223,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-			ensureStore();
+			ensureStore(ctx);
 			const kind: InsightKind = (INSIGHT_KINDS as string[]).includes(params.kind?.trim() ?? "")
 				? (params.kind!.trim() as InsightKind)
 				: "note";
@@ -2489,7 +2528,10 @@ export default function (pi: ExtensionAPI) {
 		parsed: { kind: InsightKind; text: string }[],
 		sub: SubSessionState,
 		cwd: string,
+		ctx: StoreContext,
 	): InsightRecord[] {
+		// 用 nextId 前必须先确保 store 已初始化(惰性首建时为 undefined)。
+		ensureStore(ctx);
 		const now = Date.now();
 		const records: InsightRecord[] = [];
 		const push = (kind: InsightKind, text: string) => {

@@ -12,8 +12,8 @@
  * 是处理过程中的解决方式、异常、经验等,供后续任务主动获得启发。
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 
 export type InsightKind = "result" | "approach" | "anomaly" | "lesson" | "finding" | "decision" | "note";
 
@@ -108,6 +108,11 @@ export class InsightStore {
 		return this.records.length;
 	}
 
+	/** 该 id 是否已在索引中(load 出来的 + 本次会话新增的);用于迁移去重。 */
+	has(id: string): boolean {
+		return this.termFreq.has(id);
+	}
+
 	private indexRecord(record: InsightRecord): void {
 		const freq = new Map<string, number>();
 		const tokens = tokenize(`${record.title} ${record.kind} ${record.text}`);
@@ -176,4 +181,73 @@ export class InsightStore {
 		hits.sort((a, b) => b.score - a.score);
 		return hits.slice(0, limit);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 记忆文件位置解析
+// ---------------------------------------------------------------------------
+
+function isDir(path: string): boolean {
+	try {
+		return statSync(path).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/** 从 path(含自身)向上找名为 "sessions" 的目录,返回其父目录(即该会话的配置目录);找不到返回 undefined。 */
+function findSessionsParent(path: string | undefined): string | undefined {
+	if (!path) return undefined;
+	let dir = resolve(path);
+	for (let depth = 0; depth < 64; depth++) {
+		if (basename(dir) === "sessions") return dirname(dir);
+		const parent = dirname(dir);
+		if (parent === dir) return undefined;
+		dir = parent;
+	}
+	return undefined;
+}
+
+/** 合理性校验:候选目录得像个 pi 配置目录,否则宁可退回 agent 目录。 */
+function isConfigDir(dir: string, agentDir: string): boolean {
+	const name = basename(dir);
+	return name === ".pi" || name === "agent" || dir === resolve(agentDir) || existsSync(join(dir, "settings.json"));
+}
+
+/** 从 cwd(含自身)向上找最近的项目 .pi 目录。 */
+function findProjectDotPi(cwd: string): string | undefined {
+	let dir = resolve(cwd);
+	for (let depth = 0; depth < 64; depth++) {
+		const candidate = join(dir, ".pi");
+		if (isDir(candidate)) return candidate;
+		const parent = dirname(dir);
+		if (parent === dir) return undefined;
+		dir = parent;
+	}
+	return undefined;
+}
+
+/** 解析经验记忆文件路径:<配置目录>/session-agents/insights.jsonl。配置目录按以下优先级:
+ *  1) 当前会话的 sessions 目录的父目录(从 sessionFile/sessionDir 向上找名为 "sessions" 的祖先);
+ *  2) 合理性校验:该目录 basename 为 ".pi"/"agent"、等于 agentDir、或其下有 settings.json 才采纳;
+ *  3) 从 cwd 向上找最近的 .pi 目录;
+ *  4) 终极回退 agentDir。 */
+export function resolveInsightsFile(opts: {
+	sessionFile?: string;
+	sessionDir?: string;
+	cwd: string;
+	agentDir: string;
+}): string {
+	const suffix = join("session-agents", "insights.jsonl");
+
+	// 1) + 2) 优先跟随当前会话的配置目录(sessionDir 默认是 <配置目录>/sessions)。
+	const configDir = findSessionsParent(opts.sessionFile ?? opts.sessionDir);
+	if (configDir && isConfigDir(configDir, opts.agentDir)) return join(configDir, suffix);
+
+	// 3) 会话信息不可用 / 不合理:退到 cwd 所在项目的 .pi 目录。
+	const dotPi = findProjectDotPi(opts.cwd);
+	if (dotPi) return join(dotPi, suffix);
+
+	// 4) 终极回退:agent 目录(与历史行为一致)。
+	return join(opts.agentDir, suffix);
 }
