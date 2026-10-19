@@ -51,7 +51,7 @@ export default function (pi: ExtensionAPI) {
 
 	// /term 与 /terminal 共用同一处理逻辑。
 	pi.registerCommand("term", {
-		description: "呼出一个可折叠/销毁的终端 (term [open|new|list|destroy|help] [name])",
+		description: "呼出一个可折叠/销毁的终端 (term [open|new|list|destroy|kill|help] [name])",
 		handler: termHandler,
 	});
 	pi.registerCommand("terminal", {

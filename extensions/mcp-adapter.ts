@@ -108,7 +108,7 @@ import type {
 	ToolExposure,
 } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative } from "node:path";
 
@@ -331,7 +331,9 @@ export function persistServerTools(server: string, tools: CachedTool[]): void {
 		}
 		for (const tool of tools) merged.set(tool.name, tool);
 		servers[server] = { tools: [...merged.values()] };
-		writeFileSync(path, JSON.stringify({ ...root, version: 1, servers }, null, 1), { mode: 0o600 });
+		const tmp = `${path}.${process.pid}.tmp`;
+		writeFileSync(tmp, JSON.stringify({ ...root, version: 1, servers }, null, 1), { mode: 0o600 });
+		renameSync(tmp, path);
 	} catch {
 		// Best effort: the cache only enriches what the call proxy can list up front.
 	}
@@ -1174,7 +1176,12 @@ function sync(pi: ExtensionAPI, state: AdapterState, ctx: Pick<ExtensionContext,
 	// Drop servers that disappeared from the config.
 	for (const name of [...state.registered.keys()]) {
 		if (!wanted.has(name)) {
-			pi.unregisterMcpServer(name);
+			try {
+				pi.unregisterMcpServer(name);
+			} catch {
+				// Best effort: host semantics for unknown names are undocumented; a stray
+				// throw must not abort the rest of the sync.
+			}
 			state.registered.delete(name);
 		}
 	}

@@ -21,7 +21,7 @@
 
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { request as nodeHttpRequest } from "node:http";
 import { request as nodeHttpsRequest } from "node:https";
 import { homedir } from "node:os";
@@ -68,6 +68,8 @@ interface RequestOptions {
 	headers?: Record<string, string>;
 	body?: string | Buffer;
 	signal?: AbortSignal;
+	/** 响应体字节上限,超过则中止并报错(防超大/恶意响应 OOM)。 */
+	maxBytes?: number;
 }
 
 function directRequestOnce(urlStr: string, opts: RequestOptions): Promise<RawResponse> {
@@ -76,7 +78,17 @@ function directRequestOnce(urlStr: string, opts: RequestOptions): Promise<RawRes
 		const lib = url.protocol === "https:" ? nodeHttpsRequest : nodeHttpRequest;
 		const req = lib(url, { method: opts.method ?? "GET", headers: opts.headers }, (res) => {
 			const chunks: Buffer[] = [];
-			res.on("data", (chunk) => chunks.push(chunk));
+			let received = 0;
+			res.on("data", (chunk) => {
+				received += chunk.length;
+				if (opts.maxBytes && received > opts.maxBytes) {
+					const err = new Error(`response too large (> ${opts.maxBytes} bytes)`);
+					reject(err);
+					req.destroy(err);
+					return;
+				}
+				chunks.push(chunk);
+			});
 			// Truncated/aborted responses never emit "end"; settle here so the promise cannot hang.
 			res.on("error", reject);
 			res.on("aborted", () => reject(new Error("response aborted")));
@@ -132,10 +144,34 @@ async function fetchDirect(urlStr: string, opts: RequestOptions): Promise<RawRes
 		body: opts.body,
 		signal: opts.signal,
 	});
+	const declared = Number(res.headers.get("content-length") ?? "");
+	if (opts.maxBytes && declared > opts.maxBytes) {
+		throw new Error(`response too large (> ${opts.maxBytes} bytes)`);
+	}
+	let buffer: Buffer;
+	if (opts.maxBytes && res.body) {
+		// 流式累计,超限即中止,避免超大响应全量入内存。
+		const reader = res.body.getReader();
+		const chunks: Buffer[] = [];
+		let received = 0;
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			received += value.byteLength;
+			if (received > opts.maxBytes) {
+				await reader.cancel().catch(() => {});
+				throw new Error(`response too large (> ${opts.maxBytes} bytes)`);
+			}
+			chunks.push(Buffer.from(value));
+		}
+		buffer = Buffer.concat(chunks);
+	} else {
+		buffer = Buffer.from(await res.arrayBuffer());
+	}
 	return {
 		status: res.status,
 		headers: Object.fromEntries(res.headers.entries()),
-		buffer: Buffer.from(await res.arrayBuffer()),
+		buffer,
 	};
 }
 
@@ -800,8 +836,11 @@ export async function resolveReferenceImage(ref: string, cwd: string): Promise<R
 	return { dataUri: `data:${mimeType};base64,${data.toString("base64")}` };
 }
 
+/** 下载图片的响应大小上限(防超大/恶意图源 OOM)。 */
+const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
+
 async function downloadImage(url: string, signal?: AbortSignal): Promise<{ data: string; mimeType: string }> {
-	const res = await httpRequest(url, { signal });
+	const res = await httpRequest(url, { signal, maxBytes: MAX_DOWNLOAD_BYTES });
 	if (res.status < 200 || res.status >= 300) throw new Error(`failed to download ${url}: HTTP ${res.status}`);
 	const contentType = res.headers["content-type"]?.split(";")[0].trim();
 	const mimeType = contentType?.startsWith("image/")
@@ -810,19 +849,29 @@ async function downloadImage(url: string, signal?: AbortSignal): Promise<{ data:
 	return { data: res.buffer.toString("base64"), mimeType };
 }
 
-async function uniquePath(dir: string, name: string): Promise<string> {
+/**
+ * 原子地写入一个未被占用的目标路径:先写同目录随机名临时文件,再 link(原子
+ * no-replace)落位到最终路径,成功后删临时文件。目标已存在(EEXIST)换下一个
+ * 候选名重试。同时消除『写一半的文件』与检查→写入的 TOCTOU 竞态。
+ */
+async function writeUniqueFile(dir: string, name: string, data: Buffer): Promise<string> {
 	const dot = name.lastIndexOf(".");
 	const stem = dot > 0 ? name.slice(0, dot) : name;
 	const ext = dot > 0 ? name.slice(dot) : "";
 	for (let i = 0; i < 100; i++) {
 		const candidate = join(dir, i === 0 ? name : `${stem}-${i + 1}${ext}`);
+		const tmp = `${candidate}.tmp-${Math.random().toString(36).slice(2, 10)}`;
 		try {
-			readFileSync(candidate);
-		} catch {
+			await writeFile(tmp, data, { flag: "wx" });
+			await link(tmp, candidate);
 			return candidate;
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+		} finally {
+			await rm(tmp, { force: true });
 		}
 	}
-	return join(dir, `${stem}-${Date.now()}${ext}`);
+	throw new Error(`too many file name collisions for ${name} in ${dir}`);
 }
 
 export async function saveImages(
@@ -858,8 +907,7 @@ export async function saveImages(
 			} else {
 				name = `${slugify(opts.prompt)}-${timestamp()}-${i + 1}.${ext}`;
 			}
-			const path = await uniquePath(dir, name);
-			await writeFile(path, buffer);
+			const path = await writeUniqueFile(dir, name, buffer);
 			saved.push({ path, mimeType, bytes: buffer.length, data });
 		} catch (error) {
 			errors.push(`image ${i + 1}: ${error instanceof Error ? error.message : error}`);

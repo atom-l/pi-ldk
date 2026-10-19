@@ -19,6 +19,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 
 export type ShellStatus = "running" | "exited" | "killed";
 
@@ -33,6 +34,8 @@ export interface ShellSessionOptions {
 const MAX_BUFFER_LINES = 5000;
 /** 先 SIGTERM、超过该时间仍未退出则 SIGKILL 的宽限期。 */
 const KILL_GRACE_MS = 1500;
+/** 无换行残片(pending)的上限,超过则强制落行并截断,避免无上限增长。 */
+const MAX_PENDING_CHARS = 1024 * 1024;
 
 /**
  * 本模块加载到的所有存活会话。用于进程退出时兜底清理。
@@ -70,6 +73,9 @@ export class ShellSession {
 
 	private child: ChildProcessWithoutNullStreams;
 	private pending = "";
+	// 流式 UTF-8 解码:多字节字符可能被 chunk 边界切开,逐块 toString() 会产生 U+FFFD 乱码。
+	private stdoutDecoder = new StringDecoder("utf8");
+	private stderrDecoder = new StringDecoder("utf8");
 	private killTimer: ReturnType<typeof setTimeout> | null = null;
 	private disposed = false;
 
@@ -91,14 +97,21 @@ export class ShellSession {
 		this.appendLine(`[终端 ${this.name}] pid=${this.pid ?? "?"} · shell=${this.shell} · cwd=${this.cwd}`);
 		this.appendLine(`[提示] Esc=折叠(进程继续运行) · Ctrl+X=销毁(终止进程) · Ctrl+C=中断`);
 
-		this.child.stdout.on("data", (chunk: Buffer) => this.ingest(chunk.toString()));
-		this.child.stderr.on("data", (chunk: Buffer) => this.ingest(chunk.toString()));
+		this.child.stdout.on("data", (chunk: Buffer) => this.ingest(this.stdoutDecoder.write(chunk)));
+		this.child.stderr.on("data", (chunk: Buffer) => this.ingest(this.stderrDecoder.write(chunk)));
+		// 三流挂 'error' 监听:对端提前关闭后 stdin 写入/流读取会异步抛 EPIPE/EIO,
+		// 无监听将升级为未捕获异常崩掉宿主;这里记一行输出即可。
+		this.child.stdin.on("error", (err) => this.appendLine(`[shell stdin error] ${err.message}`));
+		this.child.stdout.on("error", (err) => this.appendLine(`[shell stdout error] ${err.message}`));
+		this.child.stderr.on("error", (err) => this.appendLine(`[shell stderr error] ${err.message}`));
 		this.child.on("error", (err) => {
 			this.appendLine(`[shell 启动失败] ${err.message}`);
 			this.status = "exited";
 			this.onOutput?.();
 		});
 		this.child.on("exit", (code, signal) => {
+			const tail = this.stdoutDecoder.end() + this.stderrDecoder.end();
+			if (tail) this.ingest(tail);
 			this.flushPending();
 			this.exitCode = code;
 			this.exitSignal = signal;
@@ -117,12 +130,15 @@ export class ShellSession {
 
 	private ingest(text: string): void {
 		this.pending += text;
-		let idx: number;
-		while ((idx = this.pending.indexOf("\n")) >= 0) {
-			let line = this.pending.slice(0, idx);
-			this.pending = this.pending.slice(idx + 1);
-			if (line.endsWith("\r")) line = line.slice(0, -1);
-			this.appendLine(line);
+		const parts = this.pending.split("\n");
+		this.pending = parts.pop() ?? "";
+		for (const part of parts) {
+			this.appendLine(part.endsWith("\r") ? part.slice(0, -1) : part);
+		}
+		if (this.pending.length > MAX_PENDING_CHARS) {
+			// 无换行残片超限:强制落行并截断,避免内存无上限增长。
+			this.appendLine(this.pending.slice(0, MAX_PENDING_CHARS));
+			this.pending = "";
 		}
 		// 未换行的片段(如 printf 无换行、进度条)保留在 pending,由 getView 作为
 		// 最后一行实时显示;后续到达的文本继续拼接,直到遇到换行才落为完整行。

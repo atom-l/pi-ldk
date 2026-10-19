@@ -58,6 +58,7 @@ const MAX_BLOCK_CHARS = 32_000;
 const MAX_TURN_LOG = 80;
 const TURN_LOG_KEEP = 60;
 const MAX_DESK_ENTRIES = 24;
+const MAX_BACKGROUND_JOBS = 200;
 const MAX_MODEL_LISTING = 120;
 /** 模型能力评分的默认维度(models.json 的 capabilities 可自由新增维度名)。 */
 const DEFAULT_CAPABILITY_DIMS: readonly string[] = [
@@ -705,6 +706,7 @@ export default function (pi: ExtensionAPI) {
 						desk: { ...emptyDesk(), ...(sub.desk ?? {}) },
 						assignments: sub.assignments ?? [],
 						log: sub.log ?? [],
+						usage: { ...emptyUsage(), ...(sub.usage ?? {}), cost: { ...emptyUsage().cost, ...(sub.usage?.cost ?? {}) } },
 					});
 				}
 				break;
@@ -767,6 +769,8 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function rebuildFromSession(ctx: ExtensionContext): void {
+		// 分支切换/重入前先取消在飞后台作业,防止旧分支的轮次回写污染重建后的状态。
+		cancelAllJobs();
 		roles.clear();
 		subs.clear();
 		workMode = DEFAULT_WORK_MODE;
@@ -792,6 +796,8 @@ export default function (pi: ExtensionAPI) {
 		roles.clear();
 		subs.clear();
 		locks.clear();
+		traceLog.length = 0;
+		traceSeq = 0;
 	});
 
 	// -- 主动提供启发:任务开始时自动召回相关经验 ----------------------------
@@ -1224,6 +1230,18 @@ export default function (pi: ExtensionAPI) {
 		jobs.clear();
 	}
 
+	/** 超出上限时按完成时间淘汰最旧的已收尾作业(运行中/未收集结果不动,仅在超限时才丢弃)。 */
+	function pruneJobs(): void {
+		if (jobs.size <= MAX_BACKGROUND_JOBS) return;
+		const finished = [...jobs.values()]
+			.filter((job) => job.status !== "running")
+			.sort((a, b) => (a.finishedAt ?? a.startedAt) - (b.finishedAt ?? b.startedAt));
+		for (const job of finished) {
+			if (jobs.size <= MAX_BACKGROUND_JOBS) break;
+			jobs.delete(job.id);
+		}
+	}
+
 	// -- 协作轮核心:支持轮内并行 / 跨轮并发 ------------------------------
 
 	interface RunRoundParams {
@@ -1382,6 +1400,14 @@ export default function (pi: ExtensionAPI) {
 			return withLock(`${name}:commit`, async () => {
 				const current = subs.get(name);
 				if (!current) return fail(`Sub-session "${name}" was discarded.`, { action: "subsession_run", traces: outcomes.map((o) => o.turn.trace) });
+				// 重建身份守卫:round 开始时持有的对象若已被 rebuild/discard+同名重建替换,
+				// 本轮贡献(含 abort 产生的 [error])不得写入重建后的新分支。
+				if (current !== snapshot) {
+					return fail(`Sub-session "${name}" was rebuilt/discarded mid-round; this round's contributions are not committed.`, {
+						action: "subsession_run",
+						traces: outcomes.map((o) => o.turn.trace),
+					});
+				}
 				if (current.status === "done") {
 					const notes = outcomes.map(
 						({ assignment, role, turn }) =>
@@ -1465,6 +1491,12 @@ export default function (pi: ExtensionAPI) {
 			if (!sub) {
 				return fail(`No sub-session named "${params.subsession}". Existing: ${[...subs.keys()].join(", ") || "(none)"}`, {
 					action: "desk_update",
+				});
+			}
+			if (sub.status === "done") {
+				return fail(`Sub-session "${sub.name}" is already finished; its desk is read-only now.`, {
+					action: "desk_update",
+					subsession: sub.name,
 				});
 			}
 			const added: string[] = [];
@@ -1855,6 +1887,7 @@ export default function (pi: ExtensionAPI) {
 						job.finishedAt = Date.now();
 					});
 				jobs.set(id, job);
+				pruneJobs();
 				return ok(
 					`已后台派发子会话 "${name}" 协作轮 — job=${id}
 ` +
@@ -2511,7 +2544,7 @@ export default function (pi: ExtensionAPI) {
 		if (!result) result = text.trim();
 
 		const insights: { kind: InsightKind; text: string }[] = [];
-		const blocks = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)];
+		const blocks = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)];
 		for (const block of blocks.reverse()) {
 			try {
 				const parsed = JSON.parse(block[1].trim());

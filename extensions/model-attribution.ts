@@ -32,9 +32,8 @@
  * never modified — the tag is a new text block, so provider signatures
  * (`textSignature`, `thinkingSignature`, `thoughtSignature`) stay valid.
  *
- * Canonical source:  model-attribution/model-attribution.ts (this file)
- * Deployed copy:     <project>/.pi/extensions/model-attribution.ts
- * See README.md in the canonical directory for install/upgrade notes.
+ * Canonical source:  extensions/model-attribution.ts (this file)
+ * See README.md at the repository root for install/upgrade notes.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -252,11 +251,13 @@ export function applySystemPolicy(messages: MessageLike[]): MessageLike[] {
   const head = messages[0];
   if (!head || head.role !== "system") return messages;
   const content = head.content;
+  // content 形状非法(既非 string 也非数组)时不做任何变换,原样保留。
+  if (typeof content !== "string" && !Array.isArray(content)) return messages;
   const text =
     typeof content === "string"
       ? content
       : Array.isArray(content)
-        ? (content as ContentBlock[]).map((block) => (typeof block.text === "string" ? block.text : "")).join("")
+        ? (content as ContentBlock[]).map((block) => (typeof block?.text === "string" ? block.text : "")).join("")
         : "";
   if (text.includes(POLICY_TAG)) return messages;
   const policy = buildSystemPolicy();
@@ -281,8 +282,14 @@ export function stripEchoedAttributionTag(message: MessageLike): MessageLike {
   const block = content[index];
   if (!block || block.type !== "text" || typeof block.text !== "string") return message;
   const stripped = block.text.replace(ECHO_TAG_LEADING_RE, "");
-  if (stripped === block.text || stripped.length === 0) return message;
+  if (stripped === block.text) return message;
   const { textSignature: _drop, ...rest } = block;
+  if (stripped.length === 0) {
+    // 首文本块被 echo tag 占满也算剥离成功:整块移除;若它是唯一内容块则
+    // 保留空文本块,避免产出空 content 数组。
+    const without = [...content.slice(0, index), ...content.slice(index + 1)];
+    return { ...message, content: without.length > 0 ? without : [{ ...rest, text: "" }] };
+  }
   const cleaned = { ...rest, text: stripped };
   return { ...message, content: [...content.slice(0, index), cleaned, ...content.slice(index + 1)] };
 }
