@@ -9,7 +9,7 @@
  *      子会话是一张"公共桌面",为它指派若干角色 agent,agent 们在桌面
  *      (desk:发现/决策/异常/待决)与工作日志上相互交流、协作完成任务。
  *      完成时向调用模型返回两部分:【结果】与【额外信息】。
- *   3. 经验记忆(工具 insight_*):结果与额外信息沉淀为跨会话的记忆记录,
+ *   3. 经验记忆(工具 insight_*):结果与额外信息沉淀为**当前会话**的记忆记录,
  *      提供类 RAG 的快速召回 / 回溯(BM25,无模型调用),并在后续任务开始时
  *      主动把相关经验作为"启发提示"注入系统提示。
  *   4. 模型能力评分(models.json 各模型的 capabilities):各维度 1-100 分,
@@ -22,14 +22,17 @@
  * details(渲染用,不进模型上下文),因此对主模型与其他子会话不可见,但对
  * 用户可见:点击 / ctrl+e 展开工具结果即可查看,或用 /agent-trace 实时追踪。
  *
- * 生命周期:角色与子会话的生命周期等于会话(内存态 + custom entry 持久化,
- * resume / 分支切换后恢复);经验记忆存放在 agent 目录下的 JSONL,跨会话存活。
+ * 生命周期:角色、子会话与经验记忆的生命周期均等于会话(内存态 + custom entry
+ * 持久化,resume / 分支切换后按当前分支重放恢复):经验记忆与产出它的会话绑定,
+ * 各会话互相隔离、不互通,删除会话文件即删除其经验(rewind 到更早的分支点后,
+ * 该点之后沉淀的经验也不再召回)。
  *
  * 本扩展是 ldk 包(pi-ldk)的一部分,入口由 package.json 的 pi.extensions 声明。
  */
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+// getAgentDir 仍用于 models.json 的定位(模型能力评分),经验记忆已不再使用它。
 import type {
 	AgentToolResult,
 	CustomEntry,
@@ -43,13 +46,13 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { Api, AssistantMessage, Message, Model, Tool, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
 import { matchesKey, Text, truncateToWidth, wrapTextWithAnsi, type Component, type Focusable } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { InsightStore, INSIGHT_KINDS, resolveInsightsFile, tokenize, type InsightKind, type InsightRecord } from "./insights.ts";
+import { InsightStore, INSIGHT_KINDS, tokenize, type InsightKind, type InsightRecord } from "./insights.ts";
 
 // ---------------------------------------------------------------------------
 // 常量
 // ---------------------------------------------------------------------------
 
-/** 会话文件中 custom entry 的 customType(用于恢复角色与子会话状态)。 */
+/** 会话文件中 custom entry 的 customType(用于恢复角色、子会话与经验记忆状态)。 */
 const ENTRY_TYPE = "session-agents-v2";
 const DEFAULT_MAX_TURNS = 8;
 const MAX_TURNS_CAP = 24;
@@ -290,7 +293,8 @@ type StoreOp =
 	| { op: "sub_assign"; name: string; assignments: Assignment[] }
 	| { op: "sub_discard"; name: string }
 	| { op: "sub_discard_all" }
-	| { op: "mode_set"; mode: WorkMode };
+	| { op: "mode_set"; mode: WorkMode }
+	| { op: "insight_add"; records: InsightRecord[] };
 
 interface ToolDetails {
 	action: string;
@@ -592,62 +596,16 @@ export default function (pi: ExtensionAPI) {
 	const roles = new Map<string, RoleState>();
 	const subs = new Map<string, SubSessionState>();
 	const locks = new Map<string, Promise<void>>();
-	/** 经验记忆:文件位置跟随当前会话的配置目录,首次使用时惰性建立(见 ensureStore)。 */
-	let store!: InsightStore;
-	let storePath = "";
+	/** 经验记忆:纯内存索引,内容随会话文件 custom entry(insight_add)重放恢复,随会话删除而消失。 */
+	const store = new InsightStore();
 	/** 当前工作模式(新会话默认 auto;resume / 分支切换时由 mode_set 操作重放恢复)。 */
 	let workMode: WorkMode = DEFAULT_WORK_MODE;
 
-	/** ensureStore 需要的上下文:扩展 ctx 与工具 ctx 都满足该结构。 */
-	type StoreContext = {
-		cwd: string;
-		sessionManager?: {
-			getSessionFile?: () => string | undefined;
-			getSessionDir?: () => string;
-		};
-	};
-
-	/** 确保 store 指向当前会话配置目录下的记忆文件;路径变化(会话切换)时重建重载 + 幂等迁移旧记录。 */
-	function ensureStore(ctx: StoreContext): void {
-		const path = resolveInsightsFile({
-			sessionFile: ctx.sessionManager?.getSessionFile?.(),
-			sessionDir: ctx.sessionManager?.getSessionDir?.(),
-			cwd: ctx.cwd,
-			agentDir: getAgentDir(),
-		});
-		if (store && path === storePath) return;
-		store = new InsightStore(path);
-		store.load();
-		storePath = path;
-		migrateLegacyInsights(path);
-	}
-
-	/** 旧位置(getAgentDir 下)的记录一次性迁入当前文件:按 id 去重、幂等;旧文件保持原样不删不改。 */
-	function migrateLegacyInsights(path: string): void {
-		// 迁移失败(旧文件不可读 / 目标不可写 / 磁盘满)只静默降级,不影响主流程。
-		try {
-			const legacy = join(getAgentDir(), "session-agents", "insights.jsonl");
-			if (legacy === path || !existsSync(legacy)) return;
-			// 目标文件加载失败时索引为空,去重不可信,跳过以免重复追加。
-			if (store.hadLoadFailure) return;
-			const seen = new Set<string>();
-			const records: InsightRecord[] = [];
-			for (const line of readFileSync(legacy, "utf8").split("\n")) {
-				if (!line.trim()) continue;
-				try {
-					const record = JSON.parse(line) as InsightRecord;
-					if (record?.id && typeof record.text === "string" && !store.has(record.id) && !seen.has(record.id)) {
-						seen.add(record.id);
-						records.push(record);
-					}
-				} catch {
-					// 跳过损坏的行
-				}
-			}
-			store.add(records);
-		} catch {
-			// 旧记忆迁移是尽力而为的增强:失败留在旧位置即可,不向调用方抛。
-		}
+	/** 记录经验:先更新内存索引,再把记录写进会话文件(重放时按同一管线重建)。 */
+	function recordInsights(records: InsightRecord[]): void {
+		if (records.length === 0) return;
+		store.add(records);
+		persist({ op: "insight_add", records });
 	}
 
 	// -- 状态持久化与恢复 ---------------------------------------------------
@@ -765,6 +723,11 @@ export default function (pi: ExtensionAPI) {
 				if (mode) workMode = mode;
 				break;
 			}
+			case "insight_add": {
+				// 仅更新内存索引(无文件 IO);add 内部按 id 去重,保证重放幂等。
+				store.add(op.records ?? []);
+				break;
+			}
 		}
 	}
 
@@ -773,6 +736,8 @@ export default function (pi: ExtensionAPI) {
 		cancelAllJobs();
 		roles.clear();
 		subs.clear();
+		// 经验记忆同样随分支重建:先清空,再按当前分支的 entry 重放恢复本会话的 insights。
+		store.clear();
 		workMode = DEFAULT_WORK_MODE;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom") {
@@ -784,7 +749,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		rebuildFromSession(ctx);
-		ensureStore(ctx);
 		updateModeStatus(ctx);
 	});
 	pi.on("session_tree", (_event, ctx) => {
@@ -795,6 +759,7 @@ export default function (pi: ExtensionAPI) {
 		cancelAllJobs();
 		roles.clear();
 		subs.clear();
+		store.clear();
 		locks.clear();
 		traceLog.length = 0;
 		traceSeq = 0;
@@ -822,11 +787,10 @@ export default function (pi: ExtensionAPI) {
 			if (menu) event.systemPromptOptions.sections["session_agents_models"] = menu;
 		}
 
-		ensureStore(ctx);
 		if (store.size === 0) return;
 		const prompt = event.messageType === "user" ? event.prompt : "";
 		if (tokenize(prompt).length < 3) return;
-		const hits = store.search(prompt, { limit: 3, cwd: ctx.cwd, minScore: 2 });
+		const hits = store.search(prompt, { limit: 3, minScore: 2 });
 		if (hits.length === 0) return;
 		const lines = hits
 			.map(
@@ -835,7 +799,7 @@ export default function (pi: ExtensionAPI) {
 			)
 			.join("\n");
 		event.systemPromptOptions.sections["session_agents_experience"] =
-			`以下经验由历史子会话沉淀,按与当前输入的相关度自动召回。仅在确实相关时参考,不相关请忽略;\n` +
+			`以下经验由本会话的历史子会话沉淀,按与当前输入的相关度自动召回。仅在确实相关时参考,不相关请忽略;\n` +
 			`需要更多背景或想精确检索时调用 insight_recall。\n${lines}`;
 	});
 
@@ -2013,7 +1977,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"When a sub-session finishes, keep BOTH parts it returns: the result (what was concluded) and the extra info (how it was solved, anomalies hit, lessons) — the extra info often informs later work, and insight_recall brings it back.",
 		],
-		description: `Finish a sub-session: synthesize the desk and work log into a final deliverable and return it in two parts — 1) 结果/result: the task outcome or conclusion; 2) 额外信息/extras: valuable process information (solution approach, anomalies and problems hit mid-way, reusable lessons). Both parts are also written into the cross-session experience memory so later tasks can recall them (insight_recall) and receive them as automatic inspiration. Idempotent: calling again returns the stored result.`,
+		description: `Finish a sub-session: synthesize the desk and work log into a final deliverable and return it in two parts — 1) 结果/result: the task outcome or conclusion; 2) 额外信息/extras: valuable process information (solution approach, anomalies and problems hit mid-way, reusable lessons). Both parts are also written into this session's experience memory so later tasks can recall them (insight_recall) and receive them as automatic inspiration. Idempotent: calling again returns the stored result.`,
 		parameters: Type.Object({
 			name: Type.String({ description: "Sub-session name." }),
 			guidance: Type.Optional(Type.String({ description: "Extra guidance for the synthesis (emphasis, format, what to highlight in extras)." })),
@@ -2080,16 +2044,14 @@ export default function (pi: ExtensionAPI) {
 				current.result = parsed.result;
 				current.extras = parsed.extras;
 				current.updatedAt = Date.now();
-				const insights = collectInsights(parsed.insights, current, ctx.cwd, ctx);
+				const insights = collectInsights(parsed.insights, current, ctx.cwd);
 				addUsage(current.usage, usage);
 				persist({ op: "sub_finish", name, result: parsed.result, extras: parsed.extras, desk: current.desk, usage });
 
-				if (insights.length > 0) {
-					// store 已在 collectInsights 内确保初始化。
-					store.add(insights);
-				}
+				// 沉淀到本会话的经验记忆(内存索引 + 会话 custom entry)。
+				recordInsights(insights);
 
-				const tail = `\n\n(已沉淀 ${insights.length} 条经验到跨会话记忆;后续任务可调用 insight_recall 召回,或在开始新任务时自动获得相关启发)`;
+				const tail = `\n\n(已沉淀 ${insights.length} 条经验到本会话记忆;后续任务可调用 insight_recall 召回,或在开始新任务时自动获得相关启发)`;
 				return ok(truncate(`${renderResult(current)}${tail}`, MAX_RESULT_CHARS), {
 					action: "subsession_finish",
 					subsession: summarizeSub(current),
@@ -2202,29 +2164,25 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Before tackling a task that resembles past work, call insight_recall once — it brings back results and process know-how (approach, anomalies, lessons) from earlier sub-sessions in milliseconds.",
 		],
-		description: `Recall results and extra information from finished sub-sessions (and manually added insights) with a fast, RAG-like search: ranked retrieval over the cross-session experience memory, no model call, returns instantly. Returns both the conclusion (kind=result) and process know-how (approach / anomaly / lesson / finding / decision) with provenance so you can trace back to the sub-session that produced it. Query in the language of the task; use kinds/scope to narrow.`,
+		description: `Recall results and extra information from finished sub-sessions (and manually added insights) of THIS session with a fast, RAG-like search: ranked retrieval over the session-bound experience memory, no model call, returns instantly. Returns both the conclusion (kind=result) and process know-how (approach / anomaly / lesson / finding / decision) with provenance so you can trace back to the sub-session that produced it. Insights are session-bound: only what this session (or its current branch) recorded is recalled. Query in the language of the task; use kinds to narrow.`,
 		parameters: Type.Object({
 			query: Type.String({ description: "What to look for: a task description, symptom, technology, or question." }),
 			kinds: Type.Optional(
 				Type.Array(Type.String(), { description: `Filter by kind: ${INSIGHT_KINDS.join(", ")}. Default: all.` }),
 			),
 			limit: Type.Optional(Type.Number({ description: "Max results (default 6)." })),
-			scope: Type.Optional(Type.String({ description: '"project" (default) recalls this project\'s memory; "all" searches every project.' })),
 			detail: Type.Optional(Type.Boolean({ description: "Return fuller text per result (default false, one-line snippets)." })),
 		}),
 		annotations: { readOnlyHint: true, destructiveHint: false },
-		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-			ensureStore(ctx);
+		execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
 			const kinds = (params.kinds ?? []).map((kind) => kind.trim()).filter((kind): kind is InsightKind => (INSIGHT_KINDS as string[]).includes(kind));
 			const hits = store.search(params.query, {
 				limit: params.limit ?? 6,
 				kinds: kinds.length ? kinds : undefined,
-				cwd: ctx.cwd,
-				scope: params.scope === "all" ? "all" : "project",
 			});
 			if (hits.length === 0) {
 				return ok(
-					`No insights matched "${params.query}" (memory size: ${store.size}). Try different keywords, scope:"all", or record new knowledge with insight_add.`,
+					`No insights matched "${params.query}" (memory size: ${store.size}). Try different keywords, or record new knowledge with insight_add.`,
 					{ action: "insight_recall", hits: [] },
 				);
 			}
@@ -2254,7 +2212,7 @@ export default function (pi: ExtensionAPI) {
 		name: "insight_add",
 		label: "Insight: add",
 		namespace: roleNamespace,
-		description: `Record a piece of experience into the cross-session memory so later tasks can recall it (insight_recall) or receive it as automatic inspiration. Use it for durable know-how worth keeping: surprising findings, reusable approaches, pitfalls, decisions with rationale. Results and extras of finished sub-sessions are recorded automatically by subsession_finish.`,
+		description: `Record a piece of experience into THIS session's memory so later tasks in the same session can recall it (insight_recall) or receive it as automatic inspiration. Use it for durable know-how worth keeping: surprising findings, reusable approaches, pitfalls, decisions with rationale. Results and extras of finished sub-sessions are recorded automatically by subsession_finish.`,
 		parameters: Type.Object({
 			text: Type.String({ description: "The insight: one concrete, self-contained statement." }),
 			kind: Type.Optional(Type.String({ description: `One of ${INSIGHT_KINDS.join(", ")} (default "note").` })),
@@ -2263,7 +2221,6 @@ export default function (pi: ExtensionAPI) {
 		}),
 		annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-			ensureStore(ctx);
 			const kind: InsightKind = (INSIGHT_KINDS as string[]).includes(params.kind?.trim() ?? "")
 				? (params.kind!.trim() as InsightKind)
 				: "note";
@@ -2276,7 +2233,7 @@ export default function (pi: ExtensionAPI) {
 				cwd: ctx.cwd,
 				timestamp: Date.now(),
 			};
-			store.add([record]);
+			recordInsights([record]);
 			return ok(`Recorded insight ${record.id} [${kind}]. Memory size: ${store.size}.`, {
 				action: "insight_add",
 				insight: { id: record.id, kind, text: oneLine(record.text, 120) },
@@ -2568,10 +2525,7 @@ export default function (pi: ExtensionAPI) {
 		parsed: { kind: InsightKind; text: string }[],
 		sub: SubSessionState,
 		cwd: string,
-		ctx: StoreContext,
 	): InsightRecord[] {
-		// 用 nextId 前必须先确保 store 已初始化(惰性首建时为 undefined)。
-		ensureStore(ctx);
 		const now = Date.now();
 		const records: InsightRecord[] = [];
 		const push = (kind: InsightKind, text: string) => {

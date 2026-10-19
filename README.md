@@ -75,7 +75,7 @@ pi --extension ./pi-ldk/extensions/session-agents
 角色 agent(固定上下文 + 专属底层模型 + 各自的知识/视角)
    │  ③ 完成后返回【结果】+【额外信息】
    ▼
-经验记忆 insight(跨会话沉淀,类 RAG 快速召回 + 主动启发)
+经验记忆 insight(随会话沉淀,类 RAG 快速召回 + 主动启发)
 ```
 
 核心思想:**任务不直接派给 agent**。任务本身的上下文先进入"子会话"这个
@@ -108,13 +108,14 @@ agent 们的**公共桌面**。任务上下文(目标、验收、背景数据、
 
 #### 3. 经验记忆(`insight_*`)
 
-结果与额外信息沉淀为跨会话的记忆记录,提供**类 RAG 的召回/回溯**:
+结果与额外信息沉淀为**本会话内**的记忆记录(与会话绑定、随会话文件删除),
+提供**类 RAG 的召回/回溯**:
 
 - **快**:内存倒排索引 + BM25,无模型调用,毫秒级返回;
 - **主动提供启发**:`before_agent_start` 按当前输入自动召回最相关的经验,
   注入系统提示的 `<session_agents_experience>` 段落(不相关自动跳过);
 - **可回溯**:每条记录带 kind、来源子会话、角色、时间、项目与命中词项;
-- 中英混合分词(拉丁整词 + CJK 一元/二元 gram),支持 kinds / scope / detail 过滤。
+- 中英混合分词(拉丁整词 + CJK 一元/二元 gram),支持 kinds / detail 过滤。
 
 ### 工作模式
 
@@ -249,7 +250,7 @@ resume / 分支切换后按分支历史重放恢复;目标路径不存在、或�
 | `subsession_finish` | 收尾合成,返回【结果】+【额外信息】,并沉淀经验到记忆 |
 | `subsession_get` | 查看子会话:summary / desk / log / result |
 | `subsession_discard` | 丢弃子会话(单个 / 全部),同时取消该子会话在飞的后台作业 |
-| `insight_recall` | 类 RAG 检索历史结果与额外信息(query / kinds / limit / scope / detail) |
+| `insight_recall` | 类 RAG 检索**当前会话**已沉淀的结果与额外信息(query / kinds / limit / detail) |
 | `insight_add` | 主动记录一条经验 |
 
 另有内部工具 `desk_update`(exposure: deferred),仅供子会话内的 agent 写公共桌面。
@@ -327,7 +328,7 @@ insight_recall  query="OAuth 迁移 风险"      # 后续任务需要时召回
 ### 异常与问题
 ### 经验与启发
 
-(已沉淀 N 条经验到跨会话记忆;后续任务可调用 insight_recall 召回)
+(已沉淀 N 条经验到本会话记忆;本会话后续任务可调用 insight_recall 召回)
 ```
 
 ### 生命周期与持久化
@@ -335,10 +336,12 @@ insight_recall  query="OAuth 迁移 风险"      # 后续任务需要时召回
 | 数据 | 生命周期 | 存储 |
 |---|---|---|
 | 角色、子会话(desk/log/结果) | 与会话相同 | 会话 custom entry(不进模型上下文),resume / 分支切换后重放恢复 |
-| 经验记忆 | **跨会话** | 当前 pi 会话的配置目录下 `session-agents/insights.jsonl`(会话 `sessionDir` 为 `<项目>/.pi/sessions` 时即 `<项目>/.pi/session-agents/insights.jsonl`;默认布局下为 `~/.pi/agent/session-agents/insights.jsonl`) |
+| 经验记忆 | 与会话相同 | 会话 custom entry(不进模型上下文),resume / 分支切换后重放恢复;各会话隔离、不互通,删除会话即删除其经验 |
 
 模型可随时 `agent_discard` / `subsession_discard` 主动释放;子会话被丢弃后,
-其已沉淀的经验仍可通过 `insight_recall` 召回。
+其已沉淀的经验仍可通过 `insight_recall` 召回(限本会话内)。经验记忆与会话
+绑定:各会话互相隔离,只检索当前会话/当前分支的记录;删除会话文件即删除其
+全部经验(rewind 到更早的分支点后,该点之后沉淀的经验也不再召回)。
 
 ### 实测记录
 
@@ -355,13 +358,13 @@ insight_recall  query="OAuth 迁移 风险"      # 后续任务需要时召回
 - agent 单条工具结果注入历史时截断到 32 KB;单次工具结果返回给调用模型
   截断到 48 KB(完整内容保留在子会话工作日志中)。
 - 子会话工作日志超过 80 条时自动裁剪旧条目(保留最近 60 条)。
-- 经验记忆按项目 cwd 隔离(`scope:"all"` 可跨项目检索);记忆文件存到**当前会话
-  的配置目录**下 `session-agents/insights.jsonl`(跟随会话的 `sessionDir`:
-  session 文件在 `<项目>/.pi/sessions` 时写入 `<项目>/.pi/session-agents/insights.jsonl`,
-  默认布局下仍是 `~/.pi/agent/session-agents/insights.jsonl`);旧位置
-  (`~/.pi/agent/session-agents/insights.jsonl`)的记录会在首次加载时自动迁移
-  (按 id 去重、幂等,旧文件保留不删),记忆文件只追加,
-  可手动清理或用 `subsession_discard` 控制沉淀节奏。
+- 经验记忆与会话绑定(存于会话文件的 custom entry,`customType: session-agents-v2`),
+  各会话互相隔离、不互通:`insight_recall` 与自动注入只检索当前会话/当前分支
+  的记录;`rewind` 后更早分支点之后的经验不再召回;删除会话文件即删除其全部
+  经验(使用 `/session-delete`、`/session-delete-all` 同理)。
+- 旧版共享文件 `session-agents/insights.jsonl`(位于会话配置目录下,如默认的
+  `~/.pi/agent/session-agents/insights.jsonl`)**不再读取、不再写入、也不会自动
+  删除**;如确认不需要可手动清理。经验沉淀节奏可用 `subsession_discard` 控制。
 - 授予角色工具时注意权限:嵌套工具调用与模型调用走同样的权限钩子,但
   也可以授予 `agent_create` / `subsession_*` 让角色自行再拆解任务(无深度
   上限,请自行控制)。
