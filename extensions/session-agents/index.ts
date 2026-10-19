@@ -287,7 +287,7 @@ type StoreOp =
 	| { op: "role_discard_all" }
 	| { op: "sub_create"; sub: SubSessionState }
 	| { op: "sub_run"; name: string; log: LogEntry[]; desk: Desk; rounds: number; usage: Usage }
-	| { op: "sub_finish"; name: string; result: string; extras: string; desk: Desk; usage: Usage }
+	| { op: "sub_finish"; name: string; result: string; extras: string; desk: Desk; usage: Usage; insights: InsightRecord[] }
 	| { op: "sub_desk"; name: string; desk: Desk }
 	| { op: "sub_context"; name: string; context: string }
 	| { op: "sub_assign"; name: string; assignments: Assignment[] }
@@ -601,11 +601,12 @@ export default function (pi: ExtensionAPI) {
 	/** 当前工作模式(新会话默认 auto;resume / 分支切换时由 mode_set 操作重放恢复)。 */
 	let workMode: WorkMode = DEFAULT_WORK_MODE;
 
-	/** 记录经验:先更新内存索引,再把记录写进会话文件(重放时按同一管线重建)。 */
+	/** 工具主动记录经验的入口:先落会话 custom entry,再更新内存索引(重放时按同一管线重建)。 */
 	function recordInsights(records: InsightRecord[]): void {
 		if (records.length === 0) return;
-		store.add(records);
+		// 先落盘再更新内存索引:persist 失败时内存不被污染,重试不会产生幽灵记录。
 		persist({ op: "insight_add", records });
+		store.add(records);
 	}
 
 	// -- 状态持久化与恢复 ---------------------------------------------------
@@ -690,6 +691,9 @@ export default function (pi: ExtensionAPI) {
 					addUsage(sub.usage, op.usage);
 					sub.updatedAt = Date.now();
 				}
+				// 经验随 sub_finish 单条 entry 原子重放;旧版分离的 insight_add entry 仍由其自身 case 重放,
+				// 两者按 id 去重不冲突(store.add 内含 Array.isArray 防御)。
+				store.add(op.insights ?? []);
 				break;
 			}
 			case "sub_desk": {
@@ -734,6 +738,8 @@ export default function (pi: ExtensionAPI) {
 	function rebuildFromSession(ctx: ExtensionContext): void {
 		// 分支切换/重入前先取消在飞后台作业,防止旧分支的轮次回写污染重建后的状态。
 		cancelAllJobs();
+		// 旧分支的在飞锁随分支一起作废:不清会让新分支的同名操作被旧锁串行化(且旧锁后续不再有意义)。
+		locks.clear();
 		roles.clear();
 		subs.clear();
 		// 经验记忆同样随分支重建:先清空,再按当前分支的 entry 重放恢复本会话的 insights。
@@ -742,7 +748,13 @@ export default function (pi: ExtensionAPI) {
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom") {
 				const custom = entry as CustomEntry<StoreOp>;
-				if (custom.customType === ENTRY_TYPE) applyOp(custom.data);
+				if (custom.customType === ENTRY_TYPE) {
+					try {
+						applyOp(custom.data);
+					} catch {
+						// 单条损坏 entry 不得中断整条分支重放:跳过继续,保住其后所有 role/sub/insight/mode 状态。
+					}
+				}
 			}
 		}
 	}
@@ -2040,16 +2052,23 @@ export default function (pi: ExtensionAPI) {
 
 				const parsed = parseSynthesis(text);
 
-				current.status = "done";
+				// 重建身份守卫:合成是长 await,期间 rebuild/discard+同名重建后,
+				// 不得把旧分支的结果/经验 append 到重建后的新分支(参照 round 守卫的写法与措辞)。
+				if (subs.get(name) !== current) {
+					return fail(`Sub-session "${name}" was rebuilt/discarded mid-finish; its result is not committed.`, {
+						action: "subsession_finish",
+					});
+				}
+
 				current.result = parsed.result;
 				current.extras = parsed.extras;
-				current.updatedAt = Date.now();
 				const insights = collectInsights(parsed.insights, current, ctx.cwd);
 				addUsage(current.usage, usage);
-				persist({ op: "sub_finish", name, result: parsed.result, extras: parsed.extras, desk: current.desk, usage });
-
-				// 沉淀到本会话的经验记忆(内存索引 + 会话 custom entry)。
-				recordInsights(insights);
+				persist({ op: "sub_finish", name, result: parsed.result, extras: parsed.extras, desk: current.desk, usage, insights });
+				// 落盘成功后才翻转内存状态:persist 失败时 status 仍 open,重试不会被幂等短路挡死。
+				current.status = "done";
+				current.updatedAt = Date.now();
+				store.add(insights);
 
 				const tail = `\n\n(已沉淀 ${insights.length} 条经验到本会话记忆;后续任务可调用 insight_recall 召回,或在开始新任务时自动获得相关启发)`;
 				return ok(truncate(`${renderResult(current)}${tail}`, MAX_RESULT_CHARS), {

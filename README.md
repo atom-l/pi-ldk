@@ -336,7 +336,7 @@ insight_recall  query="OAuth 迁移 风险"      # 后续任务需要时召回
 | 数据 | 生命周期 | 存储 |
 |---|---|---|
 | 角色、子会话(desk/log/结果) | 与会话相同 | 会话 custom entry(不进模型上下文),resume / 分支切换后重放恢复 |
-| 经验记忆 | 与会话相同 | 会话 custom entry(不进模型上下文),resume / 分支切换后重放恢复;各会话隔离、不互通,删除会话即删除其经验 |
+| 经验记忆 | 与会话相同 | 会话 custom entry(不进模型上下文),resume / 分支切换后重放恢复;各会话隔离、不互通,删除会话即删除其经验。finish 沉淀的经验随 `sub_finish` entry 原子落盘 |
 
 模型可随时 `agent_discard` / `subsession_discard` 主动释放;子会话被丢弃后,
 其已沉淀的经验仍可通过 `insight_recall` 召回(限本会话内)。经验记忆与会话
@@ -365,6 +365,8 @@ insight_recall  query="OAuth 迁移 风险"      # 后续任务需要时召回
 - 旧版共享文件 `session-agents/insights.jsonl`(位于会话配置目录下,如默认的
   `~/.pi/agent/session-agents/insights.jsonl`)**不再读取、不再写入、也不会自动
   删除**;如确认不需要可手动清理。经验沉淀节奏可用 `subsession_discard` 控制。
+- `/session-merge` 只把源会话的对话转录注入为上下文,不复制 custom entry——
+  源会话的经验不随 merge 迁移,仍留在其会话文件中(隔离语义的一部分)。
 - 授予角色工具时注意权限:嵌套工具调用与模型调用走同样的权限钩子,但
   也可以授予 `agent_create` / `subsession_*` 让角色自行再拆解任务(无深度
   上限,请自行控制)。

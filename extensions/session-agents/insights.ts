@@ -114,6 +114,8 @@ export class InsightStore {
 
 	/** 更新内存索引(纯内存,无文件 IO);按 id 去重,保证会话重建重放幂等。 */
 	add(records: InsightRecord[]): void {
+		// 重放的 op.records 可能是任意损坏形状(如对象/字符串):单条损坏只跳过该批,不得抛错中断重放。
+		if (!Array.isArray(records)) return;
 		for (const record of records) {
 			if (!record?.id || this.termFreq.has(record.id)) continue;
 			this.indexRecord(record);
