@@ -9,7 +9,7 @@
 | 会话命令 | `extensions/sessions.ts` | `/session-new`(别名 `/sn`、`/clear`)、`/session-list`(别名 `/sl`、`/sessions`)、`/session-delete`(别名 `/sd`、`/sdel`)、`/session-delete-all`(别名 `/sda`、`/sdel-all`)、`/session-merge`(别名 `/sm`、`/merge`)。⚠️ `/clear` 是**开新会话**(当前对话存档保留),不是清屏。 |
 | 模型归属 | `extensions/model-attribution.ts` | 给历史中的助手回复打上生成它的 provider/model 标签，避免中途切换模型时把早前的回复误认成自己的。 |
 | MCP 适配器 | `extensions/mcp-adapter.ts` | 从 `.pi/mcp-adapter.json` 和 `~/.pi/agent/mcp-adapter.json` 读取 MCP server 配置并注册给 PI;`/mcp-adapter [list\|reload]` 查看状态或重新读取配置。 |
-| 图片生成 | `extensions/image-gen/` | `generate_image` 工具、`/imagine` 命令及图片模型处理逻辑。`/imagine [prompt]` 弹选 model/size/数量;`model=provider/id`、`n=2`、`size=1024x1024`、`out=dir` 跳过对应选择器;`/imagine list`(或 `models`)列出已配置模型。 |
+| 图片生成 | `extensions/image-gen/` | `generate_image` 工具、`/imagine` 命令及图片模型处理逻辑。`/imagine [prompt]` 弹选 model/size/数量;`model=provider/id`、`n=2`、`size=1024x1024`、`out=dir`(相对路径不可含 `..`,需写到别处时用绝对路径)跳过对应选择器;`/imagine list`(或 `models`)列出已配置模型。 |
 | 子会话工作台 | `extensions/session-agents/` | 角色 agent + 子会话(公共桌面)+ 经验记忆的大型任务拆分框架,详见[子会话工作台](#子会话工作台)。 |
 | 嵌入终端 | `extensions/terminal/` | 会话内呼出终端执行命令,可折叠(进程继续运行)或销毁(终止进程组),详见[嵌入终端](#嵌入终端)。 |
 | 会话工作目录 | `extensions/workdir.ts` | 会话级「概念工作目录」:声明会话在某目录上工作,引导模型聚焦该目录、尽量不关注父目录/兄弟目录,详见[会话工作目录](#会话工作目录)。 |
@@ -398,7 +398,7 @@ insight_recall  query="OAuth 迁移 风险"      # 后续任务需要时召回
 | `Enter` | 执行当前输入行 |
 | `↑` / `↓` | 历史命令 |
 | `PgUp` / `PgDn` | 滚动回看输出 |
-| `Ctrl+C` | 中断前台进程组(SIGINT) |
+| `Ctrl+C` | 中断前台进程组(SIGINT)；已知限制：终端会话自身也在该进程组内，shell 可能随之退出 |
 | `Ctrl+L` | 清空可见输出缓冲 |
 | `Esc` | **折叠**:关闭终端界面,进程继续运行、输出继续累积,回到 pi 会话 |
 | `Ctrl+X` | **销毁**:再按一次确认后终止进程组并清理会话 |

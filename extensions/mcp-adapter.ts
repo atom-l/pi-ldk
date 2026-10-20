@@ -108,7 +108,7 @@ import type {
 	ToolExposure,
 } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative } from "node:path";
 
@@ -200,8 +200,11 @@ const ERROR_KINDS: Array<{ name: string; retryable: boolean; advice: string; pat
 		name: "network",
 		retryable: true,
 		advice: "A transport problem between this machine and the server. Check that the server URL is reachable and stable.",
+		// Only JSON *parse* failures (truncated/HTML response bodies) count as transport here;
+		// a bare "JSON" in the text is far too broad — server-side argument complaints like
+		// "expected JSON object" would get retried as transient network errors.
 		pattern:
-			/fetch failed|ECONN|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|network|timed? ?out|timeout|deadline exceeded|connection (reset|refused|closed|aborted)|disconnected|temporarily|unavailable|unexpected end|JSON/i,
+			/fetch failed|ECONN|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|socket hang up|network|timed? ?out|timeout|deadline exceeded|connection (reset|refused|closed|aborted)|disconnected|temporarily|unavailable|unexpected end|is not valid JSON|unexpected token|JSON parse/i,
 	},
 ];
 
@@ -313,7 +316,15 @@ export function loadOwnToolCache(): Map<string, CachedTool[]> {
 	return readToolCacheFile(join(homedir(), ".pi", "agent", "mcp-adapter-tools.json"));
 }
 
-/** Remember the tools of one server, merging with what is already saved. */
+/**
+ * Remember the tools of one server, merging with what is already saved.
+ *
+ * Concurrency: several pi processes may persist at once. The rename is atomic, but the
+ * read-merge-write sequence is not — a write that races another process's write wins wholesale
+ * and drops the other's newly listed tools (last writer wins). Best effort by design: the cache
+ * only enriches what the call proxy can list up front, and the live `tools/list` remains the
+ * source of truth once the server connects.
+ */
 export function persistServerTools(server: string, tools: CachedTool[]): void {
 	try {
 		const path = join(homedir(), ".pi", "agent", "mcp-adapter-tools.json");
@@ -332,8 +343,19 @@ export function persistServerTools(server: string, tools: CachedTool[]): void {
 		for (const tool of tools) merged.set(tool.name, tool);
 		servers[server] = { tools: [...merged.values()] };
 		const tmp = `${path}.${process.pid}.tmp`;
-		writeFileSync(tmp, JSON.stringify({ ...root, version: 1, servers }, null, 1), { mode: 0o600 });
-		renameSync(tmp, path);
+		try {
+			writeFileSync(tmp, JSON.stringify({ ...root, version: 1, servers }, null, 1), { mode: 0o600 });
+			renameSync(tmp, path);
+		} catch (error) {
+			// A failed rename must not leave the temp file behind (a stale `<path>.<pid>.tmp`
+			// accumulating in ~/.pi/agent); the outer catch swallows the failure.
+			try {
+				rmSync(tmp, { force: true });
+			} catch {
+				// Best effort.
+			}
+			throw error;
+		}
 	} catch {
 		// Best effort: the cache only enriches what the call proxy can list up front.
 	}
@@ -363,22 +385,34 @@ export function mcpToolName(server: string, tool: string): string {
 
 /** Every name pi may give the tool: both the pi 1.1 and the pi 0.99 naming scheme. */
 export function mcpToolNames(server: string, tool: string): string[] {
+	const hash = createHash("sha256").update(`${server}\0${tool}`).digest("hex").slice(0, 8);
 	const shorten = (name: string) => {
 		if (name.length <= MAX_TOOL_NAME_LENGTH) return name;
-		const hash = createHash("sha256").update(`${server}\0${tool}`).digest("hex").slice(0, 8);
 		return `${name.slice(0, MAX_TOOL_NAME_LENGTH - hash.length - 1)}_${hash}`;
 	};
-	return [
-		...new Set([
-			mcpToolName(server, tool),
-			shorten(`mcp__${server}__${tool}`.replace(/[^A-Za-z0-9_-]/g, "_")),
-		]),
-	];
+	// pi hash-shortens not only over-long names but also names whose sanitized form collides
+	// with another tool of the server (its `isTaken` check), so `<name>_<hash>` exists even for
+	// short names. The hashed forms come first: when the plain form is taken by a colliding
+	// tool, a call by the server-side name must resolve to the hash-renamed one.
+	const hashed = (name: string) => `${name.slice(0, MAX_TOOL_NAME_LENGTH - hash.length - 1)}_${hash}`;
+	const plain = `mcp__${server}__${tool}`.replace(/[^A-Za-z0-9_]/g, "_");
+	const dashed = `mcp__${server}__${tool}`.replace(/[^A-Za-z0-9_-]/g, "_");
+	return [...new Set([hashed(plain), hashed(dashed), shorten(plain), shorten(dashed)])];
 }
 
 /** Namespaces of a server's tools on both pi versions: `mcp__<server>`, `-` kept or replaced by `_`. */
 export function namespaceNames(server: string): string[] {
 	return [...new Set([`mcp__${server}`, `mcp__${server.replace(/-/g, "_")}`])];
+}
+
+/**
+ * The tool's own name: its registered name without the `mcp__<server>__` prefix. A
+ * hash-shortened registered name keeps its `_<hash>` suffix (or the whole registered name,
+ * when shortening ate into the prefix itself); the original name is not recoverable.
+ */
+function rawToolName(entry: { name: string; namespace?: { name: string } }): string {
+	const prefix = `${entry.namespace?.name ?? ""}__`;
+	return entry.name.startsWith(prefix) ? entry.name.slice(prefix.length) : entry.name;
 }
 
 /** Name of the call proxy that stands in for a server's tools while it connects. */
@@ -602,7 +636,7 @@ export function createProxyDefinition(options: ProxyOptions): ToolDefinition {
 			const wantsList = !tool || tool === "__list__";
 			const args = params?.arguments && typeof params.arguments === "object" ? params.arguments : {};
 			const candidates = wantsList ? [] : mcpToolNames(server, tool);
-			const rawName = (entry: { name: string; namespace?: { name: string } }) => entry.name.slice((entry.namespace?.name ?? "").length + 2);
+			const rawName = rawToolName;
 			const deadline = Date.now() + readyTimeout * 1000;
 			let target: string | undefined;
 			for (;;) {
@@ -617,6 +651,13 @@ export function createProxyDefinition(options: ProxyOptions): ToolDefinition {
 							!entry.name.startsWith("mcp_call__"),
 					);
 				target = candidates.find((candidate) => inNamespace.some((entry) => entry.name === candidate));
+				if (target === undefined) {
+					// A hash-shortened registered name does not round-trip through mcpToolNames:
+					// the listed name is the registered one minus its namespace (see rawToolName).
+					// Accept that name back as-is.
+					const listed = inNamespace.find((entry) => rawToolName(entry) === tool);
+					if (listed) target = listed.name;
+				}
 				const ready = wantsList ? inNamespace.length > 0 : target !== undefined;
 				if (ready) {
 					// Remember the live tools so the next session can list them right away.
@@ -703,10 +744,17 @@ export function createProxyDefinition(options: ProxyOptions): ToolDefinition {
 				// Exponential backoff between attempts, capped at 30 seconds.
 				const waitMs = Math.min(retryDelay * 1000 * 2 ** (attempt - 1), 30_000);
 				await new Promise<void>((resolve, reject) => {
+					const stop = () => reject(new Error(`Stopped waiting for MCP server "${server}".`));
+					// Pre-check: an already-aborted signal never fires a fresh 'abort' event, so without
+					// this the wait would sleep out the full backoff after the caller gave up.
+					if (signal?.aborted) {
+						stop();
+						return;
+					}
 					let timer: ReturnType<typeof setTimeout>;
 					const onAbort = () => {
 						clearTimeout(timer);
-						reject(new Error(`Stopped waiting for MCP server "${server}".`));
+						stop();
 					};
 					timer = setTimeout(() => {
 						signal?.removeEventListener("abort", onAbort);
@@ -955,7 +1003,12 @@ function readAdapterFile(path: string): {
 	let text: string;
 	try {
 		text = readFileSync(path, "utf8");
-	} catch {
+	} catch (error) {
+		// A missing file is normal; any other read failure (EACCES, EISDIR, …) is a config problem
+		// worth reporting — silently returning zero servers would hide it.
+		if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+			errors.push(`${path}: cannot read: ${error instanceof Error ? error.message : String(error)}`);
+		}
 		return { servers: {}, errors };
 	}
 	let parsed: unknown;
@@ -986,12 +1039,26 @@ function readAdapterFile(path: string): {
 		else errors.push(`${path}: 'retryDelay' must be a positive number of seconds`);
 	}
 	// Accept the standard `mcpServers` map (or VS Code's `servers`), or a bare name → entry map.
-	const servers: RawEntry = { ...(parsed.mcpServers ?? parsed.servers ?? parsed) };
-	delete servers.startupWait;
-	delete servers.readyTimeout;
-	delete servers.retries;
-	delete servers.retryDelay;
-	if (!isRecord(servers)) return { servers: {}, errors: [`${path}: 'mcpServers' must be an object`] };
+	const declared = "mcpServers" in parsed ? parsed.mcpServers : "servers" in parsed ? parsed.servers : undefined;
+	if (declared !== undefined && !isRecord(declared)) {
+		return { servers: {}, errors: [`${path}: 'mcpServers' must be an object`] };
+	}
+	const bare = declared === undefined;
+	const servers: RawEntry = { ...(bare ? parsed : (declared as RawEntry)) };
+	if (bare) {
+		// Bare map: entries share the top level with the option keys, which are reserved and
+		// not servers. Only here may those names be dropped — in the `mcpServers` form a server
+		// may legitimately be named `retries`.
+		delete servers.startupWait;
+		delete servers.readyTimeout;
+		delete servers.retries;
+		delete servers.retryDelay;
+		// Other non-object top-level values ($schema, version, comments) are metadata, not
+		// entries — a server entry is always an object, so nothing is lost by skipping them.
+		for (const [name, value] of Object.entries(servers)) {
+			if (!isRecord(value)) delete servers[name];
+		}
+	}
 	return { servers, errors, startupWait, readyTimeout, retries, retryDelay };
 }
 
@@ -1127,7 +1194,7 @@ function registerProxies(pi: ExtensionAPI, state: AdapterState, loaded: AdapterL
 			.getAllTools()
 			.filter((tool) => tool.namespace?.name !== undefined && namespaces.includes(tool.namespace.name) && !tool.name.startsWith("mcp_call__"))
 			.map((tool) => ({
-				name: tool.name.slice((tool.namespace?.name ?? "").length + 2),
+				name: rawToolName(tool),
 				description: tool.description,
 				inputSchema: tool.parameters,
 			}));
@@ -1294,7 +1361,7 @@ export function buildMcpUsageGuide(report: AdapterLoadResult, pi?: ExtensionAPI)
 				!tool.name.startsWith("mcp_call__"),
 		);
 		const liveTools = live.map((tool) => ({
-			name: tool.name.slice((tool.namespace?.name ?? "").length + 2),
+			name: rawToolName(tool),
 			description: tool.description,
 			inputSchema: tool.parameters,
 		}));
@@ -1449,7 +1516,7 @@ export default function mcpAdapterExtension(pi: ExtensionAPI) {
 				for (const entry of state.report.entries) {
 					if (!namespaceNames(entry.name).includes(namespace)) continue;
 					const list = tools.get(entry.name) ?? [];
-					list.push(tool.name.slice(namespace.length + 2));
+					list.push(rawToolName(tool));
 					tools.set(entry.name, list);
 				}
 			}

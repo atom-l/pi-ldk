@@ -93,7 +93,11 @@ const GenerateParams = Type.Object({
 		}),
 	),
 	outputDir: Type.Optional(
-		Type.String({ description: "Directory for the generated files (default: generated-images under the working directory)." }),
+		Type.String({
+			description:
+				"Directory for the generated files (default: generated-images under the working directory). " +
+				'Relative paths must stay under the working directory (no ".."); use an absolute path to write elsewhere.',
+		}),
 	),
 	fileName: Type.Optional(
 		Type.String({ description: "Base file name without extension (default derived from the prompt and timestamp)." }),
@@ -222,9 +226,16 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 		};
 		const render = () => {
 			if (!enabled) return;
-			const spinner = frames[frame++ % frames.length];
-			ctx.ui.setStatus("image-gen", `${title} ${elapsed()}`);
-			ctx.ui.setWidget("image-gen-progress", [`${spinner} ${title} — ${elapsed()}`, `   ${stage}`]);
+			// The UI can be torn down mid-generation. A throw here would either
+			// escape the setInterval callback (process-level crash) or surface
+			// through onProgress as a bogus "generation failed" error.
+			try {
+				const spinner = frames[frame++ % frames.length];
+				ctx.ui.setStatus("image-gen", `${title} ${elapsed()}`);
+				ctx.ui.setWidget("image-gen-progress", [`${spinner} ${title} — ${elapsed()}`, `   ${stage}`]);
+			} catch {
+				// ignore UI errors during teardown
+			}
 		};
 		if (enabled) {
 			timer = setInterval(render, 500);
@@ -246,8 +257,12 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 			stop() {
 				if (timer) clearInterval(timer);
 				if (enabled) {
-					ctx.ui.setWidget("image-gen-progress", undefined);
-					ctx.ui.setStatus("image-gen", undefined);
+					try {
+						ctx.ui.setWidget("image-gen-progress", undefined);
+						ctx.ui.setStatus("image-gen", undefined);
+					} catch {
+						// ignore UI errors during teardown
+					}
 				}
 			},
 		};
@@ -270,7 +285,17 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const tokens = args.trim().split(/\s+/).filter(Boolean);
 			if (tokens[0] === "list" || tokens[0] === "models") {
-				const list = loadImageModels(ctx.cwd);
+				// Must never throw out of the handler: a malformed models.json
+				// degrades to an error notice, like the extension entry point.
+				let list: ImageModelEntry[];
+				try {
+					list = loadImageModels(ctx.cwd);
+				} catch (error) {
+					const message = `models.json could not be read: ${error instanceof Error ? error.message : error}`;
+					if (ctx.hasUI) ctx.ui.notify(message, "error");
+					else console.log(message);
+					return;
+				}
 				const lines = list.map((e) => {
 					const cfg = e.gen;
 					const parts = [
@@ -321,7 +346,13 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 					}
 				}
 
-				const entries = loadImageModels(ctx.cwd);
+				let entries: ImageModelEntry[];
+				try {
+					entries = loadImageModels(ctx.cwd);
+				} catch (error) {
+					notify(ctx, `models.json could not be read: ${error instanceof Error ? error.message : error}`, "error");
+					return;
+				}
 				if (entries.length === 0) {
 					notify(ctx, '没有配置生图模型。请在 models.json 里用 "imageGeneration": true 标记一个模型。', "warning");
 					return;

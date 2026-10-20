@@ -76,6 +76,8 @@ export function tokenize(text: string): string[] {
 
 const K1 = 1.2;
 const B = 0.75;
+/** Date 合法毫秒范围上限(8.64e15):超出的 timestamp 会让 toISOString 抛 RangeError。 */
+const MAX_DATE_MS = 8.64e15;
 
 /** 纯内存经验索引:内容由调用方从会话 custom entry 重放恢复,自身不做文件 IO。 */
 export class InsightStore {
@@ -112,13 +114,39 @@ export class InsightStore {
 		return `ins-${Date.now().toString(36)}-${this.seq.toString(36)}-${rand}`;
 	}
 
+	/**
+	 * 单条记录字段归一化:重放的 op.records 可能是任意损坏形状,而渲染端
+	 * (insight_recall 的 toISOString、before_agent_start 的 oneLine)对字段类型敏感。
+	 * 非对象 / 无字符串 id 的记录丢弃,其余字段就地收敛为安全类型。
+	 */
+	private normalizeRecord(raw: InsightRecord): InsightRecord | undefined {
+		if (!raw || typeof raw !== "object") return undefined;
+		const id = typeof raw.id === "string" ? raw.id : "";
+		if (!id) return undefined;
+		const timestamp =
+			typeof raw.timestamp === "number" && Number.isFinite(raw.timestamp) && Math.abs(raw.timestamp) <= MAX_DATE_MS
+				? raw.timestamp
+				: Date.now();
+		return {
+			id,
+			kind: INSIGHT_KINDS.includes(raw.kind) ? raw.kind : "note",
+			title: typeof raw.title === "string" ? raw.title : "",
+			text: typeof raw.text === "string" ? raw.text : "",
+			source: typeof raw.source === "string" ? raw.source : "manual",
+			...(typeof raw.agent === "string" && raw.agent ? { agent: raw.agent } : {}),
+			cwd: typeof raw.cwd === "string" ? raw.cwd : "",
+			timestamp,
+		};
+	}
+
 	/** 更新内存索引(纯内存,无文件 IO);按 id 去重,保证会话重建重放幂等。 */
 	add(records: InsightRecord[]): void {
 		// 重放的 op.records 可能是任意损坏形状(如对象/字符串):单条损坏只跳过该批,不得抛错中断重放。
 		if (!Array.isArray(records)) return;
 		for (const record of records) {
-			if (!record?.id || this.termFreq.has(record.id)) continue;
-			this.indexRecord(record);
+			const safe = this.normalizeRecord(record);
+			if (!safe || this.termFreq.has(safe.id)) continue;
+			this.indexRecord(safe);
 		}
 	}
 

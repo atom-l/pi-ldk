@@ -324,6 +324,9 @@ function addUsage(acc: Usage, add: Usage | undefined): void {
 	acc.cacheWrite += add.cacheWrite ?? 0;
 	acc.totalTokens += add.totalTokens ?? 0;
 	if (add.cost) {
+		// 重放归一化:持久化 entry 重放出的 acc 可能缺 cost(损坏/旧数据的 role_stats usage),
+		// 补零值基底防 acc.cost.input += 抛 TypeError。
+		acc.cost ??= { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 		acc.cost.input += add.cost.input ?? 0;
 		acc.cost.output += add.cost.output ?? 0;
 		acc.cost.cacheRead += add.cost.cacheRead ?? 0;
@@ -500,7 +503,11 @@ function loadCapabilities(): Map<string, Capabilities> {
 		if (providers && typeof providers === "object") {
 			for (const [providerId, providerValue] of Object.entries(providers)) {
 				const provider = providerValue as { models?: unknown[]; modelOverrides?: Record<string, unknown> } | null;
-				for (const entry of provider?.models ?? []) {
+				// 非数组的 models(损坏/误配置的 models.json)不得让 for...of 抛 TypeError、
+				// 中断其余 provider 的解析。
+				const rawModels = provider?.models;
+				const models = Array.isArray(rawModels) ? rawModels : [];
+				for (const entry of models) {
 					const id = (entry as { id?: unknown } | null)?.id;
 					if (typeof id !== "string" || !id) continue;
 					const caps = sanitizeCapabilities((entry as { capabilities?: unknown }).capabilities);
@@ -596,6 +603,8 @@ export default function (pi: ExtensionAPI) {
 	const roles = new Map<string, RoleState>();
 	const subs = new Map<string, SubSessionState>();
 	const locks = new Map<string, Promise<void>>();
+	/** 轮次派发的身份绑定:signal → 本轮持有的 sub 对象,供 desk_update 校验写入目标身份(防跨分支写入)。 */
+	const runSubBySignal = new WeakMap<AbortSignal, SubSessionState>();
 	/** 经验记忆:纯内存索引,内容随会话文件 custom entry(insight_add)重放恢复,随会话删除而消失。 */
 	const store = new InsightStore();
 	/** 当前工作模式(新会话默认 auto;resume / 分支切换时由 mode_set 操作重放恢复)。 */
@@ -627,7 +636,8 @@ export default function (pi: ExtensionAPI) {
 						config: role.config,
 						contexts: role.contexts ?? [],
 						runs: role.runs ?? 0,
-						usage: role.usage ?? emptyUsage(),
+						// 重放归一化:usage 可能缺 cost(损坏 entry),与 sub_create 同法补零值基底。
+						usage: { ...emptyUsage(), ...(role.usage ?? {}), cost: { ...emptyUsage().cost, ...(role.usage?.cost ?? {}) } },
 						createdAt: role.createdAt ?? Date.now(),
 						updatedAt: role.updatedAt ?? Date.now(),
 					});
@@ -646,7 +656,10 @@ export default function (pi: ExtensionAPI) {
 				const role = roles.get(op.name);
 				if (role) {
 					role.runs = op.runs ?? role.runs;
-					role.usage = op.usage ?? role.usage;
+					// 重放归一化:op.usage 可能缺 cost(损坏 entry),合并到零值基底(与 sub_create 同法)。
+					role.usage = op.usage
+						? { ...emptyUsage(), ...op.usage, cost: { ...emptyUsage().cost, ...(op.usage.cost ?? {}) } }
+						: role.usage;
 				}
 				break;
 			}
@@ -683,10 +696,13 @@ export default function (pi: ExtensionAPI) {
 			}
 			case "sub_finish": {
 				const sub = subs.get(op.name);
+				const rawResult = (op as { result?: unknown }).result;
+				const rawExtras = (op as { extras?: unknown }).extras;
 				if (sub) {
 					sub.status = "done";
-					sub.result = op.result;
-					sub.extras = op.extras;
+					// 重放归一化:renderResult 对 result/extras 直接 .trim();非字符串损坏值收敛为字符串,空值保持空。
+					sub.result = typeof rawResult === "string" ? rawResult : rawResult === undefined || rawResult === null ? undefined : String(rawResult);
+					sub.extras = typeof rawExtras === "string" ? rawExtras : rawExtras === undefined || rawExtras === null ? undefined : String(rawExtras);
 					sub.desk = { ...emptyDesk(), ...(op.desk ?? {}) };
 					addUsage(sub.usage, op.usage);
 					sub.updatedAt = Date.now();
@@ -1256,6 +1272,14 @@ export default function (pi: ExtensionAPI) {
 			const prep = await withLock(`${name}:commit`, async () => {
 				const current = subs.get(name);
 				if (!current) return { ok: false as const, error: `Sub-session "${name}" was discarded before the round started.` };
+				// finish→lock 窗口守卫:外层 status 检查到拿锁之间,子会话可能已被 subsession_finish 收尾;
+				// 已收尾的子会话不得再派发轮次(不写 context/assignments/轮号)。
+				if (current.status === "done") {
+					return {
+						ok: false as const,
+						error: `Sub-session "${name}" was finished before this round started. Its result is available from subsession_get (detail="result") or insight_recall.`,
+					};
+				}
 
 				if (params.context?.trim()) {
 					current.context.push(params.context.trim());
@@ -1296,6 +1320,9 @@ export default function (pi: ExtensionAPI) {
 			const { participants, round } = prep;
 			params.onRoundAllocated?.(round);
 			const snapshot = prep.current;
+			// desk_update 身份绑定:把本轮持有的 sub 对象绑到 signal,desk_update 据此拒绝
+			// 落到分支重建/丢弃+同名重建后新对象上的在飞写入。
+			if (signal) runSubBySignal.set(signal, snapshot);
 
 			// -- 阶段 2:执行 agent(parallelAgents 决定串行 / 并行) ----------
 			type Outcome = { assignment: Assignment; role: RoleState; turn: TurnResult; instruction: string };
@@ -1462,11 +1489,21 @@ export default function (pi: ExtensionAPI) {
 				notes: Type.Optional(Type.Array(Type.String(), { description: "Free-form notes." })),
 			}),
 		}),
-		execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
-			const sub = subs.get(params.subsession.trim());
+		execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
+			const name = params.subsession.trim();
+			const sub = subs.get(name);
 			if (!sub) {
 				return fail(`No sub-session named "${params.subsession}". Existing: ${[...subs.keys()].join(", ") || "(none)"}`, {
 					action: "desk_update",
+				});
+			}
+			// 身份守卫:子会话内 agent 的调用绑定派发轮次持有的 sub 对象;分支重建/丢弃+同名重建后,
+			// 同名目标已不是派发时的对象,拒绝在飞写入落到重建后的新分支(与 round/finish 守卫同因)。
+			const bound = signal ? runSubBySignal.get(signal) : undefined;
+			if (bound && name === bound.name && sub !== bound) {
+				return fail(`Sub-session "${name}" was rebuilt/discarded mid-round; this desk update is not committed.`, {
+					action: "desk_update",
+					subsession: name,
 				});
 			}
 			if (sub.status === "done") {
@@ -1970,11 +2007,13 @@ export default function (pi: ExtensionAPI) {
 			return ok(
 				`作业 ${target.id}(子会话 "${target.sub}" ${roundDesc})已完成(${(((target.finishedAt ?? Date.now()) - target.startedAt) / 1000).toFixed(1)}s):\n\n${text && text.type === "text" ? text.text : "(no output)"}`,
 				{
+					// 详情字段前置展开:run 的 details 自带 action:"subsession_run",放在尾部会
+					// 覆盖本工具的 action/job/status/jobs;前置展开让 probe 自身字段保持权威。
+					...(result?.details ?? {}),
 					action: "subsession_probe",
 					job: target.id,
 					status: target.status,
 					jobs: jobsSummary,
-					...(result?.details ?? {}),
 				},
 				result?.usage,
 			);
@@ -2060,12 +2099,15 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 
+				// collectInsights 读 sub.result 沉淀 result 经验:传入解析结果视图,不依赖内存赋值时序
+				// (result/extras/usage 落内存移到 persist 成功之后,persist 失败时不污染内存)。
+				const insights = collectInsights(parsed.insights, { ...current, result: parsed.result }, ctx.cwd);
+				persist({ op: "sub_finish", name, result: parsed.result, extras: parsed.extras, desk: current.desk, usage, insights });
+				// 落盘成功后才写内存 result/extras/usage 并翻转 status:persist 失败时内存不被污染,
+				// 重试不会被幂等短路挡死。
 				current.result = parsed.result;
 				current.extras = parsed.extras;
-				const insights = collectInsights(parsed.insights, current, ctx.cwd);
 				addUsage(current.usage, usage);
-				persist({ op: "sub_finish", name, result: parsed.result, extras: parsed.extras, desk: current.desk, usage, insights });
-				// 落盘成功后才翻转内存状态:persist 失败时 status 仍 open,重试不会被幂等短路挡死。
 				current.status = "done";
 				current.updatedAt = Date.now();
 				store.add(insights);

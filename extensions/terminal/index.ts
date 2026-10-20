@@ -15,6 +15,8 @@
  *          再次 /term 打开会看到折叠期间的输出。
  *   Ctrl+X 销毁:先 SIGTERM、宽限期后 SIGKILL 终止整棵进程树,清理会话。
  *   其余见终端内状态栏(Enter 执行、↑↓ 历史、PgUp/PgDn 滚动、Ctrl+C 中断、Ctrl+L 清屏)。
+ *   ⚠ 已知限制:Ctrl+C 对整个前台进程组发 SIGINT,终端会话自身也在该组内,
+ *   shell 可能随之退出 — 不做进程组隔离。
  *
  * 进程生命周期:每个会话用独立进程组(detached)启动用户 shell,销毁/清理时
  * process.kill(-pid) 一次性结束整棵树;session_shutdown 时兜底 dispose 全部,
@@ -89,8 +91,9 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					if (!(await ctx.ui.confirm("销毁终端", `终止进程(pid=${s.pid ?? "?"})并清理会话 "${target}"?`))) return;
-					s.disposeGracefully();
-					sessions.delete(target);
+					// 等进程真正退出后再从表里移除,否则 ≤2s 宽限窗口内同名会话会"不可见"
+					// (再次 /term <name> 会误建第二个 shell)。
+					s.disposeGracefully(() => sessions.delete(target));
 					ctx.ui.notify(`终端 "${target}" 已销毁`, "info");
 					return;
 				}
@@ -149,8 +152,8 @@ export default function (pi: ExtensionAPI) {
 		active.onOutput = null;
 
 		if (action === "destroy") {
-			active.disposeGracefully();
-			sessions.delete(active.name);
+			// 委托 disposeGracefully 的完成回调移出表项(进程退出后),避免异步窗口内重名会话不可见。
+			active.disposeGracefully(() => sessions.delete(active.name));
 			ctx.ui.notify(`终端 "${active.name}" 已销毁(进程终止中)`, "info");
 		} else {
 			// fold 或直接关闭:进程继续运行。

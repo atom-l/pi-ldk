@@ -17,7 +17,8 @@
  *   /workdir            (/wd)      无参数:弹出选项(切换到子目录 / 输入路径 / 重置为默认)
  *   /workdir <路径>                 直接切换到指定目录(相对路径以当前工作目录为基准)
  *
- * 新会话默认工作目录 = 会话启动目录(ctx.cwd)。切换 / 重置会持久化,resume、分支切换时恢复。
+ * 新会话默认工作目录 = 会话启动目录(ctx.cwd)。切换 / 重置会持久化,resume、分支切换时恢复;
+ * 恢复时会校验持久化的目录仍然存在,已消失的目录回退到最后有效值。
  *
  * Loaded automatically from the package's pi.extensions. After editing, run /reload in pi.
  */
@@ -128,10 +129,18 @@ export default function (pi: ExtensionAPI): void {
 		pi.appendEntry<StoreOp>(ENTRY_TYPE, structuredClone(op));
 	}
 
+	/**
+	 * 重放一条持久化操作。wd_set 在写入前校验目录存在且确为目录:持久化之后目录可能
+	 * 已被删除(临时目录被清理 / 跨机 resume),悬空路径一旦写入就会作为"当前工作目录"
+	 * 进入系统提示与相对路径基准。悬空则丢弃该条操作,保留重放至今的最后有效目录
+	 * (rebuild 的起点是 ctx.cwd,因此最坏情况回退到会话默认目录)。
+	 * 仅作用于回放;setWorkDir 交互路径仍在切换时校验并向用户提示,行为不变。
+	 */
 	function applyOp(data: unknown): void {
 		const op = data as StoreOp | undefined;
 		if (!op || typeof op !== "object") return;
 		if (op.op === "wd_set" && typeof op.path === "string" && op.path) {
+			if (!isDirectory(op.path)) return;
 			workDir = op.path;
 		}
 	}

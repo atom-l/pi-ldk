@@ -554,9 +554,13 @@ export function stripNulls(body: Record<string, unknown>): Record<string, unknow
 }
 
 function parseDataUri(dataUri: string): { mimeType: string; data: string } | undefined {
-	const match = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i.exec(dataUri.trim());
+	// The media type may carry extra parameters (e.g. ";charset=utf-8") before
+	// ";base64,"; anything else (percent-encoded payloads) is still rejected.
+	const match = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+)((?:;[^;,]+)*);base64,([a-z0-9+/=\s]+)$/i.exec(
+		dataUri.trim(),
+	);
 	if (!match) return undefined;
-	return { mimeType: match[1], data: match[2].replace(/\s+/g, "") };
+	return { mimeType: match[1], data: match[3].replace(/\s+/g, "") };
 }
 
 export function buildRequest(
@@ -644,7 +648,8 @@ export function buildRequest(
 export type RawImage = { kind: "b64"; data: string; mimeType?: string } | { kind: "url"; url: string };
 
 // Base64 runs may contain \r\n line wraps; spaces terminate (they mark prose).
-const DATA_URI_RE = /data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\r\n]+)/g;
+// Parameterized media types (e.g. ";charset=utf-8") are allowed before ";base64,".
+const DATA_URI_RE = /data:(image\/[a-zA-Z0-9.+-]+)((?:;[^;,]+)*);base64,([A-Za-z0-9+/=\r\n]+)/g;
 const MD_IMG_RE = /!\[[^\]]*\]\(<?([^)\s]+)>?[^)]*\)/g;
 const HTML_IMG_RE = /<img[^>]+src=["']([^"']+)["']/gi;
 const BARE_URL_RE = /https?:\/\/[^\s"'<>()\]]+/g;
@@ -693,7 +698,7 @@ export function extractImages(json: any): RawImage[] {
 	};
 	const scanText = (text: string) => {
 		if (!text) return;
-		for (const m of text.matchAll(DATA_URI_RE)) pushB64(m[2], m[1]);
+		for (const m of text.matchAll(DATA_URI_RE)) pushB64(m[3], m[1]);
 		for (const m of text.matchAll(MD_IMG_RE)) handleUrlish(m[1]);
 		for (const m of text.matchAll(HTML_IMG_RE)) handleUrlish(m[1]);
 		for (const m of text.matchAll(BARE_URL_RE)) {
@@ -922,10 +927,23 @@ export async function saveImages(
 
 export function mapUsage(raw: any): UsageLike | undefined {
 	if (!raw || typeof raw !== "object") return undefined;
-	const input = Number(raw.prompt_tokens ?? raw.input_tokens ?? 0);
-	const output = Number(raw.completion_tokens ?? raw.output_tokens ?? 0);
-	const total = Number(raw.total_tokens ?? input + output);
-	return { input, output, cacheRead: 0, cacheWrite: 0, totalTokens: total };
+	// Some gateways return non-numeric token fields (e.g. "n/a"); fall back
+	// instead of propagating NaN into usage accounting.
+	const finite = (value: unknown, fallback: number): number => {
+		const n = Number(value);
+		return Number.isFinite(n) ? n : fallback;
+	};
+	const input = finite(raw.prompt_tokens ?? raw.input_tokens ?? 0, 0);
+	const output = finite(raw.completion_tokens ?? raw.output_tokens ?? 0, 0);
+	// Anthropic-style cache fields, OpenAI prompt_tokens_details, and the
+	// OpenRouter-style input_token_details are all honored when present.
+	const cacheRead = finite(
+		raw.cache_read_input_tokens ?? raw.prompt_tokens_details?.cached_tokens ?? raw.input_token_details?.cache_read ?? 0,
+		0,
+	);
+	const cacheWrite = finite(raw.cache_creation_input_tokens ?? raw.input_token_details?.cache_creation ?? 0, 0);
+	const totalTokens = finite(raw.total_tokens, input + output + cacheRead + cacheWrite);
+	return { input, output, cacheRead, cacheWrite, totalTokens };
 }
 
 export function formatBytes(bytes: number): string {
@@ -953,11 +971,29 @@ export async function generateImages(options: GenerateOptions): Promise<Generate
 	const onProgress = options.onProgress ?? (() => {});
 	const warnings: string[] = [];
 
+	// A relative outputDir must stay under the working directory: refuse ".."
+	// segments so model-controlled paths cannot escape the workspace. Absolute
+	// paths are the documented way to write somewhere else.
+	const outputDir = options.outputDir ?? gen.outputDir ?? GEN_DEFAULTS.outputDir;
+	if (!isAbsolute(outputDir) && outputDir.split(/[\\/]/).includes("..")) {
+		throw new Error(
+			`Invalid outputDir "${outputDir}": relative paths must not contain ".." ` +
+				"(they must stay inside the working directory; use an absolute path to write elsewhere).",
+		);
+	}
+
 	onProgress(`Using ${entry.key} to generate ${count} image(s)...`);
 
 	const referenceImages: ReferenceImage[] = [];
 	for (const ref of options.referenceImages ?? []) {
-		referenceImages.push(await resolveReferenceImage(ref, options.cwd));
+		try {
+			referenceImages.push(await resolveReferenceImage(ref, options.cwd));
+		} catch (error) {
+			// One unreadable reference must not sink the whole generation.
+			warnings.push(
+				`reference image "${ref}" could not be loaded: ${error instanceof Error ? error.message : error}`,
+			);
+		}
 	}
 	if (referenceImages.length > 0 && (api === "images" || api === "openai-images")) {
 		warnings.push("referenceImages are not supported by the images API and were ignored");
@@ -1008,7 +1044,7 @@ export async function generateImages(options: GenerateOptions): Promise<Generate
 	onProgress(`Received ${rawImages.length} image(s), saving...`);
 	const { saved, errors } = await saveImages(rawImages, {
 		cwd: options.cwd,
-		outputDir: options.outputDir ?? gen.outputDir ?? GEN_DEFAULTS.outputDir,
+		outputDir,
 		fileName: options.fileName,
 		prompt: options.prompt,
 		signal, // merged timeout+caller signal, so timeoutMs also covers the download phase

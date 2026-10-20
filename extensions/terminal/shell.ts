@@ -95,7 +95,7 @@ export class ShellSession {
 		trackSession(this);
 
 		this.appendLine(`[终端 ${this.name}] pid=${this.pid ?? "?"} · shell=${this.shell} · cwd=${this.cwd}`);
-		this.appendLine(`[提示] Esc=折叠(进程继续运行) · Ctrl+X=销毁(终止进程) · Ctrl+C=中断`);
+		this.appendLine(`[提示] Esc=折叠(进程继续运行) · Ctrl+X=销毁(终止进程) · Ctrl+C=中断(很可能连带结束本会话)`);
 
 		this.child.stdout.on("data", (chunk: Buffer) => this.ingest(this.stdoutDecoder.write(chunk)));
 		this.child.stderr.on("data", (chunk: Buffer) => this.ingest(this.stderrDecoder.write(chunk)));
@@ -107,6 +107,13 @@ export class ShellSession {
 		this.child.on("error", (err) => {
 			this.appendLine(`[shell 启动失败] ${err.message}`);
 			this.status = "exited";
+			// spawn 失败(ENOENT/无 cwd)时不会派发 'exit',此处必须自行回收:
+			// 否则 liveSessions 里会残留一个已终止的会话,且 killTimer 悬挂。
+			if (this.killTimer) {
+				clearTimeout(this.killTimer);
+				this.killTimer = null;
+			}
+			liveSessions.delete(this);
 			this.onOutput?.();
 		});
 		this.child.on("exit", (code, signal) => {
@@ -218,6 +225,9 @@ export class ShellSession {
 		this.signalGroup("SIGTERM");
 		if (this.killTimer) clearTimeout(this.killTimer);
 		const pid = this.pid;
+		// 仅在进程仍在运行时安排 SIGKILL 宽限定时器:对已退出(含 SIGINT 后 status==='killed')
+		// 的会话发 kill(-pid) 会打到可能已被复用的 pid 上,误杀无关进程。
+		if (this.status !== "running") return;
 		this.killTimer = setTimeout(() => {
 			try {
 				if (pid && process.platform !== "win32") process.kill(-pid, "SIGKILL");
@@ -243,18 +253,27 @@ export class ShellSession {
 	 * 用户主动销毁终端:kill()(SIGTERM→宽限期→SIGKILL)后等进程退出再 dispose,
 	 * 兜底在宽限期+500ms 后强制清理。session_shutdown / 进程退出兜底仍用 killNow/dispose。
 	 */
-	disposeGracefully(): void {
-		if (this.disposed) return;
+	disposeGracefully(onDisposed?: () => void): void {
+		if (this.disposed) {
+			onDisposed?.();
+			return;
+		}
 		// 已退出/已杀的会话不再走 SIGTERM 宽限等待,直接释放。
 		if (this.status !== "running") {
 			this.dispose();
+			onDisposed?.();
 			return;
 		}
 		this.kill();
 		let fallback: ReturnType<typeof setTimeout> | null = null;
+		// settled 幂等守卫:'exit' 与兜底超时可能各自触发一次,回调只应执行一次。
+		let settled = false;
 		const finish = () => {
+			if (settled) return;
+			settled = true;
 			if (fallback) clearTimeout(fallback);
 			this.dispose();
+			onDisposed?.();
 		};
 		this.child.once("exit", finish);
 		fallback = setTimeout(finish, KILL_GRACE_MS + 500);

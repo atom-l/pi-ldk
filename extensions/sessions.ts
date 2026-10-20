@@ -235,13 +235,21 @@ export default function sessionsExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify("Cancelled", "info");
 				return;
 			}
-			rmSync(target.path);
+			// rmSync 对已被外部删除/权限不足的路径会抛(ENOENT/EPERM/EISDIR),
+			// 在 async handler 中即为未处理拒绝;这里降级为提示,不阻断后续流程。
+			try {
+				rmSync(target.path);
+			} catch (err) {
+				ctx.ui.notify(`Failed to delete ${target.path}: ${err instanceof Error ? err.message : String(err)}`, "warning");
+				return;
+			}
 			if (isCurrent) {
-				await ctx.newSession({
+				const res = await ctx.newSession({
 					withSession: async (newCtx) => {
 						newCtx.ui.notify("Session deleted", "info");
 					},
 				});
+				if (res.cancelled) ctx.ui.notify("Cancelled", "info");
 			} else {
 				ctx.ui.notify("Session deleted", "info");
 			}
@@ -268,11 +276,17 @@ export default function sessionsExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			let n = 0;
+			let failed = 0;
 			for (const s of targets) {
-				rmSync(s.path);
-				n++;
+				// 单个删除失败(已不存在 / 权限不足)不应中断整批;计数并继续。
+				try {
+					rmSync(s.path);
+					n++;
+				} catch {
+					failed++;
+				}
 			}
-			ctx.ui.notify(`Deleted ${n} session(s)`, "info");
+			ctx.ui.notify(`Deleted ${n} session(s)${failed ? `, ${failed} failed` : ""}`, failed ? "warning" : "info");
 		},
 	});
 
