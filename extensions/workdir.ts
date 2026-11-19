@@ -10,7 +10,7 @@
  * ⚠️ 硬约束(不可破坏):本扩展**绝不触碰 `.pi` 目录的有效性**。工作目录是一个与宿主
  * cwd 完全正交的概念状态:它不调用 process.chdir、不写 ctx.cwd、不改 sessionManager。
  * `.pi` 目录(扩展加载、`/reload`、`/mcp-adapter` 配置等)一律锚定会话启动时的 `ctx.cwd`,
- * 不随 workdir 切换 / 恢复而改变。workDir 只流向三处:提示文本、底栏状态、本命令自身
+ * 不随 workdir 切换 / 恢复而改变。workDir 用于新建终端的初始目录、提示文本、底栏状态、本命令自身
  * 的相对路径解析。切勿让 workDir 渗入任何 `.pi` 路径或宿主 cwd 的解析。
  *
  * 命令:
@@ -67,6 +67,18 @@ function isDirectory(p: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/** 当前分支最新且仍有效的工作目录。终端与 /wd 共用同一恢复规则,不依赖扩展加载顺序。 */
+export function resolveSessionWorkdir(ctx: ExtensionContext): string {
+	const branch = ctx.sessionManager.getBranch();
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i];
+		if (entry.type !== "custom" || entry.customType !== ENTRY_TYPE) continue;
+		const op = (entry as CustomEntry<StoreOp>).data;
+		if (op?.op === "wd_set" && typeof op.path === "string" && isAbsolute(op.path) && isDirectory(op.path)) return op.path;
+	}
+	return ctx.cwd;
 }
 
 /** 列出目录下的直接子目录(隐藏目录除外),用于快选;失败返回空。 */
@@ -129,32 +141,10 @@ export default function (pi: ExtensionAPI): void {
 		pi.appendEntry<StoreOp>(ENTRY_TYPE, structuredClone(op));
 	}
 
-	/**
-	 * 重放一条持久化操作。wd_set 在写入前校验目录存在且确为目录:持久化之后目录可能
-	 * 已被删除(临时目录被清理 / 跨机 resume),悬空路径一旦写入就会作为"当前工作目录"
-	 * 进入系统提示与相对路径基准。悬空则丢弃该条操作,保留重放至今的最后有效目录
-	 * (rebuild 的起点是 ctx.cwd,因此最坏情况回退到会话默认目录)。
-	 * 仅作用于回放;setWorkDir 交互路径仍在切换时校验并向用户提示,行为不变。
-	 */
-	function applyOp(data: unknown): void {
-		const op = data as StoreOp | undefined;
-		if (!op || typeof op !== "object") return;
-		if (op.op === "wd_set" && typeof op.path === "string" && op.path) {
-			if (!isDirectory(op.path)) return;
-			workDir = op.path;
-		}
-	}
-
 	/** 从会话分支重建状态:默认 = ctx.cwd,wd_set 操作依次重放。 */
 	function rebuildFromSession(ctx: ExtensionContext): void {
 		defaultDir = ctx.cwd;
-		workDir = ctx.cwd;
-		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type === "custom") {
-				const custom = entry as CustomEntry<StoreOp>;
-				if (custom.customType === ENTRY_TYPE) applyOp(custom.data);
-			}
-		}
+		workDir = resolveSessionWorkdir(ctx);
 	}
 
 	// -- 底栏状态 -----------------------------------------------------------

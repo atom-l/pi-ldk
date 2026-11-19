@@ -6,6 +6,7 @@
  *
  * 按键:
  *   Enter          执行当前输入行(命令会回显进输出缓冲,便于对照结果)
+ *   Tab            命令 / 路径补全;有多个候选时先扩展公共前缀,再按一次列出候选
  *   ← / →          按码点移动光标(不拆散 emoji / 代理对)
  *   ↑ / ↓          历史命令
  *   PgUp / PgDn    滚动回看输出
@@ -17,6 +18,9 @@
  *   未识别的控制 / 转义序列(如 Ctrl+← = \x1b[1;5D)整体忽略,不污染输入行
  */
 
+import { accessSync, constants, readdirSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, delimiter, isAbsolute, parse, resolve } from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
 	CURSOR_MARKER,
@@ -39,6 +43,142 @@ const OUTPUT_ROWS = 18;
 /** 含控制字符 / 转义序列的输入(非纯可打印文本)。 */
 const CONTROL_OR_ESC = /[\x00-\x1f\x7f]/;
 
+/** PATH 中没有对应文件的 shell 内建命令也参与首词补全。 */
+const SHELL_BUILTINS = [
+	"alias",
+	"bg",
+	"cd",
+	"command",
+	"echo",
+	"eval",
+	"exec",
+	"exit",
+	"export",
+	"fg",
+	"hash",
+	"help",
+	"history",
+	"jobs",
+	"kill",
+	"local",
+	"printf",
+	"pwd",
+	"read",
+	"readonly",
+	"return",
+	"set",
+	"shift",
+	"source",
+	"test",
+	"times",
+	"trap",
+	"type",
+	"ulimit",
+	"umask",
+	"unalias",
+	"unset",
+	"wait",
+];
+
+/** 连续第二次 Tab 时最多列出的候选数,避免 PATH / 大目录刷屏。 */
+const MAX_LISTED_COMPLETIONS = 60;
+/** 未加引号的补全文本中需要反斜杠转义的 shell 元字符。 */
+const SHELL_ESCAPED_CHARS = new Set([..."\\'\"`$&;|<>()*?[]{}!#"]);
+
+interface CompletionCandidate {
+	/** 不带引号 / 转义的完整候选词(保留用户写的 ./、~/ 等前缀)。 */
+	value: string;
+	/** 候选列表里展示的短名称。 */
+	label: string;
+	directory: boolean;
+	directorySeparator: string;
+}
+
+interface CompletionToken {
+	start: number;
+	end: number;
+	value: string;
+	command: boolean;
+	expandHome: boolean;
+}
+
+interface CompletionState {
+	cwd: string;
+	input: string;
+	cursor: number;
+	candidates: CompletionCandidate[];
+	listed: boolean;
+}
+
+/** 按码点求公共前缀,避免在两个候选共享代理对的一半时截断字符。 */
+function commonPrefix(values: string[]): string {
+	if (values.length === 0) return "";
+	const first = Array.from(values[0]);
+	let length = first.length;
+	for (let i = 1; i < values.length && length > 0; i++) {
+		const other = Array.from(values[i]);
+		length = Math.min(length, other.length);
+		let j = 0;
+		while (j < length && first[j] === other[j]) j++;
+		length = j;
+	}
+	return first.slice(0, length).join("");
+}
+
+/** 将当前词还原成文件系统使用的文本(去掉引号和 POSIX 反斜杠转义)。 */
+function decodeShellWord(raw: string): string {
+	let value = "";
+	let quote: "'" | '"' | null = null;
+	let escaped = false;
+	for (let i = 0; i < raw.length; i++) {
+		const ch = raw[i];
+		if (escaped) {
+			value += ch;
+			escaped = false;
+			continue;
+		}
+		if (process.platform !== "win32" && ch === "\\" && quote !== "'") {
+			// POSIX 双引号内只有少数字符可被反斜杠转义,其他反斜杠应保留。
+			const next = raw[i + 1];
+			if (quote === '"' && next !== undefined && !'"\\$`\n'.includes(next)) {
+				value += ch;
+				continue;
+			}
+			escaped = true;
+			continue;
+		}
+		if (quote) {
+			if (ch === quote) quote = null;
+			else value += ch;
+			continue;
+		}
+		if (ch === "'" || ch === '"') quote = ch;
+		else value += ch;
+	}
+	// 末尾孤单的反斜杠是用户正在输入的转义,不把它吞掉。
+	if (escaped) value += "\\";
+	return value;
+}
+
+/** 用不加引号的 POSIX shell 写法插回候选,路径含空格 / 元字符时仍可按原义执行。 */
+function encodeShellWord(value: string): string {
+	if (process.platform === "win32") {
+		// cmd.exe 不使用反斜杠转义;仅在确有需要时加双引号。
+		return /[\s&|<>^"]/.test(value) ? `"${value.replaceAll('"', '\\"')}"` : value;
+	}
+	return Array.from(value, (ch) => (/\s/.test(ch) || SHELL_ESCAPED_CHARS.has(ch) ? `\\${ch}` : ch)).join("");
+}
+
+function isExecutable(path: string): boolean {
+	try {
+		if (!statSync(path).isFile()) return false;
+		if (process.platform !== "win32") accessSync(path, constants.X_OK);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 export class TerminalComponent implements Component, Focusable {
 	focused = true;
 
@@ -51,6 +191,8 @@ export class TerminalComponent implements Component, Focusable {
 	private scroll = 0;
 	/** 是否处于「再按 Ctrl+X 确认销毁」状态。 */
 	private confirmDestroy = false;
+	/** 上一次多候选补全的位置;仅连续 Tab 复用,任何编辑 / 移动都会清空。 */
+	private completion: CompletionState | null = null;
 
 	constructor(
 		private session: ShellSession,
@@ -109,7 +251,7 @@ export class TerminalComponent implements Component, Focusable {
 	}
 
 	private renderPrompt(inner: number): string {
-		const prompt = `${this.shortCwd()} $ `;
+		const prompt = `${truncateToWidth(this.shortCwd(), Math.max(1, inner - 9), "…")} $ `;
 		const avail = Math.max(6, inner - visibleWidth(prompt) - 1);
 
 		// 光标超出可视范围时,窗口右移到能容纳光标处。
@@ -149,7 +291,7 @@ export class TerminalComponent implements Component, Focusable {
 			);
 		}
 		const help = this.theme.style(
-			"Enter=执行 ←→=光标 ↑↓=历史 PgUp/PgDn=滚动 Ctrl+C=中断 Ctrl+L=清屏 Esc=折叠 Ctrl+X=销毁",
+			"Enter=执行 Tab=补全 ←→=光标 ↑↓=历史 PgUp/PgDn=滚动 Ctrl+C=中断 Ctrl+L=清屏 Esc=折叠 Ctrl+X=销毁",
 			{ fg: "muted" },
 		);
 		return this.frameRow(` ${help} `, inner);
@@ -157,10 +299,9 @@ export class TerminalComponent implements Component, Focusable {
 
 	private shortCwd(): string {
 		const home = process.env.HOME || process.env.USERPROFILE;
-		let cwd = this.session.cwd;
-		if (home && cwd.startsWith(home)) cwd = `~${cwd.slice(home.length)}`;
-		const parts = cwd.split("/");
-		return parts[parts.length - 1] || "/";
+		const cwd = this.session.cwd;
+		if (cwd === home) return "~";
+		return (basename(cwd) || parse(cwd).root).replace(/[\x00-\x1f\x7f-\x9f]/g, "�");
 	}
 
 	invalidate(): void {
@@ -170,6 +311,9 @@ export class TerminalComponent implements Component, Focusable {
 	// -- 输入 ---------------------------------------------------------------
 
 	handleInput(data: string): void {
+		const isTab = matchesKey(data, Key.tab);
+		if (!isTab) this.completion = null;
+
 		// 确认销毁状态下,只处理 Ctrl+X / Esc。
 		if (this.confirmDestroy) {
 			if (matchesKey(data, Key.ctrl("x"))) {
@@ -204,6 +348,13 @@ export class TerminalComponent implements Component, Focusable {
 		if (matchesKey(data, Key.ctrl("l"))) {
 			this.session.clear();
 			this.scroll = 0;
+			this.tui.requestRender();
+			return;
+		}
+
+		// 补全必须在 CONTROL_OR_ESC 过滤之前处理(Tab 本身是控制字符)。
+		if (isTab) {
+			this.complete();
 			this.tui.requestRender();
 			return;
 		}
@@ -286,6 +437,216 @@ export class TerminalComponent implements Component, Focusable {
 		// 可打印文本
 		this.insert(data);
 		this.tui.requestRender();
+	}
+
+	// -- Tab 补全 -----------------------------------------------------------
+
+	/** 当前光标前的 shell 词,以及它是否处于命令位置。 */
+	private completionToken(): CompletionToken {
+		let start = 0;
+		let expectCommand = true;
+		let redirectTarget = false;
+		let quote: "'" | '"' | null = null;
+		let escaped = false;
+		for (let i = 0; i < this.cursor; i++) {
+			const ch = this.input[i];
+			if (escaped) {
+				escaped = false;
+				continue;
+			}
+			if (process.platform !== "win32" && ch === "\\" && quote !== "'") {
+				escaped = true;
+				continue;
+			}
+			if (quote) {
+				if (ch === quote) quote = null;
+				continue;
+			}
+			if (ch === "'" || ch === '"') {
+				quote = ch;
+				continue;
+			}
+			// 空白和命令分隔符都开启新词;引号 / 转义内的相同字符属于路径本身。
+			if (/\s/.test(ch) || ";|&()<>".includes(ch)) {
+				const word = this.input.slice(start, i);
+				if (word) {
+					if (redirectTarget) redirectTarget = false;
+					else if (!(/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || ("<>".includes(ch) && /^\d+$/.test(word)))) expectCommand = false;
+				}
+				if ("<>".includes(ch)) redirectTarget = true;
+				else if (";|&()".includes(ch)) { expectCommand = true; redirectTarget = false; }
+				start = i + 1;
+			}
+		}
+
+		// 同时找到当前词终点。补全词中间时用完整候选替换整个词,不能保留并重复后缀。
+		let end = this.cursor;
+		while (end < this.input.length) {
+			const ch = this.input[end];
+			if (escaped) {
+				escaped = false;
+			} else if (process.platform !== "win32" && ch === "\\" && quote !== "'") {
+				escaped = true;
+			} else if (quote) {
+				if (ch === quote) quote = null;
+			} else if (ch === "'" || ch === '"') {
+				quote = ch;
+			} else if (/\s/.test(ch) || ";|&()<>".includes(ch)) {
+				break;
+			}
+			end++;
+		}
+
+		return {
+			start,
+			end,
+			expandHome: /^~(?:\/|$)/.test(this.input.slice(start, this.cursor)),
+			value: decodeShellWord(this.input.slice(start, this.cursor)),
+			command: expectCommand && !redirectTarget,
+		};
+	}
+
+	private complete(): void {
+		// 多候选时第一次 Tab 已尽量扩展公共前缀;位置未变的第二次 Tab 列出候选。
+		const cwd = this.session.cwd;
+		if (this.completion && this.completion.cwd === cwd && this.completion.input === this.input && this.completion.cursor === this.cursor) {
+			if (!this.completion.listed) {
+				this.listCompletions(this.completion.candidates);
+				this.completion.listed = true;
+			}
+			return;
+		}
+		this.completion = null;
+
+		const token = this.completionToken();
+		const pathLike = !token.command || token.value === "~" || this.hasPathSeparator(token.value);
+		const candidates = pathLike ? this.pathCompletions(token.value, token.command, token.expandHome, cwd) : this.commandCompletions(token.value, cwd);
+		if (candidates.length === 0) return;
+
+		if (candidates.length === 1) {
+			const candidate = candidates[0];
+			this.replaceCompletion(token, candidate.value, candidate);
+			return;
+		}
+
+		const prefix = commonPrefix(candidates.map((candidate) => candidate.value));
+		if (prefix.length > token.value.length) this.replaceCompletion(token, prefix);
+		this.completion = {
+			cwd,
+			input: this.input,
+			cursor: this.cursor,
+			candidates,
+			listed: false,
+		};
+	}
+
+	/** 首词且不含路径分隔符时,从 shell 内建命令与 PATH 中找可执行文件。 */
+	private commandCompletions(prefix: string, cwd: string): CompletionCandidate[] {
+		const candidates = new Map<string, CompletionCandidate>();
+		const add = (name: string) => {
+			if (!name.startsWith(prefix) || candidates.has(name) || /[\x00-\x1f\x7f-\x9f]/.test(name)) return;
+			if (!prefix.startsWith(".") && name.startsWith(".")) return;
+			candidates.set(name, { value: name, label: name, directory: false, directorySeparator: "/" });
+		};
+		for (const name of SHELL_BUILTINS) add(name);
+
+		for (const pathEntry of (process.env.PATH ?? "").split(delimiter)) {
+			// 空 PATH 项表示当前目录;相对 PATH 项也按 shell 的当前 cwd 解析。
+			const dir = resolve(cwd, pathEntry || ".");
+			let names: string[];
+			try {
+				names = readdirSync(dir);
+			} catch {
+				continue;
+			}
+			for (const name of names) {
+				if (!name.startsWith(prefix) || candidates.has(name)) continue;
+				if (isExecutable(resolve(dir, name))) add(name);
+			}
+		}
+		return [...candidates.values()].sort((a, b) => a.value.localeCompare(b.value));
+	}
+
+	/** 参数一律按路径补全;命令位置含 / 时只补可执行文件,但保留目录以便继续下钻。 */
+	private pathCompletions(value: string, executablesOnly: boolean, expandHome: boolean, cwd: string): CompletionCandidate[] {
+		if (expandHome && value === "~") {
+			try {
+				return statSync(homedir()).isDirectory()
+					? [{ value, label: "~/", directory: true, directorySeparator: "/" }]
+					: [];
+			} catch {
+				return [];
+			}
+		}
+
+		const backslash = process.platform === "win32" ? value.lastIndexOf("\\") : -1;
+		const slash = Math.max(value.lastIndexOf("/"), backslash);
+		const directoryPart = slash >= 0 ? value.slice(0, slash + 1) : "";
+		const prefix = slash >= 0 ? value.slice(slash + 1) : value;
+		const directorySeparator = slash >= 0 ? value[slash] : process.platform === "win32" ? "\\" : "/";
+		let fsDirectoryPart = directoryPart || ".";
+		if (fsDirectoryPart === "~") fsDirectoryPart = homedir();
+		else if (expandHome && /^~[\\/]/.test(fsDirectoryPart)) fsDirectoryPart = resolve(homedir(), fsDirectoryPart.slice(2));
+		const dir = isAbsolute(fsDirectoryPart) ? fsDirectoryPart : resolve(cwd, fsDirectoryPart);
+
+		let entries;
+		try {
+			entries = readdirSync(dir, { withFileTypes: true });
+		} catch {
+			return [];
+		}
+		const candidates: CompletionCandidate[] = [];
+		for (const entry of entries) {
+			if (!entry.name.startsWith(prefix)) continue;
+			if (!prefix.startsWith(".") && entry.name.startsWith(".")) continue;
+			// 控制序列不可安全插入输入行或候选列表。
+			if (/[\x00-\x1f\x7f-\x9f]/.test(entry.name)) continue;
+			const fullPath = resolve(dir, entry.name);
+			let directory = entry.isDirectory();
+			if (entry.isSymbolicLink()) {
+				try {
+					directory = statSync(fullPath).isDirectory();
+				} catch {
+					continue;
+				}
+			}
+			if (executablesOnly && !directory && !isExecutable(fullPath)) continue;
+			const candidateValue = `${directoryPart}${entry.name}`;
+			candidates.push({
+				value: candidateValue,
+				label: `${entry.name}${directory ? directorySeparator : ""}`,
+				directory,
+				directorySeparator,
+			});
+		}
+		return candidates.sort((a, b) => a.value.localeCompare(b.value));
+	}
+
+	private hasPathSeparator(value: string): boolean {
+		return value.includes("/") || (process.platform === "win32" && value.includes("\\"));
+	}
+
+	/** 替换整个当前词,保留其后的输入;目录留分隔符,其余唯一候选留一个空格。 */
+	private replaceCompletion({ start, end, expandHome }: CompletionToken, value: string, candidate?: CompletionCandidate): void {
+		let suffix = candidate ? (candidate.directory ? candidate.directorySeparator : " ") : "";
+		// 后续已有空白时无需再补一个空格;目录仍补 / 以便连续 Tab 下钻。
+		if (candidate && !candidate.directory && end < this.input.length && /\s/.test(this.input[end])) suffix = "";
+		const literalTilde = process.platform !== "win32" && !expandHome && value.startsWith("~");
+		const replacement = `${literalTilde ? "\\" : ""}${encodeShellWord(value)}${suffix}`;
+		this.input = this.input.slice(0, start) + replacement + this.input.slice(end);
+		this.cursor = start + replacement.length;
+		this.historyPos = null;
+	}
+
+	private listCompletions(candidates: CompletionCandidate[]): void {
+		this.session.flush();
+		const shown = candidates.slice(0, MAX_LISTED_COMPLETIONS).map((candidate) => candidate.label);
+		const remaining = candidates.length - shown.length;
+		// 输出窗口按行裁剪；每项独占一行，窄屏也能用 PgUp/PgDn 查看候选。
+		this.session.appendLine(`[Tab 补全 ${candidates.length} 项]`);
+		for (const label of shown) this.session.appendLine(`  ${label}`);
+		if (remaining > 0) this.session.appendLine(`… 另有 ${remaining} 项`);
+		this.scroll = 0;
 	}
 
 	private insert(text: string): void {

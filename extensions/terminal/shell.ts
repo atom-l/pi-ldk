@@ -18,8 +18,12 @@
  * (vim / top 等)不作为目标场景。
  */
 
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { readlinkSync } from "node:fs";
+import { promisify } from "node:util";
 import { StringDecoder } from "node:string_decoder";
+
+const execFileAsync = promisify(execFile);
 
 export type ShellStatus = "running" | "exited" | "killed";
 
@@ -58,7 +62,15 @@ function trackSession(session: ShellSession): void {
 
 export class ShellSession {
 	readonly name: string;
-	readonly cwd: string;
+	private currentDir: string;
+	get cwd(): string {
+		// Linux 的 procfs 是本地内核状态。按键/重绘不能等下一次轮询才看见已完成的 cd。
+		if (process.platform === "linux" && this.pid && this.status === "running" && !this.disposed) {
+			try { this.currentDir = readlinkSync(`/proc/${this.pid}/cwd`); } catch { /* 保留上次已知目录 */ }
+		}
+		return this.currentDir;
+	}
+	private readingCwd = false;
 	readonly shell: string;
 	readonly pid: number | undefined;
 	readonly createdAt = Date.now();
@@ -81,7 +93,7 @@ export class ShellSession {
 
 	constructor(opts: ShellSessionOptions) {
 		this.name = opts.name;
-		this.cwd = opts.cwd;
+		this.currentDir = opts.cwd;
 		this.shell = opts.shell || process.env.SHELL || (process.platform === "win32" ? "cmd.exe" : "/bin/sh");
 
 		this.child = spawn(this.shell, [], {
@@ -192,6 +204,30 @@ export class ShellSession {
 		const view = this.lines.slice(start, end);
 		if (atBottom && this.pending) view.push(this.pending);
 		return view;
+	}
+
+	/** 直接观察 shell 进程,不在 stdin 注入 pwd(否则会干扰 read、here-doc 和 $?)。 */
+	async refreshCwd(): Promise<void> {
+		if (this.readingCwd || !this.pid || this.status !== "running" || this.disposed) return;
+		this.readingCwd = true;
+		try {
+			const previous = this.currentDir;
+			let dir: string | undefined;
+			if (process.platform === "linux") {
+				dir = this.cwd;
+			} else if (process.platform === "darwin") {
+				const { stdout } = await execFileAsync("/usr/sbin/lsof", ["-a", "-p", String(this.pid), "-d", "cwd", "-Fn0"], { timeout: 1500 });
+				dir = stdout.split("\0").find(field => field.startsWith("n/"))?.slice(1);
+			}
+			if (dir && dir !== previous && this.status === "running" && !this.disposed) {
+				this.currentDir = dir;
+				this.onOutput?.();
+			}
+		} catch {
+			// 进程刚退出或系统不允许读取 cwd:保留最后一次有效值。
+		} finally {
+			this.readingCwd = false;
+		}
 	}
 
 	// -- 输入 / 进程控制 -----------------------------------------------------

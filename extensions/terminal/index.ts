@@ -24,11 +24,9 @@
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { resolveSessionWorkdir } from "../workdir.ts";
 import { ShellSession } from "./shell.ts";
 import { TerminalComponent, type TerminalAction } from "./component.ts";
-
-/** name → 常驻 shell 会话。折叠时仍存活。 */
-const sessions = new Map<string, ShellSession>();
 
 /** 保留的子命令名,不能作为会话名。 */
 const RESERVED = new Set(["open", "new", "list", "destroy", "kill", "help", ""]);
@@ -45,6 +43,8 @@ function parseArgs(raw: string): { cmd: string; name?: string } {
 }
 
 export default function (pi: ExtensionAPI) {
+	// 折叠时保留 shell，但不能在同一宿主的多个 pi 扩展实例之间复用。
+	const sessions = new Map<string, ShellSession>();
 	// 会话关闭时兜底清理,保证不漏进程。
 	pi.on("session_shutdown", () => {
 		for (const s of sessions.values()) s.dispose();
@@ -136,20 +136,25 @@ export default function (pi: ExtensionAPI) {
 
 		let session = sessions.get(name);
 		if (!session) {
-			session = new ShellSession({ name, cwd: ctx.cwd });
+			session = new ShellSession({ name, cwd: resolveSessionWorkdir(ctx) });
 			sessions.set(name, session);
 		}
 		const active = session;
 
 		// 呼出终端:接管交互区,直到组件调用 done(fold | destroy)。
-		const action = await ctx.ui.custom<TerminalAction | undefined>((tui, theme, _kb, done) => {
-			// 有新输出时触发重绘(仅在终端可见期间)。
-			active.onOutput = () => tui.requestRender();
-			return new TerminalComponent(active, theme, tui, (a) => done(a));
-		});
-
-		// 关闭界面:停止重绘回调(进程与缓冲继续)。
-		active.onOutput = null;
+		await active.refreshCwd(); // 折叠期间也可能执行了 cd。
+		let action: TerminalAction | undefined;
+		const watchCwd = (process.platform === "linux" || process.platform === "darwin") &&
+			setInterval(() => void active.refreshCwd(), process.platform === "linux" ? 200 : 1000);
+		try {
+			action = await ctx.ui.custom<TerminalAction | undefined>((tui, theme, _kb, done) => {
+				active.onOutput = () => tui.requestRender();
+				return new TerminalComponent(active, theme, tui, (a) => done(a));
+			});
+		} finally {
+			if (watchCwd) clearInterval(watchCwd);
+			active.onOutput = null;
+		}
 
 		if (action === "destroy") {
 			// 委托 disposeGracefully 的完成回调移出表项(进程退出后),避免异步窗口内重名会话不可见。
