@@ -93,7 +93,7 @@ export default function (pi: ExtensionAPI) {
 					if (!(await ctx.ui.confirm("销毁终端", `终止进程(pid=${s.pid ?? "?"})并清理会话 "${target}"?`))) return;
 					// 等进程真正退出后再从表里移除,否则 ≤2s 宽限窗口内同名会话会"不可见"
 					// (再次 /term <name> 会误建第二个 shell)。
-					s.disposeGracefully(() => sessions.delete(target));
+					s.disposeGracefully();
 					ctx.ui.notify(`终端 "${target}" 已销毁`, "info");
 					return;
 				}
@@ -136,30 +136,48 @@ export default function (pi: ExtensionAPI) {
 
 		let session = sessions.get(name);
 		if (!session) {
-			session = new ShellSession({ name, cwd: resolveSessionWorkdir(ctx) });
-			sessions.set(name, session);
+			const created = new ShellSession({ name, cwd: resolveSessionWorkdir(ctx) });
+			session = created;
+			sessions.set(name, created);
+			// 注册表的生命周期独立于面板：折叠期间退出也要释放，不留失效的同名终端。
+			created.onExit(() => {
+				if (sessions.get(name) === created) sessions.delete(name);
+				created.dispose();
+			});
 		}
 		const active = session;
 
 		// 呼出终端:接管交互区,直到组件调用 done(fold | destroy)。
 		await active.refreshCwd(); // 折叠期间也可能执行了 cd。
-		let action: TerminalAction | undefined;
+		type PanelResult = TerminalAction | "exit" | undefined;
+		let action: PanelResult;
+		let stopListening: (() => void) | undefined;
 		const watchCwd = (process.platform === "linux" || process.platform === "darwin") &&
 			setInterval(() => void active.refreshCwd(), process.platform === "linux" ? 200 : 1000);
 		try {
-			action = await ctx.ui.custom<TerminalAction | undefined>((tui, theme, _kb, done) => {
+			action = await ctx.ui.custom<PanelResult>((tui, theme, _kb, done) => {
+				let closed = false;
+				const close = (result: PanelResult) => {
+					if (closed) return;
+					closed = true;
+					done(result);
+				};
 				active.onOutput = () => tui.requestRender();
-				return new TerminalComponent(active, theme, tui, (a) => done(a));
+				stopListening = active.onExit(() => close("exit"));
+				return new TerminalComponent(active, theme, tui, close);
 			});
 		} finally {
+			stopListening?.();
 			if (watchCwd) clearInterval(watchCwd);
 			active.onOutput = null;
 		}
 
 		if (action === "destroy") {
-			// 委托 disposeGracefully 的完成回调移出表项(进程退出后),避免异步窗口内重名会话不可见。
-			active.disposeGracefully(() => sessions.delete(active.name));
+			active.disposeGracefully();
 			ctx.ui.notify(`终端 "${active.name}" 已销毁(进程终止中)`, "info");
+		} else if (action === "exit" || active.status !== "running") {
+			const reason = active.startError ?? active.exitSignal ?? `code=${active.exitCode ?? "?"}`;
+			ctx.ui.notify(`终端 "${name}" 已关闭：${reason}`, active.exitCode === 0 ? "info" : "warning");
 		} else {
 			// fold 或直接关闭:进程继续运行。
 			ctx.ui.notify(`终端 "${active.name}" 已折叠,进程继续运行。再次 /term ${active.name === "main" ? "" : active.name}返回。`, "info");

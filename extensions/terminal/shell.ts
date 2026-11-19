@@ -78,6 +78,8 @@ export class ShellSession {
 	/** 输出缓冲(每行可含 ANSI)。 */
 	lines: string[] = [];
 	status: ShellStatus = "running";
+	startError?: string;
+	private readonly exitListeners = new Set<() => void>();
 	exitCode: number | null = null;
 	exitSignal: NodeJS.Signals | null = null;
 	/** 有新输出时的回调(用于触发界面重绘)。 */
@@ -117,6 +119,8 @@ export class ShellSession {
 		this.child.stdout.on("error", (err) => this.appendLine(`[shell stdout error] ${err.message}`));
 		this.child.stderr.on("error", (err) => this.appendLine(`[shell stderr error] ${err.message}`));
 		this.child.on("error", (err) => {
+			if (this.pid) { this.appendLine(`[shell error] ${err.message}`); return; }
+			this.startError = err.message;
 			this.appendLine(`[shell 启动失败] ${err.message}`);
 			this.status = "exited";
 			// spawn 失败(ENOENT/无 cwd)时不会派发 'exit',此处必须自行回收:
@@ -126,7 +130,7 @@ export class ShellSession {
 				this.killTimer = null;
 			}
 			liveSessions.delete(this);
-			this.onOutput?.();
+			this.notifyExit();
 		});
 		this.child.on("exit", (code, signal) => {
 			const tail = this.stdoutDecoder.end() + this.stderrDecoder.end();
@@ -141,8 +145,21 @@ export class ShellSession {
 			}
 			liveSessions.delete(this);
 			this.appendLine(`[进程已退出] ${signal ? `signal=${signal}` : `code=${code}`}`);
-			this.onOutput?.();
+			this.notifyExit();
 		});
+	}
+
+	/** 注册一次性退出通知；界面挂载前已经退出时也不会漏掉事件。 */
+	onExit(listener: () => void): () => void {
+		if (this.status !== "running") listener();
+		else this.exitListeners.add(listener);
+		return () => { this.exitListeners.delete(listener); };
+	}
+
+	private notifyExit(): void {
+		const listeners = [...this.exitListeners];
+		this.exitListeners.clear();
+		for (const listener of listeners) listener();
 	}
 
 	// -- 输出缓冲 ----------------------------------------------------------
@@ -338,7 +355,10 @@ export class ShellSession {
 			/* ignore */
 		}
 		this.onOutput = null;
-		if (this.status === "running") this.status = "killed";
+		if (this.status === "running") {
+			this.status = "killed";
+			this.notifyExit();
+		}
 	}
 
 	private signalGroup(sig: NodeJS.Signals): void {
