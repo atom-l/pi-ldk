@@ -27,6 +27,7 @@ import {
 	type Component,
 	type Focusable,
 	type TUI,
+	type TuiMouseEvent,
 	Key,
 	matchesKey,
 	truncateToWidth,
@@ -181,6 +182,7 @@ function isExecutable(path: string): boolean {
 
 export class TerminalComponent implements Component, Focusable {
 	focused = true;
+	readonly capturesViewportInput = true; // 全屏模式下先把翻页键交给当前终端，而不是聊天记录。
 
 	private input = "";
 	/** 光标位置(UTF-16 码元下标)。 */
@@ -310,6 +312,18 @@ export class TerminalComponent implements Component, Focusable {
 
 	// -- 输入 ---------------------------------------------------------------
 
+	private scrollBy(linesFromEnd: number): boolean {
+		const previous = this.scroll;
+		this.scroll = Math.max(0, Math.min(Math.max(0, this.session.lines.length - OUTPUT_ROWS), previous + linesFromEnd));
+		return this.scroll !== previous;
+	}
+
+	handleMouse(event: TuiMouseEvent) {
+		if (event.type !== "wheel") return undefined;
+		// 宿主已命中面板，并按滚轮设置计算了逻辑行数。即使到达边界也不要滚动聊天记录。
+		return { handled: true, render: this.scrollBy(-(event.wheelDelta ?? 0)) };
+	}
+
 	handleInput(data: string): void {
 		const isTab = matchesKey(data, Key.tab);
 		if (!isTab) this.completion = null;
@@ -409,12 +423,12 @@ export class TerminalComponent implements Component, Focusable {
 
 		// 滚动
 		if (matchesKey(data, "pageUp")) {
-			this.scroll = Math.min(Math.max(0, this.session.lines.length - OUTPUT_ROWS), this.scroll + OUTPUT_ROWS);
+			this.scrollBy(OUTPUT_ROWS);
 			this.tui.requestRender();
 			return;
 		}
 		if (matchesKey(data, "pageDown")) {
-			this.scroll = Math.max(0, this.scroll - OUTPUT_ROWS);
+			this.scrollBy(-OUTPUT_ROWS);
 			this.tui.requestRender();
 			return;
 		}
