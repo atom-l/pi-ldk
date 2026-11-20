@@ -378,7 +378,10 @@ insight_recall  query="OAuth 迁移 风险"      # 后续任务需要时召回
 `extensions/terminal/`,在会话里呼出一个终端执行命令,随时可以折叠回 pi 会话,
 也可以彻底销毁。新建终端从当前会话的 `/workdir` 启动；未设置时使用 pi 的启动目录。
 重新打开已有终端会保留它自己的目录。终端里的 `cd` 不会修改会话的 `/workdir`。
-在 Linux（`/proc`）和 macOS（`lsof`）上，提示符会跟随 shell 的实际目录；无法读取时保留上次已知目录。
+在 Linux（`/proc`）、macOS（`lsof`）和 Windows 的 `cmd.exe` 中，提示符与相对路径补全会跟随 shell 的实际目录；无法读取时保留上次已知目录。
+
+Windows 下使用 `cmd.exe` 时，终端按启动时的活动代码页读写命令、标准输出和错误输出（包括简体中文 CP936 和 UTF-8）。无法查询控制台时尝试系统 OEM 代码页；也可以在启动 pi 前设置 `PI_TERMINAL_CMD_CODEPAGE`（如 `936` 或 `65001`）与实际代码页匹配。终端不会主动执行 `chcp` 或改变宿主的代码页。若手动切换代码页，请新建终端；自行采用其他编码输出的程序需要单独配置。
+目录跟踪使用 cmd 的 `PROMPT`；覆盖 `PROMPT` 或执行 `echo off` 可能中断更新。其他 Windows shell 不使用此 cmd 协议。
 
 ### 命令
 

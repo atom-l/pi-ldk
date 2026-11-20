@@ -22,6 +22,7 @@ import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child
 import { readlinkSync } from "node:fs";
 import { promisify } from "node:util";
 import { StringDecoder } from "node:string_decoder";
+import { configureCmd, isCmd } from "./windows-cmd.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -87,9 +88,10 @@ export class ShellSession {
 
 	private child: ChildProcessWithoutNullStreams;
 	private pending = "";
-	// 流式 UTF-8 解码:多字节字符可能被 chunk 边界切开,逐块 toString() 会产生 U+FFFD 乱码。
-	private stdoutDecoder = new StringDecoder("utf8");
-	private stderrDecoder = new StringDecoder("utf8");
+	// 两路独立流式解码，避免跨 chunk 的汉字或跨 stdout/stderr 的半个字符拼错。
+	private stdoutDecoder: { write(b: Buffer): string; end(): string };
+	private stderrDecoder: { write(b: Buffer): string; end(): string };
+	private encodeLine: (text: string) => Buffer | string;
 	private killTimer: ReturnType<typeof setTimeout> | null = null;
 	private disposed = false;
 
@@ -98,9 +100,15 @@ export class ShellSession {
 		this.currentDir = opts.cwd;
 		this.shell = opts.shell || process.env.SHELL || (process.platform === "win32" ? "cmd.exe" : "/bin/sh");
 
-		this.child = spawn(this.shell, [], {
+		const env = opts.env ?? process.env;
+		const cmd = process.platform === "win32" && isCmd(this.shell)
+			? configureCmd(this.shell, env, dir => { this.currentDir = dir; }) : undefined;
+		this.stdoutDecoder = cmd?.stdout ?? new StringDecoder("utf8");
+		this.stderrDecoder = cmd?.stderr ?? new StringDecoder("utf8");
+		this.encodeLine = cmd?.encodeLine ?? (text => `${text}\n`);
+		this.child = spawn(this.shell, cmd ? ["/d", "/a"] : [], {
 			cwd: this.cwd,
-			env: opts.env ?? process.env,
+			env: cmd?.env ?? env,
 			// 独立进程组:销毁时可安全 kill(-pid) 清掉整棵树。
 			detached: process.platform !== "win32",
 			stdio: ["pipe", "pipe", "pipe"],
@@ -111,6 +119,7 @@ export class ShellSession {
 		this.appendLine(`[终端 ${this.name}] pid=${this.pid ?? "?"} · shell=${this.shell} · cwd=${this.cwd}`);
 		this.appendLine(`[提示] Esc=折叠(进程继续运行) · Ctrl+X=销毁(终止进程) · Ctrl+C=中断(很可能连带结束本会话)`);
 
+		if (cmd?.warning) this.appendLine(`[提示] ${cmd.warning}`);
 		this.child.stdout.on("data", (chunk: Buffer) => this.ingest(this.stdoutDecoder.write(chunk)));
 		this.child.stderr.on("data", (chunk: Buffer) => this.ingest(this.stderrDecoder.write(chunk)));
 		// 三流挂 'error' 监听:对端提前关闭后 stdin 写入/流读取会异步抛 EPIPE/EIO,
@@ -257,7 +266,7 @@ export class ShellSession {
 		this.flushPending();
 		if (this.status !== "running" || !this.child.stdin.writable) return false;
 		try {
-			this.child.stdin.write(`${text}\n`);
+			this.child.stdin.write(this.encodeLine(text));
 			return true;
 		} catch {
 			return false;
