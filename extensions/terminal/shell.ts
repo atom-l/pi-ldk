@@ -98,7 +98,9 @@ export class ShellSession {
 	constructor(opts: ShellSessionOptions) {
 		this.name = opts.name;
 		this.currentDir = opts.cwd;
-		this.shell = opts.shell || process.env.SHELL || (process.platform === "win32" ? "cmd.exe" : "/bin/sh");
+		this.shell = opts.shell || (process.platform === "win32"
+			? process.env.ComSpec || "cmd.exe"
+			: process.env.SHELL || "/bin/sh");
 
 		const env = opts.env ?? process.env;
 		const cmd = process.platform === "win32" && isCmd(this.shell)

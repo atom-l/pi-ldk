@@ -15,16 +15,22 @@ function encodingName(page: string): string {
 }
 
 /** chcp prints localized text; only the trailing ASCII code page number is significant. */
-function detectPage(shell: string, env: NodeJS.ProcessEnv): string | undefined {
+type CommandRunner = (file: string, args: string[], options: {
+	env: NodeJS.ProcessEnv;
+	timeout: number;
+	stdio: ["ignore", "pipe", "ignore"];
+}) => Buffer;
+
+function detectPage(shell: string, env: NodeJS.ProcessEnv, run: CommandRunner): string | undefined {
 	const options = { env, timeout: 1500, stdio: ["ignore", "pipe", "ignore"] as ["ignore", "pipe", "ignore"] };
 	try {
-		const text = execFileSync(shell, ["/d", "/c", "chcp"], options).toString("latin1");
+		const text = run(shell, ["/d", "/c", "chcp"], options).toString("latin1");
 		const page = /(\d+)\s*$/.exec(text)?.[1];
 		if (page) return page;
 	} catch { /* Some GUI launches have no console to query. */ }
 	try {
-		const reg = win32.join(process.env.SystemRoot || "C:\\Windows", "System32", "reg.exe");
-		const text = execFileSync(reg, ["query", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage", "/v", "OEMCP"], options).toString("latin1");
+		const reg = win32.join(env.SystemRoot || env.SYSTEMROOT || "C:\\Windows", "System32", "reg.exe");
+		const text = run(reg, ["query", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage", "/v", "OEMCP"], options).toString("latin1");
 		return /\bOEMCP\s+REG_SZ\s+(\d+)/i.exec(text)?.[1];
 	} catch { return undefined; }
 }
@@ -72,9 +78,14 @@ export class CmdPromptReader {
 	}
 }
 
-export function configureCmd(shell: string, env: NodeJS.ProcessEnv, cwd: (dir: string) => void) {
+export function configureCmd(
+	shell: string,
+	env: NodeJS.ProcessEnv,
+	cwd: (dir: string) => void,
+	run: CommandRunner = execFileSync,
+) {
 	const codec: typeof import("iconv-lite") = require("iconv-lite");
-	const page = env.PI_TERMINAL_CMD_CODEPAGE?.trim() || detectPage(shell, env);
+	const page = env.PI_TERMINAL_CMD_CODEPAGE?.trim() || detectPage(shell, env, run);
 	const supported = !!page && /^\d+$/.test(page) && codec.encodingExists(encodingName(page));
 	const encoding = supported ? encodingName(page!) : "utf8";
 	const id = randomUUID();
