@@ -8,7 +8,7 @@ export async function catalog(ctx: ExtensionContext): Promise<Choice[]> {
   const disabled = new Set<string>();
   // Legacy entries retain order and hence implicit defaults. Never read a project
   // overlay for registry authentication; the registry resolves its own credentials.
-  const list: Choice[] = loadImageModels(ctx.cwd, process.env, disabled).map(e => ({ ...e, legacy:true }));
+  const list: Choice[] = loadImageModels(ctx.cwd, process.env, disabled, ctx.isProjectTrusted()).map(e => ({ ...e, legacy:true }));
   const registry = ctx.modelRegistry;
   if (typeof registry?.getAvailableOfType !== 'function' || typeof registry.generateImages !== 'function') return list;
   const entries = new Map(list.map(e => [e.key,e]));

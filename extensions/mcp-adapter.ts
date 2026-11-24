@@ -514,6 +514,8 @@ function toToolExposure(exposure: string): ToolExposure {
 }
 
 export interface ProxyOptions {
+	/** Invalidated on reload, removal, or native takeover while a proxy is waiting. */
+	isCurrent?: () => boolean;
 	server: string;
 	config: McpServerConfig;
 	cachedTools: CachedTool[];
@@ -688,6 +690,11 @@ export function createProxyDefinition(options: ProxyOptions): ToolDefinition {
 			_onUpdate: unknown,
 			ctx: ExtensionToolContext,
 		): Promise<AgentToolResult> {
+			const assertActive = () => {
+				signal?.throwIfAborted();
+				if (options.isCurrent && !options.isCurrent()) throw new Error(`MCP proxy for ${server} changed or was disabled; start a new call.`);
+			};
+			assertActive();
 			const tool = typeof params?.tool === "string" ? params.tool.trim() : "";
 			const wantsList = !tool || tool === "__list__";
 			const args = params?.arguments && typeof params.arguments === "object" ? params.arguments : {};
@@ -697,6 +704,7 @@ export function createProxyDefinition(options: ProxyOptions): ToolDefinition {
 			const deadline = Date.now() + readyTimeout * 1000;
 			let target: string | undefined;
 			for (;;) {
+				assertActive();
 				// The proxy shares the server's namespace, so it must not count as a server tool.
 				const inNamespace = pi
 					.getAllTools()
@@ -765,6 +773,7 @@ export function createProxyDefinition(options: ProxyOptions): ToolDefinition {
 			const readOnly = hints?.readOnlyHint === true && hints.destructiveHint !== true;
 			const maxAttempts = readOnly ? 1 + Math.max(0, retries) : 1;
 			for (let attempt = 1; ; attempt++) {
+				assertActive();
 				let result: AgentToolResult | undefined;
 				let errorText = "";
 				try {
@@ -1269,10 +1278,11 @@ function registerProxies(pi: ExtensionAPI, state: AdapterState, loaded: AdapterL
 				inputSchema: tool.parameters,
 			}));
 		const cachedTools = mergeCachedTools(legacy.get(entry.name), own.get(entry.name), liveTools).filter(t => effectiveToolExposure(config,t.name) !== 'hidden');
-		const key = JSON.stringify([config, cachedTools.map((tool) => tool.name), loaded.readyTimeout, loaded.retries, loaded.retryDelay]);
+		const key = JSON.stringify([config, cachedTools, loaded.readyTimeout, loaded.retries, loaded.retryDelay]);
 		if (state.proxyKeys.get(entry.name) === key) continue;
 		state.proxyKeys.set(entry.name, key);
-		const definition = createProxyDefinition({
+		const definition: ToolDefinition = createProxyDefinition({
+			isCurrent: () => state.proxyDefinitions.get(entry.name) === definition,
 			server: entry.name,
 			config,
 			cachedTools,

@@ -31,8 +31,8 @@ import { basename, extname, isAbsolute, join, resolve } from "node:path";
 /* HTTP transport                                                      */
 /* Pi installs a proxy-aware global fetch which may route even         */
 /* loopback/private hosts through HTTP_PROXY (ignoring NO_PROXY).      */
-/* Use a direct socket for proxy-exempt targets and fall back to one   */
-/* when the global fetch fails, so local gateways keep working.        */
+/* Choose the transport before sending: a failed response is not proof */
+/* that an upstream generation did not already run.                    */
 /* ------------------------------------------------------------------ */
 
 export interface RawResponse {
@@ -48,7 +48,7 @@ export function shouldBypassProxy(urlStr: string, env: NodeJS.ProcessEnv = proce
 	} catch {
 		return false;
 	}
-	if (host === "localhost" || host === "::1" || host.endsWith(".localhost")) return true;
+	if (host === "localhost" || host === "[::1]" || host === "::1" || host.endsWith(".localhost")) return true;
 	if (/^127\./.test(host)) return true;
 	if (/^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host)) return true;
 	const noProxy = env.no_proxy ?? env.NO_PROXY ?? "";
@@ -128,6 +128,7 @@ async function directRequest(urlStr: string, opts: RequestOptions): Promise<RawR
 		const res = await directRequestOnce(url, { ...opts, method, body });
 		const location = res.headers.location;
 		if (!location || ![301, 302, 303, 307, 308].includes(res.status) || !location) return res;
+		if (method !== 'GET' && method !== 'HEAD') throw new Error('Image generation redirect refused; configure the final endpoint. Request was not replayed.');
 		url = new URL(location, url).toString();
 		if (res.status !== 307 && res.status !== 308) {
 			method = "GET";
@@ -141,6 +142,7 @@ async function fetchDirect(urlStr: string, opts: RequestOptions): Promise<RawRes
 	const res = await fetch(urlStr, {
 		method: opts.method ?? "GET",
 		headers: opts.headers,
+		redirect: !opts.method || opts.method === 'GET' || opts.method === 'HEAD' ? 'follow' : 'error',
 		body: Buffer.isBuffer(opts.body) ? Uint8Array.from(opts.body) : opts.body,
 		signal: opts.signal,
 	});
@@ -175,24 +177,14 @@ async function fetchDirect(urlStr: string, opts: RequestOptions): Promise<RawRes
 	};
 }
 
-/** Direct socket for proxy-exempt hosts; global fetch elsewhere, with a direct
- *  fallback when the (possibly proxy-wrapped) fetch fails on a network error. */
+/** Use exactly one transport; never replay a request or bypass a configured proxy after an error. */
 export async function httpRequest(
 	urlStr: string,
 	opts: RequestOptions,
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<RawResponse> {
 	if (shouldBypassProxy(urlStr, env)) return directRequest(urlStr, opts);
-	try {
-		return await fetchDirect(urlStr, opts);
-	} catch (error) {
-		if (opts.signal?.aborted) throw error;
-		try {
-			return await directRequest(urlStr, opts);
-		} catch {
-			throw error; // report the original (fetch) failure
-		}
-	}
+	return fetchDirect(urlStr, opts);
 }
 
 /* ------------------------------------------------------------------ */
@@ -367,7 +359,7 @@ const PROVIDER_SCALARS = ["name", "baseUrl", "apiKey", "api", "headers", "authHe
  * Load image-capable models from pi's models.json (and optional project
  * overlays). Later files override earlier ones per provider/model.
  */
-export function loadImageModels(cwd: string, env: NodeJS.ProcessEnv = process.env, disabled?: Set<string>): ImageModelEntry[] {
+export function loadImageModels(cwd: string, env: NodeJS.ProcessEnv = process.env, disabled?: Set<string>, projectTrusted = false): ImageModelEntry[] {
 	interface Accumulated {
 		scalars: Record<string, unknown>;
 		models: Map<string, Record<string, any>>;
@@ -375,7 +367,8 @@ export function loadImageModels(cwd: string, env: NodeJS.ProcessEnv = process.en
 	}
 	const providers = new Map<string, Accumulated>();
 
-	for (const path of modelsJsonPaths(cwd, env)) {
+	const paths = modelsJsonPaths(cwd, env);
+	for (const path of projectTrusted ? paths : paths.slice(0, 1)) {
 		const raw = readJsonc(path);
 		if (!raw?.providers || typeof raw.providers !== "object") continue;
 		for (const [providerId, provider] of Object.entries(raw.providers as Record<string, any>)) {
@@ -470,9 +463,10 @@ export function selectModel(
 	const wanted = modelKey?.trim() || env.PI_IMAGE_GEN_MODEL?.trim();
 	if (wanted) {
 		const lower = wanted.toLowerCase();
-		const match =
-			entries.find((e) => e.key.toLowerCase() === lower) ??
-			entries.find((e) => e.modelId.toLowerCase() === lower);
+		const qualified = entries.find((e) => e.key === wanted) ?? entries.find((e) => e.key.toLowerCase() === lower);
+		const candidates = qualified ? [qualified] : entries.filter((e) => e.modelId.toLowerCase() === lower);
+		if (candidates.length > 1) return { error: `Ambiguous image model "${wanted}". Use provider/model-id: ${candidates.map(e => e.key).join(', ')}` };
+		const match = candidates[0];
 		if (!match) {
 			return {
 				error: `Image model "${wanted}" not found. Available: ${entries.map((e) => e.key).join(", ")}`,
@@ -985,19 +979,16 @@ export async function generateLegacy(options: GenerateOptions, entry: ImageModel
 
 	onProgress(`Using ${entry.key} to generate ${count} image(s)...`);
 
+	if (options.referenceImages?.length && (api === 'images' || api === 'openai-images')) {
+		throw new Error('This legacy images endpoint cannot accept referenceImages; no generation request was sent.');
+	}
+	if ((api === 'anthropic' || api === 'anthropic-messages') && (count > 1 || options.size)) {
+		throw new Error('Legacy Anthropic messages do not support per-call size/count overrides; no generation request was sent.');
+	}
 	const referenceImages: ReferenceImage[] = [];
 	for (const ref of options.referenceImages ?? []) {
-		try {
-			referenceImages.push(await resolveReferenceImage(ref, options.cwd));
-		} catch (error) {
-			// One unreadable reference must not sink the whole generation.
-			warnings.push(
-				`reference image "${ref}" could not be loaded: ${error instanceof Error ? error.message : error}`,
-			);
-		}
-	}
-	if (referenceImages.length > 0 && (api === "images" || api === "openai-images")) {
-		warnings.push("referenceImages are not supported by the images API and were ignored");
+		options.signal?.throwIfAborted();
+		referenceImages.push(await resolveReferenceImage(ref, options.cwd));
 	}
 
 	const auth = await options.resolveAuth(entry);
@@ -1005,7 +996,7 @@ export async function generateLegacy(options: GenerateOptions, entry: ImageModel
 		prompt: options.prompt,
 		count,
 		size: options.size,
-		referenceImages: api === "images" || api === "openai-images" ? [] : referenceImages,
+		referenceImages,
 	});
 
 	const timeoutMs = gen.timeoutMs ?? GEN_DEFAULTS.timeoutMs;

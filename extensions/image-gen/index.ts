@@ -350,8 +350,9 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 					}
 				}
 
-				const selected = selectModel(entries, modelKey).entry as Choice | undefined;
-				if (!selected) { notify(ctx, `找不到图片模型：${modelKey}`, 'error'); return; }
+				const selection = selectModel(entries, modelKey);
+				const selected = selection.entry as Choice | undefined;
+				if (!selected) { notify(ctx, selection.error ?? `找不到图片模型：${modelKey}`, 'error'); return; }
 				if (!size && selected.legacy) {
 					const picked = await ctx.ui.select("选择尺寸", SIZE_CHOICES);
 					if (!picked) {
@@ -359,7 +360,8 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 						return;
 					}
 					if (picked.startsWith("自定义")) {
-						size = ((await ctx.ui.input("自定义尺寸（如 1280x720）", "1280x720")) ?? "").trim() || undefined;
+						size = (await ctx.ui.input("自定义尺寸（如 1280x720）", "1280x720"))?.trim();
+						if (!size) { notify(ctx, '已取消', 'info'); return; }
 					} else if (!picked.startsWith("默认")) {
 						size = picked.split(" ")[0];
 					}
