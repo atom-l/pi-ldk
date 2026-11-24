@@ -151,6 +151,8 @@ export function highlightMarkdownSourceLines(lines: string[], visibleSourceRows:
 
 export class MarkdownEditor extends CustomEditor {
 	onRequestSubmit: (() => void) | undefined;
+	/** Return true only when the current input is a command Pi can execute. */
+	shouldSubmitCommand: ((text: string) => boolean) | undefined;
 
 	override handleInput(data: string): void {
 		if (matchesKey(data, "shift+enter")) {
@@ -158,8 +160,14 @@ export class MarkdownEditor extends CustomEditor {
 			return;
 		}
 		if (matchesKey(data, "enter")) {
+			if (this.shouldSubmitCommand?.(this.getExpandedText())) {
+				// Preserve Pi's native command submission, autocomplete, history
+				// and cleanup behavior without a Markdown confirmation dialog.
+				super.handleInput(data);
+				return;
+			}
 			// Use the public editing operation so undo, paste and onChange retain
-			// their native behavior, while plain Enter never submits.
+			// their native behavior, while plain Enter never submits Markdown.
 			this.insertTextAtCursor("\n");
 			return;
 		}

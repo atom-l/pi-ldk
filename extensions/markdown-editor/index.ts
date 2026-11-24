@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext, KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
 import { MarkdownEditor } from "./editor.ts";
+import { isPiCommand } from "./commands.ts";
 
 type NativeEditorFactory = ReturnType<ExtensionContext["ui"]["getEditorComponent"]>;
 
@@ -20,6 +21,7 @@ export default function markdownEditorExtension(pi: ExtensionAPI): void {
 
 	const markdownFactory = (tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager): MarkdownEditor => {
 		const editor = new MarkdownEditor(tui, theme, keybindings);
+		editor.shouldSubmitCommand = (text) => isPiCommand(text, pi.getCommands());
 		if (enabled) activeEditor = editor;
 		editor.onRequestSubmit = () => {
 			void requestConfirmation(editor);
