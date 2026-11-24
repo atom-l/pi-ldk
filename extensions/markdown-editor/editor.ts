@@ -160,9 +160,10 @@ export class MarkdownEditor extends CustomEditor {
 			return;
 		}
 		if (matchesKey(data, "enter")) {
-			if (this.shouldSubmitCommand?.(this.getExpandedText())) {
-				// Preserve Pi's native command submission, autocomplete, history
-				// and cleanup behavior without a Markdown confirmation dialog.
+			// An open autocomplete menu owns Enter first. This includes both
+			// command-name and argument/path completion; delegating preserves
+			// Pi's native selection and (where applicable) submit behavior.
+			if (this.capturesViewportInput || this.shouldSubmitCommand?.(this.getExpandedText())) {
 				super.handleInput(data);
 				return;
 			}
