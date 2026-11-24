@@ -63,12 +63,10 @@
  *
  *   { "startupWait": false, "mcpServers": { ... } }
  *
- *   - unset (default): `true` automatically when any server exposes a `direct` tool (those must be
- *     declared in the first request, so the first prompt waits for the connection, at most 10
- *     seconds), `false` otherwise.
+ *   - unset (default): register at session start and let Pi decide which servers to await.
  *   - `false`: the servers register when the first turn starts (so the first message is recorded
  *     and displayed without waiting) and connect in the background. Their tools become available
- *     as soon as they connect; until then the call proxies cover them.
+ *     as soon as they connect; an explicitly enabled call proxy can wait for them.
  *   - `true`: the servers join pi's startup connections, so the first prompt waits for them
  *     (shorter when they connect quickly) and can use their tools right away.
  *
@@ -81,14 +79,41 @@
  * tool list, so nothing is needed up front. Once the server is connected its own
  * `mcp__<server>__<tool>` tools are declared and should be preferred.
  *
- * Error handling: failures are classified. Transient ones (network problems, timeouts, 5xx,
- * rate limits) are retried up to `retries` times (default 3) with growing delays (`retryDelay`
- * seconds, doubling, default 2); a recovered call returns the real result unchanged so the model
- * continues its unfinished reasoning. Definitive failures (auth, bad request, unknown tool) and
- * transient failures that retries did not fix are reported to the model with the error class, the
- * original error, and how to help the user troubleshoot and fix it.
+ * Native first: pi 1.6 connects MCP servers itself, so the servers of this file are registered as
+ * plain pi servers (same connection, same `/mcp`, codemode, resources, permissions). A server that
+ * `mcp.json` defines wins over an adapter entry of the same name — pi counts names that differ only
+ * in `-` and `_` as the same server (`mcpNamespace`), and so does this adapter: an overridden entry
+ * is reported and not registered, so there is never a second, shadowed connection.
  *
- *   { "startupWait": false, "readyTimeout": 120, "retries": 3, "retryDelay": 2, "mcpServers": { ... } }
+ * Per-server `compat` switches the three compatibility layers this adapter can add. All default to
+ * `false`: pi 1.6 declares a connected server's tools like any other tool and lists the server in
+ * its own `mcp_servers` system prompt section, so nothing extra is needed or wanted by default.
+ *
+ *   { "mcpServers": { "web-search": {
+ *       "url": "https://example.com/mcp",
+ *       "compat": { "callProxy": false, "usageGuide": false, "queryGuard": false }
+ *   } } }
+ *
+ *   - `callProxy: true` — register `mcp_call__<server>`, a stand-in that waits for the connection and
+ *     then runs the real tool (for servers that connect slowly and whose tools are needed immediately).
+ *   - `usageGuide: true` — add the server to the `mcp_usage` system prompt section (its declared
+ *     tool descriptions and inputSchemas), for models that ignore late-declared tools.
+ *   - `queryGuard: true` — block a call that pastes the user's request text into a query parameter
+ *     (see “Query hygiene” below) instead of running a search on the raw sentence.
+ *
+ * Unknown keys of `compat` are reported and never reach pi, and neither does `compat` itself
+ * (pi's `mcpServers` shape has no such field).
+ *
+ * Error handling: failures are classified and reported to the model with the error class, the
+ * original error, and how to help the user troubleshoot and fix it. The call proxy never replays a
+ * call on its own: a failed tool call may already have run on the server, so replaying it could
+ * repeat a side effect. Only a tool whose server declares `readOnlyHint` (and not
+ * `destructiveHint`) is retried, and only when `retries` is set above 0 with growing delays
+ * (`retryDelay` seconds, doubling). `retries` defaults to 0 (report the failure, replay nothing);
+ * `retries`/`retryDelay` are still accepted so older configs keep working.
+ *
+ *   { "readyTimeout": 120, "retries": 0, "retryDelay": 2, "mcpServers": { ... } }
+ *
  *
  * Commands:
  *   /mcp-adapter           show configured servers and how they were mapped
@@ -115,9 +140,11 @@ import { join, relative } from "node:path";
 // ---------------------------------------------------------------- config files
 
 /** Where the adapter reads its config from. Global first, project overrides by name. */
+const agentDir = () => process.env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent');
+
 export function adapterConfigPaths(cwd: string): { global: string; project: string } {
 	return {
-		global: join(homedir(), ".pi", "agent", "mcp-adapter.json"),
+		global: join(agentDir(), "mcp-adapter.json"),
 		project: join(cwd, ".pi", "mcp-adapter.json"),
 	};
 }
@@ -143,10 +170,39 @@ const STDIO_TYPES = new Set(["local", "stdio", "subprocess", "process", "command
 const MAX_TOOL_NAME_LENGTH = 64;
 /** How long a call proxy waits for its server before giving up (seconds). */
 const READY_TIMEOUT_DEFAULT = 120;
-/** Extra attempts for errors that look transient (a call fails once by default). */
-const RETRIES_DEFAULT = 3;
+/**
+ * Extra attempts for errors that look transient. Default 0: a call is never replayed, because the
+ * first attempt may already have run on the server (side effects). Only tools the server declares
+ * `readOnlyHint` are retried, and only when this is set above 0.
+ */
+const RETRIES_DEFAULT = 0;
 /** Seconds before the first retry; every further retry doubles it. */
 const RETRY_DELAY_DEFAULT = 2;
+
+/**
+ * The compatibility layers this adapter can add per server. pi 1.6 connects MCP servers natively and
+ * declares their tools itself, so every layer is off unless a server asks for it.
+ */
+export interface CompatFlags {
+	/** Register `mcp_call__<server>`, a stand-in that waits for the connection. */
+	callProxy: boolean;
+	/** Add the server to the `mcp_usage` system prompt section. */
+	usageGuide: boolean;
+	/** Block calls that paste the user's request text into a query parameter. */
+	queryGuard: boolean;
+}
+
+const COMPAT_KEYS = ["callProxy", "usageGuide", "queryGuard"] as const;
+
+export const DEFAULT_COMPAT: CompatFlags = { callProxy: false, usageGuide: false, queryGuard: false };
+
+/**
+ * The name pi compares MCP servers by (`@earendil-works/pi-mcp`'s `mcpNamespace`): `-` and `_`
+ * count as the same character, so `web-search` and `web_search` are the same server.
+ */
+export function normalizeServerName(name: string): string {
+	return name.replace(/-/g, "_");
+}
 
 // ------------------------------------------------------- error classification
 
@@ -251,7 +307,7 @@ export function formatCallError(failure: CallFailure): string {
 	const { server, tool, attempts, elapsedMs, kind, error, exhausted } = failure;
 	const elapsed = `${(elapsedMs / 1000).toFixed(1)}s`;
 	const head = exhausted
-		? `MCP call failed (server "${server}", tool "${tool}") after ${attempts} attempt${attempts === 1 ? "" : "s"} over ${elapsed}. The error looked transient but the retries did not help; treat it as unrecoverable.`
+		? `MCP call failed (server "${server}", tool "${tool}") after ${attempts} attempt${attempts === 1 ? "" : "s"} over ${elapsed}. The transient error was not resolved; check remote state before making another call.`
 		: `MCP call failed (server "${server}", tool "${tool}", attempt ${attempts} after ${elapsed}). This error is not recoverable by retrying.`;
 	return [
 		head,
@@ -308,12 +364,12 @@ function readToolCacheFile(path: string): Map<string, CachedTool[]> {
 
 /** Tool lists pi cached after connecting (kept by pi versions before 1.1). */
 export function loadToolCache(): Map<string, CachedTool[]> {
-	return readToolCacheFile(join(homedir(), ".pi", "agent", "mcp-cache.json"));
+	return readToolCacheFile(join(agentDir(), "mcp-cache.json"));
 }
 
 /** Tool lists this extension observed itself (`~/.pi/agent/mcp-adapter-tools.json`). */
 export function loadOwnToolCache(): Map<string, CachedTool[]> {
-	return readToolCacheFile(join(homedir(), ".pi", "agent", "mcp-adapter-tools.json"));
+	return readToolCacheFile(join(agentDir(), "mcp-adapter-tools.json"));
 }
 
 /**
@@ -327,7 +383,7 @@ export function loadOwnToolCache(): Map<string, CachedTool[]> {
  */
 export function persistServerTools(server: string, tools: CachedTool[]): void {
 	try {
-		const path = join(homedir(), ".pi", "agent", "mcp-adapter-tools.json");
+		const path = join(agentDir(), "mcp-adapter-tools.json");
 		let root: RawEntry = {};
 		try {
 			const parsed = JSON.parse(readFileSync(path, "utf8"));
@@ -598,7 +654,7 @@ export function createProxyDefinition(options: ProxyOptions): ToolDefinition {
 		`Call a tool of the MCP server "${server}". Use it as soon as the task needs this server; the call waits for the connection, so it works even before the server's own tools are declared.`,
 		`"tool" names the MCP tool of "${server}" and "arguments" is that tool's arguments object; take both from the known tool list below (or from tool="__list__") and never invent them.`,
 		`It waits (up to ${readyTimeout} seconds) until the server is connected, then executes the real tool and returns its result.`,
-		`Transient failures (network problems, timeouts, 5xx, rate limits) are retried up to ${retries} times with growing delays before the error is reported.`,
+		`No outer retries by default. Only declared read-only tools may be replayed if retries are explicitly configured (here: ${retries}).`,
 		`Once the server's own tools (namespace ${namespaces.join(" or ")}) are declared, prefer them over this proxy.`,
 		`Calling with tool="__list__" waits for the connection and returns the server's current tool list.`,
 		listed ? `Known tools (name: server description; params: server inputSchema):\n${listed}` : `The server's tool list is not known yet; discover it with tool="__list__".`,
@@ -635,6 +691,7 @@ export function createProxyDefinition(options: ProxyOptions): ToolDefinition {
 			const tool = typeof params?.tool === "string" ? params.tool.trim() : "";
 			const wantsList = !tool || tool === "__list__";
 			const args = params?.arguments && typeof params.arguments === "object" ? params.arguments : {};
+			if (!wantsList && effectiveToolExposure(config,tool) === 'hidden') throw new Error('Hidden MCP tool is unavailable');
 			const candidates = wantsList ? [] : mcpToolNames(server, tool);
 			const rawName = rawToolName;
 			const deadline = Date.now() + readyTimeout * 1000;
@@ -647,7 +704,7 @@ export function createProxyDefinition(options: ProxyOptions): ToolDefinition {
 						(entry) =>
 							entry.namespace?.name !== undefined &&
 							namespaces.includes(entry.namespace.name) &&
-							entry.name !== name &&
+							entry.name !== name && entry.exposure !== 'hidden' && effectiveToolExposure(config,rawName(entry)) !== 'hidden' &&
 							!entry.name.startsWith("mcp_call__"),
 					);
 				target = candidates.find((candidate) => inNamespace.some((entry) => entry.name === candidate));
@@ -704,7 +761,9 @@ export function createProxyDefinition(options: ProxyOptions): ToolDefinition {
 			// so the model continues its unfinished reasoning; failures become structured errors the
 			// model can use to help the user.
 			const startedAt = Date.now();
-			const maxAttempts = 1 + Math.max(0, retries);
+			const hints = pi.getAllTools().find(t => t.name === target)?.annotations;
+			const readOnly = hints?.readOnlyHint === true && hints.destructiveHint !== true;
+			const maxAttempts = readOnly ? 1 + Math.max(0, retries) : 1;
 			for (let attempt = 1; ; attempt++) {
 				let result: AgentToolResult | undefined;
 				let errorText = "";
@@ -777,6 +836,8 @@ export interface AdapterEntry {
 	error?: string;
 	/** Fields the adapter translated, shown by /mcp-adapter. */
 	compat: string[];
+	flags: CompatFlags;
+	shadowed?: boolean;
 	/** File that defined the entry. */
 	source: string;
 	/** Whether the project file defines it (it then replaces the global entry). */
@@ -847,13 +908,21 @@ function resolveExposure(raw: RawEntry, compat: string[]): AdapterExposure | { e
 /** Translate one config entry to pi's mcpServers shape. */
 export function normalizeEntry(name: string, raw: unknown, source: string): AdapterEntry {
 	const compat: string[] = [];
-	const entry = (extra: Partial<AdapterEntry>): AdapterEntry => ({ name, compat, source, scope: "project", ...extra });
+	const flags = {...DEFAULT_COMPAT};
+	const entry = (extra: Partial<AdapterEntry>): AdapterEntry => ({ name, compat, flags, source, scope: "project", ...extra });
 
 	if (!isRecord(raw)) return entry({ error: "entry must be an object" });
 	if (!NAME_PATTERN.test(name)) {
 		return entry({ error: "name may only contain letters, digits, '_' and '-'" });
 	}
 
+	if (raw.compat !== undefined) {
+		if (!isRecord(raw.compat)) return entry({error:'compat must be an object'});
+		for (const [key,value] of Object.entries(raw.compat)) {
+			if (!COMPAT_KEYS.some(k=>k===key) || typeof value !== 'boolean') return entry({error:`invalid compat.${key}; expected callProxy, usageGuide or queryGuard with boolean value`});
+			flags[key as keyof CompatFlags] = value;
+		}
+	}
 	// Older configs may carry hand-written usage notes. Tool usage is protocol data (each tool's
 	// description and inputSchema from tools/list), so these are ignored rather than trusted.
 	if (raw.usage !== undefined || raw.toolHints !== undefined) {
@@ -1107,7 +1176,7 @@ export function loadAdapterServers(options: { cwd: string; projectTrusted: boole
 		for (const [name, raw] of Object.entries(project.servers)) {
 			const entry = normalizeEntry(name, raw, paths.project);
 			entry.scope = "project";
-			const index = result.entries.findIndex((other) => other.name === name);
+			const index = result.entries.findIndex((other) => normalizeServerName(other.name) === normalizeServerName(name));
 			if (index >= 0) result.entries.splice(index, 1, entry);
 			else result.entries.push(entry);
 		}
@@ -1144,13 +1213,13 @@ export function loadAdapterServers(options: { cwd: string; projectTrusted: boole
 /** Names defined by the `mcp.json` files pi itself reads; those win over adapter entries. */
 function mcpJsonNames(cwd: string, projectTrusted: boolean): Set<string> {
 	const names = new Set<string>();
-	const paths = [join(homedir(), ".pi", "agent", "mcp.json")];
+	const paths = [join(agentDir(), "mcp.json")];
 	if (projectTrusted) paths.push(join(cwd, ".pi", "mcp.json"));
 	for (const path of paths) {
 		try {
 			const parsed = JSON.parse(readFileSync(path, "utf8"));
 			const servers = isRecord(parsed) ? parsed.mcpServers : undefined;
-			if (isRecord(servers)) for (const name of Object.keys(servers)) names.add(name);
+			if (isRecord(servers)) for (const name of Object.keys(servers)) names.add(normalizeServerName(name));
 		} catch {
 			// Missing or unreadable: nothing to add.
 		}
@@ -1182,10 +1251,11 @@ interface AdapterState {
  * servers that disappeared. Proxies carry no connections, so they are fine at session start.
  */
 function registerProxies(pi: ExtensionAPI, state: AdapterState, loaded: AdapterLoadResult): void {
-	const legacy = loadToolCache();
-	const own = loadOwnToolCache();
+	const candidates = loaded.entries.filter(e => e.config && e.flags.callProxy && !e.shadowed);
+	const legacy = candidates.length ? loadToolCache() : new Map<string,CachedTool[]>();
+	const own = candidates.length ? loadOwnToolCache() : new Map<string,CachedTool[]>();
 	const wanted = new Set<string>();
-	for (const entry of loaded.entries) {
+	for (const entry of candidates) {
 		const config = entry.config;
 		if (!config || config.enabled === false || (config.exposure ?? "codemode") === "hidden") continue;
 		wanted.add(entry.name);
@@ -1198,7 +1268,7 @@ function registerProxies(pi: ExtensionAPI, state: AdapterState, loaded: AdapterL
 				description: tool.description,
 				inputSchema: tool.parameters,
 			}));
-		const cachedTools = mergeCachedTools(legacy.get(entry.name), own.get(entry.name), liveTools);
+		const cachedTools = mergeCachedTools(legacy.get(entry.name), own.get(entry.name), liveTools).filter(t => effectiveToolExposure(config,t.name) !== 'hidden');
 		const key = JSON.stringify([config, cachedTools.map((tool) => tool.name), loaded.readyTimeout, loaded.retries, loaded.retryDelay]);
 		if (state.proxyKeys.get(entry.name) === key) continue;
 		state.proxyKeys.set(entry.name, key);
@@ -1226,17 +1296,19 @@ function registerProxies(pi: ExtensionAPI, state: AdapterState, loaded: AdapterL
 /** Re-read the config files and bring this session's registrations in line. */
 function sync(pi: ExtensionAPI, state: AdapterState, ctx: Pick<ExtensionContext, "cwd" | "isProjectTrusted">): AdapterLoadResult {
 	const loaded = loadAdapterServers({ cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted() });
+	const nativeNames = mcpJsonNames(ctx.cwd, ctx.isProjectTrusted());
+	for (const e of loaded.entries) e.shadowed = nativeNames.has(normalizeServerName(e.name));
 	state.report = loaded;
 	registerProxies(pi, state, loaded);
 
 	// With `startupWait: false` the servers must not join pi's startup connections (the first
 	// prompt waits for those, up to 10 seconds), so registering them waits for the first prompt.
-	if (!loaded.startupWait && !state.activated) return loaded;
+	if (loaded.startupWaitSource === 'config' && !loaded.startupWait && !state.activated) return loaded;
 	state.activated = true;
 
 	const wanted = new Map<string, AdapterEntry>();
 	for (const entry of loaded.entries) {
-		if (!entry.config) continue;
+		if (!entry.config || entry.shadowed) continue;
 		if (!wanted.has(entry.name)) wanted.set(entry.name, entry);
 	}
 
@@ -1281,13 +1353,11 @@ function describe(
 ): string[] {
 	const lines: string[] = [];
 	const shown = report.entries.length;
-	lines.push(`mcp-adapter: ${shown} server${shown === 1 ? "" : "s"} registered`);
+	lines.push(`mcp-adapter: ${shown} configured server${shown === 1 ? "" : "s"}`);
 	lines.push(
-		report.startupWait
-			? `startupWait: true (${report.startupWaitSource === "config" ? "from config" : "automatic: a server exposes direct tools"}) — the first prompt waits for the connections (max 10s)`
-			: `startupWait: false (${report.startupWaitSource === "config" ? "from config" : "default"}) — connects in the background once the first turn starts`,
+		report.startupWaitSource === 'config' && !report.startupWait ? 'Registration: deferred until first turn (startupWait: false)' : 'Registration: session start; Pi manages connections and tool discovery',
 	);
-	lines.push("mcp_usage: injected into the system prompt before every prompt (server capabilities and tool usage)");
+	lines.push('Compatibility layers are off unless enabled for an individual server.');
 	lines.push(`readyTimeout: ${report.readyTimeout}s — a call proxy waits this long for its server`);
 	lines.push(`retries: ${report.retries} on transient errors (backoff ${report.retryDelay}s → ${(report.retryDelay * 2).toFixed(0)}s → …)`);
 	for (const entry of report.entries) {
@@ -1309,6 +1379,8 @@ function describe(
 		lines.push(``);
 		lines.push(`${entry.name}  [${where}: ${location}]`);
 		lines.push(`  ${target}`);
+		const flags = COMPAT_KEYS.filter(k => entry.flags[k]);
+		if (flags.length) lines.push(`  compat: ${flags.join(', ')}${entry.shadowed ? ' (inactive: native override)' : ''}`);
 		lines.push(`  ${exposure}${config?.enabled === false ? "  (disabled)" : ""}${registered.has(entry.name) ? "" : "  (not registered)"}`);
 		lines.push(`  ${toolLine}`);
 		const proxy = proxies.get(entry.name);
@@ -1323,7 +1395,7 @@ function describe(
 		}
 		for (const note of entry.compat) lines.push(`  ~ ${note}`);
 		if (entry.error) lines.push(`  ! skipped: ${entry.error}`);
-		if (overridden.has(entry.name)) lines.push(`  ! overridden by an mcp.json entry of the same name (/mcp)`);
+		if (overridden.has(normalizeServerName(entry.name))) lines.push(`  ! overridden by an mcp.json entry of the same name (/mcp)`);
 	}
 	for (const error of report.errors) {
 		lines.push(``);
@@ -1346,10 +1418,12 @@ function describe(
  * stable guide costs one message.
  */
 export function buildMcpUsageGuide(report: AdapterLoadResult, pi?: ExtensionAPI): string[] {
+	const candidates = report.entries.filter(e => e.flags.usageGuide && !e.shadowed && e.config && e.config.enabled !== false);
+	if (!candidates.length) return [];
 	const lines: string[] = [];
 	const legacy = loadToolCache();
 	const own = loadOwnToolCache();
-	for (const entry of report.entries) {
+	for (const entry of candidates) {
 		const config = entry.config;
 		if (!config || config.enabled === false || (config.exposure ?? "codemode") === "hidden") continue;
 		const namespaces = namespaceNames(entry.name);
@@ -1365,7 +1439,7 @@ export function buildMcpUsageGuide(report: AdapterLoadResult, pi?: ExtensionAPI)
 			description: tool.description,
 			inputSchema: tool.parameters,
 		}));
-		const cached = mergeCachedTools(legacy.get(entry.name), own.get(entry.name), liveTools);
+		const cached = mergeCachedTools(legacy.get(entry.name), own.get(entry.name), liveTools).filter(t => effectiveToolExposure(config,t.name) !== 'hidden');
 		// Protocol-declared server-level text: namespace description and instructions (initialize).
 		const namespaceInfo = live.find((tool) => tool.namespace?.name !== undefined)?.namespace;
 		const summary = namespaceInfo?.description ?? config.description ?? "";
@@ -1374,7 +1448,7 @@ export function buildMcpUsageGuide(report: AdapterLoadResult, pi?: ExtensionAPI)
 		lines.push(`- ${entry.name}${summary ? ` — ${summary}` : ""}`);
 		if (instructions) lines.push(`  server instructions: ${instructions.replace(/\n+/g, " ")}`);
 		if (cached.length === 0) {
-			lines.push(`  tools: not listed yet; discover them with ${proxy} and tool="__list__"`);
+			lines.push(entry.flags.callProxy ? `  tools: not listed yet; discover them with ${proxy} and tool="__list__"` : '  tools: discover them with native MCP tool search once connected');
 		} else {
 			lines.push(`  tools (the server's own declarations — use exactly these parameters):`);
 			for (const tool of cached) {
@@ -1383,14 +1457,14 @@ export function buildMcpUsageGuide(report: AdapterLoadResult, pi?: ExtensionAPI)
 				if (params) lines.push(`      params: ${params}`);
 			}
 		}
-		lines.push(
+		if (entry.flags.callProxy) lines.push(
 			`  call proxy: ${proxy} with { "tool": <tool name>, "arguments": <args> } — works while the server connects; prefer the server's own tools once declared.`,
 		);
 	}
 	if (lines.length === 0) return [];
 	return [
 		`MCP servers are configured for this session. Their tools are first-class: when a task matches one, call it proactively instead of falling back to bash/read workarounds.`,
-		`Naming: a server's own tools are mcp__<server>__<tool>; mcp_call__<server> is only its call proxy ({ tool, arguments }) for calls while the server connects and for tool="__list__". The descriptions and params below are the servers' own declarations — follow them exactly and never invent tool names or parameter names.`,
+		`Naming: a server's native tools are mcp__<server>__<tool>. Follow the declared input schemas. Only use a compatibility proxy if explicitly listed below.`,
 		...lines,
 	];
 }
@@ -1452,6 +1526,10 @@ export default function mcpAdapterExtension(pi: ExtensionAPI) {
 	pi.on("tool_call", (event) => {
 		const toolName = event.toolName;
 		if (!toolName.startsWith("mcp__") && !toolName.startsWith("mcp_call__")) return;
+		const guarded = state.report.entries.filter(e => e.config && e.config.enabled !== false && !e.shadowed && e.flags.queryGuard);
+		if (!guarded.length) return;
+		const ns = pi.getAllTools().find(t => t.name === toolName)?.namespace?.name;
+		if (!guarded.some(e => (e.flags.callProxy && toolName === proxyToolName(e.name)) || (ns && namespaceNames(e.name).includes(ns)))) return;
 		const input: RawEntry = isRecord(event.input) ? event.input : {};
 		const nestedTool =
 			typeof input.tool === "string" ? input.tool : typeof input.tool_name === "string" ? input.tool_name : undefined;
@@ -1472,7 +1550,7 @@ export default function mcpAdapterExtension(pi: ExtensionAPI) {
 		};
 	});
 
-	// With `startupWait: false` (the default), the servers must not join pi's startup connections or
+	// With explicit `startupWait: false`, the servers must not join pi's startup connections or
 	// the first `before_agent_start`: pi only records the user message after that boundary, and pi 1.1
 	// waits for `direct` servers inside it — so registering there delayed the first message's display
 	// by seconds and let a second submit race the first one away. Register at the first `turn_start`

@@ -1,9 +1,7 @@
 /**
  * pi-image-gen — generate images with multimodal models configured in models.json
  *
- * The plugin claims the custom `imageGeneration` field in pi's models.json
- * (a field pi's schema does not use and passes through untouched) to mark
- * which models can generate images. See README.md for the convention.
+ * Prefer Pi's native image registry; keep imageGeneration transports for legacy models.
  *
  * Provides:
  *   - tool    `generate_image`  — model-callable image generation / editing
@@ -18,10 +16,10 @@ import {
 	type ResolvedAuth,
 	type SavedImage,
 	formatBytes,
-	generateImages,
-	loadImageModels,
 	selectModel,
 } from "./core.ts";
+
+import { catalog, generate, preferredBackend, type Choice } from './backend.ts';
 
 type ResultContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
@@ -56,18 +54,6 @@ async function resolveAuth(ctx: ExtensionContext, entry: ImageModelEntry): Promi
 	return auth;
 }
 
-function describeModels(entries: ImageModelEntry[]): string {
-	if (entries.length === 0) return "(no models marked with the \"imageGeneration\" field)";
-	return entries
-		.map((e) => {
-			const tags: string[] = [];
-			if (e.gen.default) tags.push("default");
-			if (e.gen.promptTemplate) tags.push("promptTemplate");
-			if ((e.gen.maxImages ?? 4) > 1) tags.push(`max ${e.gen.maxImages} images`);
-			return `${e.key}${tags.length ? ` [${tags.join(", ")}]` : ""}`;
-		})
-		.join(", ");
-}
 
 /* ------------------------------------------------------------------ */
 /* Tool                                                               */
@@ -126,22 +112,11 @@ function toResultContent(text: string, saved: SavedImage[], previewImages: numbe
 /* ------------------------------------------------------------------ */
 
 export default function imageGenExtension(pi: ExtensionAPI) {
-	// Must never throw: a malformed models.json should degrade the tool
-	// description, not break extension loading. Execute re-reads config anyway.
-	let modelList: string;
-	try {
-		modelList = describeModels(loadImageModels(process.cwd()));
-	} catch (error) {
-		modelList = `(models.json could not be read: ${error instanceof Error ? error.message : error})`;
-	}
-
 	pi.registerTool({
 		name: "generate_image",
 		label: "generate image",
 		description:
-			"Generate (or edit) images with a multimodal image-generation model configured in models.json " +
-			'(models marked with the custom "imageGeneration" field). The images are written to disk and their ' +
-			`paths are returned. Available image models: ${modelList}. ` +
+			"Generate or edit images with a Pi image model or a legacy imageGeneration model. Writes files and returns their paths. " +
 			'Use the "model" parameter ("provider/model-id") to pick one; omit it for the default model. ' +
 			"The first generated image is usually echoed back so you can inspect the result; use the read tool on the saved files for more.",
 		promptSnippet: "Generate or edit images with a configured image model; writes files and returns their paths.",
@@ -171,7 +146,7 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 				},
 			};
 
-			const result = await generateImages(options);
+			const result = await generate(ctx, options);
 			const previewImages = result.entry.gen.previewImages ?? 1;
 			const details: GenerateDetails = {
 				model: result.entry.key,
@@ -195,7 +170,7 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 							cacheRead: result.usage.cacheRead,
 							cacheWrite: result.usage.cacheWrite,
 							totalTokens: result.usage.totalTokens,
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							cost: result.usage.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 						}
 					: undefined,
 			};
@@ -287,9 +262,9 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 			if (tokens[0] === "list" || tokens[0] === "models") {
 				// Must never throw out of the handler: a malformed models.json
 				// degrades to an error notice, like the extension entry point.
-				let list: ImageModelEntry[];
+				let list: Choice[];
 				try {
-					list = loadImageModels(ctx.cwd);
+					list = await catalog(ctx);
 				} catch (error) {
 					const message = `models.json could not be read: ${error instanceof Error ? error.message : error}`;
 					if (ctx.hasUI) ctx.ui.notify(message, "error");
@@ -299,6 +274,7 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 				const lines = list.map((e) => {
 					const cfg = e.gen;
 					const parts = [
+						preferredBackend(e),
 						cfg.default ? "default" : null,
 						cfg.api && cfg.api !== "chat" ? `api=${cfg.api}` : null,
 						cfg.promptTemplate ? `promptTemplate=${JSON.stringify(cfg.promptTemplate)}` : null,
@@ -308,7 +284,7 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 				});
 				const message = lines.length
 					? `Image models:\n${lines.join("\n")}`
-					: 'No image models configured. Mark one in models.json with "imageGeneration": true.';
+					: 'No available Pi image model or legacy imageGeneration entry.';
 				if (ctx.hasUI) ctx.ui.notify(message, lines.length ? "info" : "warning");
 				else console.log(message);
 				return;
@@ -334,6 +310,7 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 			}
 
 			let prompt = promptParts.join(" ").trim();
+			let entries: Choice[] | undefined;
 
 			if (ctx.hasUI) {
 				// Interactive flow: prompt → model → size → count. A provided flag
@@ -346,15 +323,14 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 					}
 				}
 
-				let entries: ImageModelEntry[];
 				try {
-					entries = loadImageModels(ctx.cwd);
+					entries = await catalog(ctx);
 				} catch (error) {
 					notify(ctx, `models.json could not be read: ${error instanceof Error ? error.message : error}`, "error");
 					return;
 				}
 				if (entries.length === 0) {
-					notify(ctx, '没有配置生图模型。请在 models.json 里用 "imageGeneration": true 标记一个模型。', "warning");
+					notify(ctx, '没有可用的 Pi 图片模型或旧 imageGeneration 模型。请检查提供商凭据或模型配置。', "warning");
 					return;
 				}
 
@@ -374,7 +350,9 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 					}
 				}
 
-				if (!size) {
+				const selected = selectModel(entries, modelKey).entry as Choice | undefined;
+				if (!selected) { notify(ctx, `找不到图片模型：${modelKey}`, 'error'); return; }
+				if (!size && selected.legacy) {
 					const picked = await ctx.ui.select("选择尺寸", SIZE_CHOICES);
 					if (!picked) {
 						notify(ctx, "已取消", "info");
@@ -407,7 +385,7 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 
 			const progress = startProgress(ctx, `正在生成图片 · ${modelKey ?? "默认模型"}`);
 			try {
-				const result = await generateImages({
+				const result = await generate(ctx, {
 					prompt,
 					modelKey,
 					count,
@@ -417,7 +395,7 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 					signal: ctx.signal,
 					resolveAuth: (entry) => resolveAuth(ctx, entry),
 					onProgress: (message) => progress.setStage(message),
-				});
+				}, entries);
 				const summary = `${result.text}\n(共 ${formatBytes(result.saved.reduce((sum, img) => sum + img.bytes, 0))},耗时 ${progress.elapsed()})`;
 				notify(ctx, summary, "info");
 			} catch (error) {

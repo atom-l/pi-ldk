@@ -37,6 +37,26 @@ pi install git:github.com/atom-l/pi-ldk@main
 pi -e git:github.com/atom-l/pi-ldk
 ```
 
+## 从 0.14.x 升级：MCP 和图片配置
+
+**MCP：不用搬配置文件。** 原有全局/项目信任目录的 `mcp-adapter.json`、`directTools`、数组 `command` 和 `environment` 仍可用。新服务推荐直接写 Pi 的 `mcp.json`；同名原生条目优先（`-` 和 `_` 按同一命名空间处理）。默认由 Pi 在会话启动时连接并按需发现工具，不再自动注册代理、注入全量 `mcp_usage` 或拦截查询。显式的 `startupWait: false` 仍将注册延后到第一轮。
+
+**只有依赖旧增强行为才需要改配置**。例如旧脚本直接调用 `mcp_call__docs`，就在 **`mcp-adapter.json`** 的对应服务里加 `compat.callProxy`，不要把 `compat` 写入原生 `mcp.json`：
+
+```json
+{
+  "mcpServers": {
+    "docs": { "url": "https://example.com/mcp", "compat": { "callProxy": true } }
+  }
+}
+```
+
+`compat.usageGuide`（详细工具说明）和 `compat.queryGuard`（查询参数检查）也是独立的逐服务开关，默认关闭。代理默认不做外层重试；设了 `retries` 也仅对服务器明确标为只读且未标为破坏性的工具重试。原生传输自己的重试策略不变。修改适配器配置后执行 `/mcp-adapter reload`；修改原生配置后执行 `/reload`。
+
+**图片：`/imagine` 和 `generate_image` 都保留，不要求打开 Code Mode。** 用 `/imagine list` 查看可用模型和首选后端（`native` / `legacy`）。Pi registry 已提供且凭证可用的 `image` 模型不再需要 `imageGeneration: true`。现有自定义网关、`imageGeneration` 条目、`PI_IMAGE_GEN_MODEL`、默认输出目录及指定文件名的用法不变；无需改造现有 `models.json`。不会自动重写任何配置文件。
+
+相同的 `provider/model-id` 只列一次。默认尺寸、单张优先使用原生接口；若有旧自定义传输设置（如 endpoint、请求体、headers）则保留旧路径。Pi 1.6 的标准图片接口没有 size/count 参数：显式请求尺寸或多张时，需要同名兼容配置，否则在请求前提示，不会静默丢参数或暗中发起多次生成。原生模型报错不会再用旧后端重发。参考图、预览和落盘仍由两个入口共享。
+
 ## 只加载部分扩展
 
 在 PI settings 里可以用对象形式缩小本包加载的资源范围：

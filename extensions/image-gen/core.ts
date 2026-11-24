@@ -141,7 +141,7 @@ async function fetchDirect(urlStr: string, opts: RequestOptions): Promise<RawRes
 	const res = await fetch(urlStr, {
 		method: opts.method ?? "GET",
 		headers: opts.headers,
-		body: opts.body,
+		body: Buffer.isBuffer(opts.body) ? Uint8Array.from(opts.body) : opts.body,
 		signal: opts.signal,
 	});
 	const declared = Number(res.headers.get("content-length") ?? "");
@@ -367,7 +367,7 @@ const PROVIDER_SCALARS = ["name", "baseUrl", "apiKey", "api", "headers", "authHe
  * Load image-capable models from pi's models.json (and optional project
  * overlays). Later files override earlier ones per provider/model.
  */
-export function loadImageModels(cwd: string, env: NodeJS.ProcessEnv = process.env): ImageModelEntry[] {
+export function loadImageModels(cwd: string, env: NodeJS.ProcessEnv = process.env, disabled?: Set<string>): ImageModelEntry[] {
 	interface Accumulated {
 		scalars: Record<string, unknown>;
 		models: Map<string, Record<string, any>>;
@@ -408,11 +408,17 @@ export function loadImageModels(cwd: string, env: NodeJS.ProcessEnv = process.en
 	for (const [providerId, acc] of providers) {
 		const scalars = acc.scalars;
 		const providerGen = normalizeGen(scalars.imageGeneration);
+		for (const [id, override] of Object.entries(acc.modelOverrides)) {
+			if (override.imageGeneration === false) disabled?.add(`${providerId}/${id}`);
+		}
 		for (const [modelId, model] of acc.models) {
 			const override = acc.modelOverrides[modelId];
 			// An explicit `false` at model or override level opts out, even when
 			// the provider opts all of its models in.
-			if (model.imageGeneration === false || override?.imageGeneration === false) continue;
+			if (model.imageGeneration === false || override?.imageGeneration === false) {
+				disabled?.add(`${providerId}/${modelId}`);
+				continue;
+			}
 			const gen = mergeGen(mergeGen(providerGen, normalizeGen(model.imageGeneration)), normalizeGen(override?.imageGeneration));
 			if (!gen) continue;
 			const headers: Record<string, string> = {
@@ -458,8 +464,7 @@ export function selectModel(
 	if (entries.length === 0) {
 		return {
 			error:
-				"No image-generation models configured. Mark a model in models.json with the custom " +
-				'"imageGeneration" field (e.g. "imageGeneration": true). See pi-image-gen/README.md.',
+				"No available Pi image model or legacy imageGeneration model. Check /imagine list and provider credentials.",
 		};
 	}
 	const wanted = modelKey?.trim() || env.PI_IMAGE_GEN_MODEL?.trim();
@@ -530,7 +535,7 @@ export interface GenerateResult {
 	entry: ImageModelEntry;
 	saved: SavedImage[];
 	errors: string[];
-	usage?: UsageLike;
+	usage?: UsageLike & { cost?: import('@earendil-works/pi-ai').Usage['cost'] };
 	text: string;
 }
 
@@ -844,7 +849,7 @@ export async function resolveReferenceImage(ref: string, cwd: string): Promise<R
 /** 下载图片的响应大小上限(防超大/恶意图源 OOM)。 */
 const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
 
-async function downloadImage(url: string, signal?: AbortSignal): Promise<{ data: string; mimeType: string }> {
+export async function downloadImage(url: string, signal?: AbortSignal): Promise<{ data: string; mimeType: string }> {
 	const res = await httpRequest(url, { signal, maxBytes: MAX_DOWNLOAD_BYTES });
 	if (res.status < 200 || res.status >= 300) throw new Error(`failed to download ${url}: HTTP ${res.status}`);
 	const contentType = res.headers["content-type"]?.split(";")[0].trim();
@@ -956,12 +961,8 @@ export function formatBytes(bytes: number): string {
 /* High-level generation                                              */
 /* ------------------------------------------------------------------ */
 
-export async function generateImages(options: GenerateOptions): Promise<GenerateResult> {
+export async function generateLegacy(options: GenerateOptions, entry: ImageModelEntry): Promise<GenerateResult> {
 	const env = options.env ?? process.env;
-	const entries = loadImageModels(options.cwd, env);
-	const selection = selectModel(entries, options.modelKey, env);
-	if (!selection.entry) throw new Error(selection.error ?? "No image model available");
-	const entry = selection.entry;
 	const gen = entry.gen;
 	const api = generationApi(entry);
 
