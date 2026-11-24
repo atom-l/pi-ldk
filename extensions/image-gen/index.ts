@@ -20,6 +20,7 @@ import {
 } from "./core.ts";
 
 import { catalog, generate, preferredBackend, type Choice } from './backend.ts';
+import { imagineTokens } from './paths.ts';
 
 type ResultContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
@@ -258,7 +259,8 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 			"Generate images interactively: /imagine [prompt] — pickers ask for model, size, and count. " +
 			"Flags skip the matching picker (model=provider/id n=2 size=1024x1024 out=dir). /imagine list shows configured models.",
 		handler: async (args, ctx) => {
-			const tokens = args.trim().split(/\s+/).filter(Boolean);
+			let tokens: string[];
+			try { tokens = imagineTokens(args); } catch (error) { notify(ctx, String(error), 'error'); return; }
 			if (tokens[0] === "list" || tokens[0] === "models") {
 				// Must never throw out of the handler: a malformed models.json
 				// degrades to an error notice, like the extension entry point.

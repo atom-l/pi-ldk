@@ -19,13 +19,14 @@
  * override-level `false` opts the model out even when the provider opts in.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { resolveOutputDir, imageFileStem } from './paths.ts';
 import { readFileSync } from "node:fs";
-import { link, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, rm } from "node:fs/promises";
 import { request as nodeHttpRequest } from "node:http";
 import { request as nodeHttpsRequest } from "node:https";
 import { homedir } from "node:os";
-import { basename, extname, isAbsolute, join, resolve } from "node:path";
+import { extname, join, resolve } from "node:path";
 
 /* ------------------------------------------------------------------ */
 /* HTTP transport                                                      */
@@ -831,7 +832,7 @@ function timestamp(): string {
 export async function resolveReferenceImage(ref: string, cwd: string): Promise<ReferenceImage> {
 	if (/^data:/i.test(ref)) return { dataUri: ref };
 	if (/^https?:\/\//i.test(ref)) return { dataUri: ref }; // providers fetch URLs themselves
-	const path = isAbsolute(ref) ? ref : resolve(cwd, ref);
+	const path = resolve(cwd, ref);
 	const data = await readFile(path);
 	const mimeType =
 		{ ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif" }[
@@ -854,28 +855,39 @@ export async function downloadImage(url: string, signal?: AbortSignal): Promise<
 }
 
 /**
- * 原子地写入一个未被占用的目标路径:先写同目录随机名临时文件,再 link(原子
- * no-replace)落位到最终路径,成功后删临时文件。目标已存在(EEXIST)换下一个
- * 候选名重试。同时消除『写一半的文件』与检查→写入的 TOCTOU 竞态。
+ * Prefer atomic no-replace via hard link. On volumes without hard links, use
+ * exclusive creation instead: readers may see an in-progress file, but an
+ * existing image is never overwritten. Both paths use the same collision policy.
  */
-async function writeUniqueFile(dir: string, name: string, data: Buffer): Promise<string> {
+export async function writeUniqueFile(dir: string, name: string, data: Buffer, makeLink = link): Promise<string> {
 	const dot = name.lastIndexOf(".");
 	const stem = dot > 0 ? name.slice(0, dot) : name;
 	const ext = dot > 0 ? name.slice(dot) : "";
-	for (let i = 0; i < 100; i++) {
-		const candidate = join(dir, i === 0 ? name : `${stem}-${i + 1}${ext}`);
-		const tmp = `${candidate}.tmp-${Math.random().toString(36).slice(2, 10)}`;
-		try {
-			await writeFile(tmp, data, { flag: "wx" });
-			await link(tmp, candidate);
+	const tmp = join(dir, `.ldk-${randomUUID()}.tmp`);
+	const tmpFile = await open(tmp, 'wx');
+	try {
+		try { await tmpFile.writeFile(data); } finally { await tmpFile.close(); }
+		let supportsLinks = true;
+		for (let i = 0; i < 100; i++) {
+			const candidate = join(dir, i === 0 ? name : `${stem}-${i + 1}${ext}`);
+			if (supportsLinks) {
+				try { await makeLink(tmp, candidate); return candidate; }
+				catch (err) {
+					const code = (err as NodeJS.ErrnoException).code ?? '';
+					if (code === 'EEXIST') continue;
+					if (!['ENOTSUP','EOPNOTSUPP','ENOSYS','EPERM','EINVAL'].includes(code)) throw err;
+					supportsLinks = false; // e.g. exFAT: preserve exclusive creation, not atomic visibility
+				}
+			}
+			let file;
+			try { file = await open(candidate, 'wx'); }
+			catch (err) { if ((err as NodeJS.ErrnoException).code === 'EEXIST') continue; throw err; }
+			try { try { await file.writeFile(data); } finally { await file.close(); } }
+			catch (err) { await rm(candidate, {force:true}); throw err; }
 			return candidate;
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-		} finally {
-			await rm(tmp, { force: true });
 		}
-	}
-	throw new Error(`too many file name collisions for ${name} in ${dir}`);
+		throw new Error(`too many file name collisions for ${name} in ${dir}`);
+	} finally { await rm(tmp, {force:true}); }
 }
 
 export async function saveImages(
@@ -884,7 +896,7 @@ export async function saveImages(
 ): Promise<{ saved: SavedImage[]; errors: string[] }> {
 	const saved: SavedImage[] = [];
 	const errors: string[] = [];
-	const dir = isAbsolute(opts.outputDir) ? opts.outputDir : resolve(opts.cwd, opts.outputDir);
+	const dir = resolveOutputDir(opts.cwd, opts.outputDir);
 	await mkdir(dir, { recursive: true });
 
 	for (let i = 0; i < rawImages.length; i++) {
@@ -905,7 +917,7 @@ export async function saveImages(
 			let name: string;
 			if (opts.fileName) {
 				// basename() blocks path traversal out of the output directory.
-				const base = basename(opts.fileName).replace(/\.[a-z0-9]+$/i, "") || "image";
+				const base = imageFileStem(opts.fileName);
 				const suffix = rawImages.length > 1 ? `-${i + 1}` : "";
 				name = `${base}${suffix}.${ext}`;
 			} else {
@@ -969,13 +981,7 @@ export async function generateLegacy(options: GenerateOptions, entry: ImageModel
 	// A relative outputDir must stay under the working directory: refuse ".."
 	// segments so model-controlled paths cannot escape the workspace. Absolute
 	// paths are the documented way to write somewhere else.
-	const outputDir = options.outputDir ?? gen.outputDir ?? GEN_DEFAULTS.outputDir;
-	if (!isAbsolute(outputDir) && outputDir.split(/[\\/]/).includes("..")) {
-		throw new Error(
-			`Invalid outputDir "${outputDir}": relative paths must not contain ".." ` +
-				"(they must stay inside the working directory; use an absolute path to write elsewhere).",
-		);
-	}
+	const outputDir = resolveOutputDir(options.cwd, options.outputDir ?? gen.outputDir ?? GEN_DEFAULTS.outputDir);
 
 	onProgress(`Using ${entry.key} to generate ${count} image(s)...`);
 

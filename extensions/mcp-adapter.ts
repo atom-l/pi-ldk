@@ -875,11 +875,19 @@ function isRecord(value: unknown): value is RawEntry {
 /** Split a shell-style string into words, honoring simple quotes. */
 function splitArgs(value: string): string[] {
 	const words: string[] = [];
-	const pattern = /"([^"]*)"|'([^']*)'|(\S+)/g;
-	let match: RegExpExecArray | null;
-	while ((match = pattern.exec(value)) !== null) {
-		words.push(match[1] ?? match[2] ?? match[3] ?? "");
+	let word = '', quote = '', started = false;
+	for (const ch of value) {
+		if (quote) {
+			if (ch === quote) quote = ''; else word += ch;
+		} else if ((ch === '"' || ch === "'") && (!started || word.endsWith('='))) {
+			quote = ch; started = true;
+		} else if (/\s/.test(ch)) {
+			if (started) words.push(word);
+			word = ''; started = false;
+		} else { word += ch; started = true; } // Never consume Windows path backslashes.
 	}
+	if (quote) throw new Error('Unclosed quote in string args; use a JSON args array for literal quotes');
+	if (started) words.push(word);
 	return words;
 }
 

@@ -1,6 +1,6 @@
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { ImageApi, ImageModel, ImagesInputContent } from '@earendil-works/pi-ai';
-import { isAbsolute } from 'node:path';
+import { resolveOutputDir } from './paths.ts';
 import { applyPromptTemplate, downloadImage, formatBytes, generateLegacy, loadImageModels, resolveReferenceImage, saveImages, selectModel, type GenerateOptions, type GenerateResult, type ImageModelEntry, type RawImage } from './core.ts';
 
 export interface Choice extends ImageModelEntry { native?: ImageModel<ImageApi>; legacy: boolean }
@@ -52,8 +52,7 @@ export async function generate(ctx: ExtensionContext, opts: GenerateOptions, cho
   if (entry.legacy && (!model || customTransport(entry) || special)) return generateLegacy(opts,entry);
   if (!model) throw new Error(`Image model ${entry.key} is unavailable`);
   if (special) throw new Error('原生图片接口仅支持默认尺寸、一次单张；参考图需要支持图片输入的模型。若需自定义参数，请配置旧 imageGeneration 后端。');
-  const outputDir=opts.outputDir ?? entry.gen.outputDir ?? 'generated-images';
-  if (!isAbsolute(outputDir) && outputDir.split(/[\\/]/).includes('..')) throw new Error('Invalid outputDir: relative paths must not contain ".."');
+  const outputDir=resolveOutputDir(opts.cwd, opts.outputDir ?? entry.gen.outputDir ?? 'generated-images');
   const timeout=AbortSignal.timeout(entry.gen.timeoutMs ?? 300000);
   const signal=opts.signal ? AbortSignal.any([opts.signal,timeout]) : timeout;
   const input: ImagesInputContent[]=[{type:'text',text:applyPromptTemplate(entry.gen.promptTemplate,opts.prompt)}];
