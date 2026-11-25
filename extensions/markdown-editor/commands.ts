@@ -43,7 +43,7 @@ const BUILTINS_WITHOUT_ARGUMENTS = new Set([
  */
 export function isPiCommand(text: string, commands: readonly SlashCommandInfo[]): boolean {
 	const input = text.trim();
-	if (!input.startsWith("/") || /[\r\n]/.test(input)) return false;
+	if (!input.startsWith("/") || /[\r\n]/.test(text)) return false;
 	const match = /^\/([^\s]+)([\s\S]*)$/.exec(input);
 	if (!match) return false;
 	const [, name, rest] = match;

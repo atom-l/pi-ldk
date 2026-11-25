@@ -151,9 +151,9 @@ export function adapterConfigPaths(cwd: string): { global: string; project: stri
 
 /**
  * Exposure values including `codemode-deferred`: pi 0.99 defines it, pi 1.1 keeps it as an alias.
- * It is accepted in the config on both and passed through to pi as written.
+ * It is accepted as input and normalized before registration.
  */
-export type AdapterExposure = "codemode" | "codemode-deferred" | "deferred" | "direct" | "hidden";
+export type AdapterExposure = McpExposure | 'codemode-deferred';
 
 const EXPOSURES: readonly AdapterExposure[] = [
 	"codemode",
@@ -162,6 +162,11 @@ const EXPOSURES: readonly AdapterExposure[] = [
 	"direct",
 	"hidden",
 ];
+function parseExposure(value: unknown): McpExposure | undefined {
+	if (value === 'codemode-deferred') return 'codemode';
+	if (value === 'direct' || value === 'deferred' || value === 'hidden' || value === 'codemode') return value;
+	return undefined;
+}
 const NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 const HTTP_TYPES = new Set(["remote", "http", "https", "sse", "url", "streamable-http", "streamable_http"]);
 const STDIO_TYPES = new Set(["local", "stdio", "subprocess", "process", "command", "cli"]);
@@ -495,22 +500,22 @@ function patternMatches(pattern: string, value: string): boolean {
 }
 
 /** Exposure of one tool: its `toolExposure` entry (exact name wins, then the first pattern), else the server's. */
-export function effectiveToolExposure(config: McpServerConfig, toolName: string): AdapterExposure {
+export function effectiveToolExposure(config: McpServerConfig, toolName: string): McpExposure {
 	const overrides = config.toolExposure;
 	if (overrides) {
 		const exact = overrides[toolName];
-		if (exact) return exact as AdapterExposure;
+		if (exact) return exact;
 		for (const [pattern, exposure] of Object.entries(overrides)) {
 			if (!pattern.includes("*")) continue;
-			if (patternMatches(pattern, toolName)) return exposure as AdapterExposure;
+			if (patternMatches(pattern, toolName)) return exposure;
 		}
 	}
-	return (config.exposure ?? "codemode") as AdapterExposure;
+	return config.exposure ?? "codemode";
 }
 
-/** `codemode-deferred` tools are not listed in the codemode description; pi reaches them with tool_search. */
-function toToolExposure(exposure: string): ToolExposure {
-	return (exposure === "codemode-deferred" ? "deferred" : exposure) as ToolExposure;
+/** Match Pi's native MCP -> extension tool exposure mapping. */
+function toToolExposure(exposure: McpExposure): ToolExposure {
+	return exposure === "codemode" ? "deferred" : exposure;
 }
 
 export interface ProxyOptions {
@@ -903,12 +908,11 @@ function stringMap(value: unknown): Record<string, string> | undefined {
 }
 
 /** `exposure` wins; else `directTools: true` maps to direct exposure. */
-function resolveExposure(raw: RawEntry, compat: string[]): AdapterExposure | { error: string } | undefined {
+function resolveExposure(raw: RawEntry, compat: string[]): McpExposure | { error: string } | undefined {
 	const exposure = raw.exposure;
 	if (exposure !== undefined) {
-		if (typeof exposure === "string" && (EXPOSURES as readonly string[]).includes(exposure)) {
-			return exposure as AdapterExposure;
-		}
+		const canonical = parseExposure(exposure);
+		if (canonical) return canonical;
 		return { error: `invalid exposure "${String(exposure)}" (expected ${EXPOSURES.join(", ")})` };
 	}
 	if (typeof raw.directTools === "boolean") {
@@ -972,8 +976,8 @@ export function normalizeEntry(name: string, raw: unknown, source: string): Adap
 		// Fields shared by both transports.
 		const base: {
 			description?: string;
-			exposure?: AdapterExposure;
-			toolExposure?: Record<string, AdapterExposure>;
+			exposure?: McpExposure;
+			toolExposure?: Record<string, McpExposure>;
 			enabled?: boolean;
 			timeout?: number;
 		} = {};
@@ -994,10 +998,11 @@ export function normalizeEntry(name: string, raw: unknown, source: string): Adap
 		}
 		if (raw.toolExposure !== undefined) {
 			if (!isRecord(raw.toolExposure)) return entry({ error: "'toolExposure' must be an object" });
-			const toolExposure: Record<string, AdapterExposure> = {};
+			const toolExposure: Record<string, McpExposure> = {};
 			for (const [tool, value] of Object.entries(raw.toolExposure)) {
-				if (typeof value === "string" && (EXPOSURES as readonly string[]).includes(value)) {
-					toolExposure[tool] = value as AdapterExposure;
+				const canonical = parseExposure(value);
+				if (canonical) {
+					toolExposure[tool] = canonical;
 				} else {
 					compat.push(`toolExposure[${tool}]: ignored invalid exposure "${String(value)}"`);
 				}
@@ -1018,7 +1023,7 @@ export function normalizeEntry(name: string, raw: unknown, source: string): Adap
 				...(headers ? { headers } : {}),
 				...(oauth ? { oauth: oauth as never } : {}),
 				...base,
-			} as unknown as McpServerConfig;
+			} satisfies McpServerConfig;
 			return entry({ config });
 		}
 
@@ -1069,7 +1074,7 @@ export function normalizeEntry(name: string, raw: unknown, source: string): Adap
 			...(env ? { env } : {}),
 			...(typeof cwd === "string" ? { cwd } : {}),
 			...base,
-		} as unknown as McpServerConfig;
+		} satisfies McpServerConfig;
 		return entry({ config });
 	} catch (error) {
 		return entry({ error: error instanceof Error ? error.message : String(error) });

@@ -67,7 +67,12 @@ export default function markdownEditorExtension(pi: ExtensionAPI): void {
 				confirmed && enabled && activeEditor === editor &&
 				pendingConfirmation === pending && generation === pending.generation
 			) {
-				editor.confirmedSubmit();
+				if (ctx.ui.getEditorComponent() !== markdownFactory) return;
+				if (!editor.confirmedSubmit()) {
+					// Pi transfers the expanded draft when restoring the editor factory.
+					restoreNativeMode(ctx);
+					ctx.ui.notify('当前 Pi 不支持 Markdown 确认发送；未发送，草稿已保留在原编辑器。', 'warning');
+				}
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);

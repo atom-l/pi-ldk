@@ -175,20 +175,25 @@ export class MarkdownEditor extends CustomEditor {
 		super.handleInput(data);
 	}
 
-	/** Submit only after the extension's confirmation dialog accepts. */
-	confirmedSubmit(): void {
+	/** False means Pi changed its submission contract. Do not emulate it with Enter/onSubmit. */
+	confirmedSubmit(): boolean {
 		// This is the native submit operation (private in the current typings,
 		// but present at runtime). Unlike handleInput("\r"), it also submits
 		// text ending in a backslash instead of turning that into a newline.
-		const submit = (this as unknown as { submitValue: () => void }).submitValue;
+		const submit = Reflect.get(this, 'submitValue');
+		if (typeof submit !== 'function') return false;
 		submit.call(this);
+		return true;
 	}
 
 	override render(width: number): string[] {
 		const sourceLines = [...super.render(width)];
-		const sourceRows = (this as unknown as { renderedVisibleLineCount?: number }).renderedVisibleLineCount
-			?? Math.max(0, sourceLines.length - 2);
-		highlightMarkdownSourceLines(sourceLines, sourceRows);
+		const rows: unknown = Reflect.get(this, 'renderedVisibleLineCount');
+		// Do not guess from total height: borders, overflow notices and suggestions
+		// are native UI, not Markdown. Return the original layout if unsure.
+		if (typeof rows === 'number' && Number.isInteger(rows) && rows > 0 && rows <= sourceLines.length - 2) {
+			highlightMarkdownSourceLines(sourceLines, rows);
+		}
 		return sourceLines;
 	}
 }

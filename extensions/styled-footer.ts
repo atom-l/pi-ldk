@@ -12,12 +12,13 @@
  *   - footerData.getGitBranch() / getExtensionStatuses() / getAvailableProviderCount()
  *   - ctx.model / ctx.getContextUsage() / ctx.thinkingLevel / ctx.sessionManager.getEntries()
  *
- * 纯渲染层改动:不改变任何会话状态、`.pi` 解析、进程 cwd。渲染按条目数缓存,避免每帧全量扫描。
+ * 纯渲染层改动:不改变任何会话状态、`.pi` 解析、进程 cwd。渲染按当前叶节点缓存,避免每帧全量扫描。
  *
  * Loaded automatically from the package's pi.extensions. After editing, run /reload in pi.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Usage } from '@earendil-works/pi-ai';
+import type { ExtensionAPI, ExtensionContext, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 // ---------------------------------------------------------------------------
@@ -34,7 +35,7 @@ function formatTokens(count: number): string {
 }
 
 /** thinking 档位 → 主题色 token(每档独立配色,便于视觉区分)。 */
-function thinkingColor(level: string): string {
+function thinkingColor(level: string): ThemeColor {
 	switch (level) {
 		case "minimal":
 			return "thinkingMinimal";
@@ -66,7 +67,7 @@ function sanitize(text: string): string {
 
 /** 依扩展 key / 值给徽章挑一个前景色 token(theme.fg 接受的 token 名)。
  * 兼容两种输入:扩展状态 key(如 "workdir" / "image-gen")与状态文本前缀(如 "wd:...")。 */
-function badgeColor(key: string, text: string): string {
+function badgeColor(key: string, text: string): ThemeColor {
 	const k = key.toLowerCase();
 	const t = text.toLowerCase();
 	const hit = (prefix: string) => k.startsWith(prefix) || t.startsWith(prefix);
@@ -108,7 +109,7 @@ interface Stats {
 }
 
 interface StatsCache {
-	entryCount: number;
+	leafId: string | null;
 	stats: Stats;
 }
 
@@ -121,12 +122,9 @@ function costOf(usage: { cost?: unknown }): number {
 
 function computeStats(ctx: ExtensionContext): Stats {
 	const empty: Stats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, cacheHit: undefined };
-	const sm = ctx.sessionManager as { getEntries?: () => unknown[] };
-	if (typeof sm.getEntries !== "function") return empty;
 	let cacheHit: number | undefined;
-	for (const raw of sm.getEntries()) {
-		const entry = raw as { type?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: unknown }; message?: { role?: string; usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: unknown } } };
-		let u: typeof entry.usage | undefined;
+	for (const entry of ctx.sessionManager.getEntries()) {
+		let u: Usage | undefined;
 		if (entry.type === "usage" || entry.type === "branch_summary" || entry.type === "compaction") u = entry.usage;
 		else if (entry.type === "message" && (entry.message?.role === "assistant" || entry.message?.role === "toolResult")) u = entry.message?.usage;
 		if (!u) continue;
@@ -151,40 +149,26 @@ function computeStats(ctx: ExtensionContext): Stats {
 export default function (pi: ExtensionAPI): void {
 	/** 最近一次事件的 ctx:底栏渲染需读 model / 用量,但 setFooter 的 factory 不带 ctx。 */
 	let latestCtx: ExtensionContext | undefined;
-	/** 用量缓存(按条目数),避免每帧重扫全会话。 */
+	/** 用量缓存(按当前叶节点),避免每帧重扫全会话。 */
 	let cache: StatsCache | undefined;
 	/** 是否已接管底栏(避免重复 setFooter)。 */
 	let installed = false;
 
 	function statsFor(ctx: ExtensionContext): Stats {
-		const count = (ctx.sessionManager as { getEntryCount?: () => number }).getEntryCount?.() ?? 0;
-		if (cache && cache.entryCount === count) return cache.stats;
+		const leafId = ctx.sessionManager.getLeafId();
+		if (cache && cache.leafId === leafId) return cache.stats;
 		const stats = computeStats(ctx);
-		cache = { entryCount: count, stats };
+		cache = { leafId, stats };
 		return stats;
 	}
 
 	function installFooter(ctx: ExtensionContext): void {
 		if (installed) return;
-		const ui = ctx.ui as { setFooter?: (factory: unknown) => void };
-		if (typeof ui.setFooter !== "function") return;
 		if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
 		installed = true;
 
-		ui.setFooter(
-			(
-				_tui: unknown,
-				theme: {
-					fg(color: string, text: string): string;
-					bold(text: string): string;
-					italic(text: string): string;
-				},
-				footerData: {
-					getGitBranch(): string | null;
-					getExtensionStatuses(): ReadonlyMap<string, string>;
-					getAvailableProviderCount(): number;
-				},
-			) => {
+		ctx.ui.setFooter(
+			(_tui, theme, footerData) => {
 				const dim = (s: string) => theme.fg("dim", s);
 
 				// -- 第 1 行:位置(路径 · 分支 · 会话名) ------------------------
@@ -193,7 +177,7 @@ export default function (pi: ExtensionAPI): void {
 					const parts: string[] = [theme.fg("syntaxVariable", cwd)];
 					const branch = footerData.getGitBranch();
 					if (branch) parts.push(theme.fg("accent", `⎇ ${branch}`));
-					const name = (latestCtx?.sessionManager as { getSessionName?: () => string })?.getSessionName?.();
+					const name = latestCtx?.sessionManager.getSessionName();
 					if (name) parts.push(theme.fg("syntaxString", `▸ ${name}`));
 					return truncateToWidth(parts.join(dim(" · ")), width, dim("…"));
 				}
@@ -308,7 +292,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_shutdown", (_event, ctx) => {
 		// 还原默认底栏,避免残留自定义组件。
 		try {
-			(ctx?.ui as { setFooter?: (f: undefined) => void })?.setFooter?.(undefined);
+			ctx.ui.setFooter(undefined);
 		} catch {
 			/* 忽略 */
 		}
