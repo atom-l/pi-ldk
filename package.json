@@ -1,7 +1,7 @@
 {
   "name": "ldk",
-  "version": "0.16.0",
-  "description": "LDK — a PI package bundling custom extensions (session commands, model attribution, MCP adapter, image generation, embedded terminal, session working directory, styled footer, session agents).",
+  "version": "0.17.0",
+  "description": "LDK — a PI package bundling custom extensions (session commands, model attribution, MCP adapter, image generation, embedded terminal, session working directory, styled footer, session agents, named flows and actions).",
   "keywords": [
     "pi-package"
   ],
@@ -19,6 +19,7 @@
       "./extensions/sessions.ts",
       "./extensions/image-gen",
       "./extensions/session-agents",
+      "./extensions/flow",
       "./extensions/terminal",
       "./extensions/markdown-editor",
       "./extensions/workdir.ts",

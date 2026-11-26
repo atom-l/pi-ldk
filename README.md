@@ -10,6 +10,7 @@
 | 模型归属 | `extensions/model-attribution.ts` | 给历史中的助手回复打上生成它的 provider/model 标签，避免中途切换模型时把早前的回复误认成自己的。 |
 | MCP 适配器 | `extensions/mcp-adapter.ts` | 从 `.pi/mcp-adapter.json` 和 `~/.pi/agent/mcp-adapter.json` 读取 MCP server 配置并注册给 PI;`/mcp-adapter [list\|reload]` 查看状态或重新读取配置。 |
 | 图片生成 | `extensions/image-gen/` | `generate_image` 工具、`/imagine` 命令及图片模型处理逻辑。`/imagine [prompt]` 弹选 model/size/数量;`model=provider/id`、`n=2`、`size=1024x1024`、`out=dir`(相对路径不可含 `..`,需写到别处时用绝对路径)跳过对应选择器;`/imagine list`(或 `models`)列出已配置模型。 |
+| Flow 固定流程 | `extensions/flow/` | `/flow`、`/action` 或模型工具编辑定义，按命名端口、分支、并行阈值和人工关口运行。见 [Flow 使用与设计](extensions/flow/GUIDE.md)。 |
 | 子会话工作台 | `extensions/session-agents/` | 角色 agent + 子会话(公共桌面)+ 经验记忆的大型任务拆分框架,详见[子会话工作台](#子会话工作台)。 |
 | 嵌入终端 | `extensions/terminal/` | 会话内呼出终端执行命令,可折叠(进程继续运行)或销毁(终止进程组),详见[嵌入终端](#嵌入终端)。 |
 | 循环保护 | `extensions/loop-guard/` | 检测无进展的工具周期和流式复读；引导无效时暂停，详见[循环保护](#循环保护)。 |
@@ -92,6 +93,10 @@ MCP 代理在等待连接或重试期间被移除、覆盖或替换时，尚未�
 ```bash
 pi --extension ./pi-ldk/extensions/session-agents
 ```
+
+## Flow 固定流程
+
+Flow 用于重复执行一套约定的步骤，例如依赖升级后的兼容性检查。输入 `/flow new 兼容性检查` 打开有起点和终点的 JSON 草稿；`/action` 编辑可跨 Flow 复用的全局 Action。也可以让模型先读 `flow_guide`，再用 `flow_define` 制定流程、`flow_run` 执行、`flow_status` 查看某次运行。编辑与运行是两件事，保存不会触发执行。完整定义格式、可运行的并行示例、收束和中断语义见 [Flow 使用与设计](extensions/flow/GUIDE.md)。
 
 ## 子会话工作台
 
