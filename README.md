@@ -11,6 +11,7 @@
 | MCP 适配器 | `extensions/mcp-adapter.ts` | 从 `.pi/mcp-adapter.json` 和 `~/.pi/agent/mcp-adapter.json` 读取 MCP server 配置并注册给 PI;`/mcp-adapter [list\|reload]` 查看状态或重新读取配置。 |
 | 图片生成 | `extensions/image-gen/` | `generate_image` 工具、`/imagine` 命令及图片模型处理逻辑。`/imagine [prompt]` 弹选 model/size/数量;`model=provider/id`、`n=2`、`size=1024x1024`、`out=dir`(相对路径不可含 `..`,需写到别处时用绝对路径)跳过对应选择器;`/imagine list`(或 `models`)列出已配置模型。 |
 | Flow 固定流程 | `extensions/flow/` | `/flow`、`/action` 或模型工具编辑定义，按命名端口、分支、并行阈值和人工关口运行。见 [Flow 固定流程](#flow-固定流程)。 |
+| 答题卡 | `extensions/reply-form/` | 模型用 `ask_form` 在输入区逐题提问，支持单选、多选、填空、回改和提交前预览。见[答题卡](#答题卡)。 |
 | 子会话工作台 | `extensions/session-agents/` | 角色 agent + 子会话(公共桌面)+ 经验记忆的大型任务拆分框架,详见[子会话工作台](#子会话工作台)。 |
 | 嵌入终端 | `extensions/terminal/` | 会话内呼出终端执行命令,可折叠(进程继续运行)或销毁(终止进程组),详见[嵌入终端](#嵌入终端)。 |
 | 循环保护 | `extensions/loop-guard/` | 检测无进展的工具周期和流式复读；引导无效时暂停，详见[循环保护](#循环保护)。 |
@@ -187,6 +188,24 @@ Flow 固定的是步骤、数据接口和激活条件。比如一次依赖兼容
 - 此版是有向无环图，不提供任意回跳。并行区域采用显式配对的 `fork → worker → join`；单个 worker 支持普通步骤链，不支持在一组 worker 内再嵌套 fork、跨组接线或从分支中提前 end。编辑时应明确报错，不以等待代替校验。普通步骤仍支持多入多出，互斥条件重新汇合不需要并行 `join`。
 
 <!-- ldk:flow-guide:end -->
+
+## 答题卡
+
+当模型需要你澄清需求或做决策时，可以用 `ask_form` 一次列出相关问题。例如告诉它：「把发布范围、要开启的功能和备注做成答题卡。」在 Pi 的交互终端里，答题卡会临时出现在输入区，每页一题；不需要逐条复制题干。它不是靠识别问号触发的：模型直接用普通消息提问时，原输入框不会被替换。你也可以直接告诉模型「这次我手写」。
+
+| 操作 | 按键 |
+|---|---|
+| 单选或多选 | `↑` / `↓` 移动，`空格` 选择或切换勾选，`退格` 清空；移动光标不算选择 |
+| 填空 | 直接输入或粘贴，`Enter` 换行 |
+| 翻题或回改 | `Tab` 下一题，`Shift+Tab` 上一题；最后一题的 `Tab` 进入预览 |
+| 查看整份回答 | `Ctrl+P` 预览，`↑` / `↓` 或 `PgUp` / `PgDn` 滚动；`Shift+Tab` 回到题目修改 |
+| 重新作答 | `Ctrl+R`，再按 `Y` 清除本次修改并恢复各题默认值；`N` 保留 |
+| 提交 | 在预览页按 `Enter` 进入确认，再按 `Y` 才发送；`N` 回预览。连按 `Enter` 不会提交 |
+| 改为手写 | 任意页面按 `Esc`。回到原输入框，原草稿保留；未确认的表单答案不会提交 |
+
+题目可有默认值，直接翻页即可沿用；选填题可以留空，必答题没有答案时会提示。预览会标明哪些是默认值、哪些是你填写的。确认提交后，模型收到预览中的答复并继续工作。**已提交的回答会进入会话历史**，不要用它填写密码或密钥。print、JSON、RPC 等非 TUI 模式不弹终端控件，改由模型列出问题，等待书面回复。
+
+实现复用 Pi 官方 `questionnaire.ts` 示例采用的 `ctx.ui.custom()` 输入区和 `pi-tui` 文本编辑器，而不是改写全局编辑器。分题草稿参考 [Codex 的底部答题面板](https://github.com/openai/codex/blob/8727186a0a0e097f5e4496ba830f5d59c235b88c/codex-rs/tui/src/bottom_pane/request_user_input/mod.rs)，多选及取消与已答的区分参考 [OpenCode 的 question 工具](https://github.com/sst/opencode/blob/314842df119544845441fe6f7a3dec0bba857624/packages/core/src/tool/plugin/question.ts)。LDK 不采用最后一题直接发送的行为，而是固定经过预览和确认。
 
 ## 子会话工作台
 
