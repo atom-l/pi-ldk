@@ -43,7 +43,7 @@ import type {
 	Theme,
 } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { Api, AssistantMessage, Message, Model, Tool, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Api, type AssistantMessage, type Message, type Model, type ModelThinkingLevel, type Tool, type ToolResultMessage, type Usage } from "@earendil-works/pi-ai";
 import { matchesKey, Text, truncateToWidth, wrapTextWithAnsi, type Component, type Focusable } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { InsightStore, INSIGHT_KINDS, tokenize, type InsightKind, type InsightRecord } from "./insights.ts";
@@ -211,11 +211,18 @@ function workModeSection(mode: WorkMode): string {
 // 类型
 // ---------------------------------------------------------------------------
 
+type RoleThinkingLevel = ModelThinkingLevel | "default";
+const roleThinkingParam = Type.Optional(Type.String({
+	description: 'A level listed for the selected model in agent_list, or "default" for no role override. Choose for delivery quality first; avoid unnecessary deliberation, not expense.',
+}));
+
 interface RoleConfig {
 	name: string;
 	description: string;
 	/** "provider/model-id" */
 	model: string;
+	/** Old session entries omit this; "default" explicitly clears an override on replay. */
+	thinkingLevel?: RoleThinkingLevel;
 	/** 角色的固定上下文:知识、视角、行为准则。 */
 	systemPrompt: string;
 	/** 可调用的会话工具;空 = 仅能使用子会话桌面工具。 */
@@ -561,7 +568,7 @@ function formatModelCard(model: Model<Api>, capsMap: Map<string, Capabilities> =
 	if (model.name && model.name !== model.id) bits.push(model.name);
 	const inputs = (model.input ?? []).join("+");
 	if (inputs) bits.push(inputs);
-	if (model.reasoning) bits.push("reasoning");
+	bits.push(`thinking: ${getSupportedThinkingLevels(model).join("/") || "(none)"}`);
 	if (model.contextWindow) bits.push(`ctx ${model.contextWindow.toLocaleString("en-US")}`);
 	if (model.maxTokens) bits.push(`out ${model.maxTokens.toLocaleString("en-US")}`);
 	const cost = model.cost as { input?: number; output?: number } | undefined;
@@ -590,7 +597,7 @@ function modelsMenuSection(ctx: {
 		"给角色选底层模型(agent_create 的 model、subsession_create 的 synthesisModel)时参考的模型菜单。",
 		`能力评分 1-100,来自 models.json 各模型的 capabilities,数值越高越强;默认维度:${DEFAULT_CAPABILITY_DIMS.join("、")},`,
 		"维度名可由用户自由扩展;标注「(未配置)」表示该模型尚未评分,完整清单与实时定价用 agent_list(includeModels)查询。",
-		"选型经验:勘察 / 批量读文件的角色优先「速度」;写代码 / 评审看「代码能力」;任务拆解与最终合成看「任务规划能力」与「通用知识与推理」。",
+		"角色选模和 thinkingLevel 以交付质量为先,不是为了省钱。按该模型列出的档位选择:歧义大、后果重大或验证困难时用更充分的推理;任务明确且容易核验时避免不必要的过度思考,在不损害质量的前提下节省时间。",
 		...ordered.map((m) => `- ${formatModelCard(m, capsMap)}`),
 	].join("\n");
 }
@@ -941,6 +948,20 @@ export default function (pi: ExtensionAPI) {
 		return { error: `Model "${wanted}" not found. Use agent_list to see available "provider/model-id" values.` };
 	}
 
+	/** Resolve the pair together: an explicit level must never move to another model by accident. */
+	function resolveRoleModel(ctx: ExtensionContext, spec: string, requested = "default", allowLegacyFallback = false):
+		| { model: Model<Api>; thinkingLevel: RoleThinkingLevel }
+		| { error: string } {
+		const resolved = resolveModel(ctx, spec);
+		const model = resolved.model ?? (allowLegacyFallback && requested === "default" ? ctx.model : undefined);
+		if (!model) return { error: resolved.error ?? "No model available." };
+		if (requested === "default") return { model, thinkingLevel: "default" };
+		const levels = getSupportedThinkingLevels(model);
+		const level = levels.find((candidate) => candidate === requested);
+		if (!level) return { error: `Unsupported thinkingLevel "${requested}" for ${model.provider}/${model.id}. Supported: ${levels.join(", ") || "(none)"}; use "default" for no override.` };
+		return { model, thinkingLevel: level };
+	}
+
 	function formatModelList(ctx: ExtensionContext): string[] {
 		const capsMap = loadCapabilities();
 		return ctx.modelRegistry
@@ -989,6 +1010,7 @@ export default function (pi: ExtensionAPI) {
 
 	interface TurnOptions {
 		model: Model<Api>;
+		thinkingLevel: RoleThinkingLevel;
 		systemPrompt: string;
 		instruction: string;
 		toolNames: string[];
@@ -1037,11 +1059,14 @@ export default function (pi: ExtensionAPI) {
 			turns = turn;
 			let response: AssistantMessage;
 			try {
-				response = await ctx.modelRegistry.complete(
-					opts.model,
-					{ systemPrompt: opts.systemPrompt, messages, tools: toolDefs },
-					{ signal },
-				);
+				const context = { systemPrompt: opts.systemPrompt, messages, tools: toolDefs };
+				// Keep legacy calls untouched. Explicit levels use Pi's provider-neutral adapter;
+				// undefined on the simple path is how Pi requests the model's off mapping.
+				response = opts.thinkingLevel === "default"
+					? await ctx.modelRegistry.complete(opts.model, context, { signal })
+					: await ctx.modelRegistry.streamSimple(opts.model, context, {
+						signal, reasoning: opts.thinkingLevel === "off" ? undefined : opts.thinkingLevel,
+					}).result();
 			} catch (error) {
 				stopReason = "error";
 				errorMessage = error instanceof Error ? error.message : String(error);
@@ -1353,10 +1378,12 @@ export default function (pi: ExtensionAPI) {
 					steps: [],
 				});
 				try {
+					const target = resolveRoleModel(ctx, role.config.model, role.config.thinkingLevel, true);
+					if ("error" in target) throw new Error(target.error);
 					const systemPrompt = buildTurnPrompt(role, sub0, assignment);
 					const turn = await runTurn(
 						{
-							model: optsModel(ctx, role.config.model),
+							...target,
 							systemPrompt,
 							instruction,
 							toolNames: [...role.config.tools, "desk_update"],
@@ -1549,10 +1576,10 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Split large tasks by creating a sub-session (subsession_create) whose context space holds the task context, then assign role agents to it — do not dispatch tasks straight to agents.",
 			"Roles carry fixed context (knowledge, perspective) and a chosen model; reuse roles across sub-sessions and discard what is no longer needed.",
-			"Pick each role's model by the capability scores shown in the model menu (<session_agents_models>) or agent_list: fast cheap models for recon and batch reading, strong models for reasoning, coding, judgment, and synthesis.",
+			"Pick each role's model by the capability scores shown in the model menu (<session_agents_models>) or agent_list: prioritize delivery quality, choosing sufficient reasoning for uncertainty and risk. Prefer a quicker supported level only when further deliberation adds little value; do not lower effort to save money.",
 			"When a sub-session finishes, keep both the result and the extra info; recall them later with insight_recall when related work comes up.",
 		],
-		description: `Create a reusable role agent: a persona with its own fixed context (knowledge, viewpoint, working style) and its own underlying model. Roles do not receive tasks directly — assign them to a sub-session (subsession_create / subsession_run), where they collaborate on a shared desk. Give each role a narrow, opinionated system prompt and a model that fits its job (cheap fast models for recon, strong models for judgment).`,
+		description: `Create a reusable role agent: a persona with its own fixed context (knowledge, viewpoint, working style) and its own underlying model. Roles do not receive tasks directly — assign them to a sub-session (subsession_create / subsession_run), where they collaborate on a shared desk. Give each role a narrow, opinionated system prompt and a model that fits its job and select a thinkingLevel offered by that model when the task calls for it.`,
 		parameters: Type.Object({
 			name: Type.String({ description: 'Unique role name, e.g. "explorer", "reviewer", "architect".' }),
 			description: Type.String({ description: "One-line description of the role's purpose and angle." }),
@@ -1565,6 +1592,7 @@ export default function (pi: ExtensionAPI) {
 						'Model "provider/model-id" for this role, picked by the capability scores in the model menu / agent_list. Omit for the session model.',
 				}),
 			),
+			thinkingLevel: roleThinkingParam,
 			context: Type.Optional(Type.String({ description: "Extra fixed context for the role (reference material, conventions)." })),
 			tools: Type.Optional(
 				Type.Array(Type.String(), {
@@ -1580,8 +1608,8 @@ export default function (pi: ExtensionAPI) {
 			if (roles.has(name)) {
 				return fail(`Role "${name}" already exists. Use agent_update to change it or pick another name.`, { action: "agent_create" });
 			}
-			const resolved = resolveModel(ctx, params.model ?? "");
-			if (!resolved.model) return fail(resolved.error ?? "model resolution failed", { action: "agent_create" });
+			const resolved = resolveRoleModel(ctx, params.model ?? "", params.thinkingLevel);
+			if ("error" in resolved) return fail(resolved.error, { action: "agent_create" });
 			const toolNames = (params.tools ?? []).map((tool) => tool.trim()).filter(Boolean);
 			const { error: toolError } = resolveTools(ctx, toolNames);
 			if (toolError) return fail(toolError, { action: "agent_create" });
@@ -1591,6 +1619,7 @@ export default function (pi: ExtensionAPI) {
 					name,
 					description: params.description.trim(),
 					model: `${resolved.model.provider}/${resolved.model.id}`,
+					thinkingLevel: resolved.thinkingLevel,
 					systemPrompt: params.systemPrompt,
 					tools: toolNames,
 					maxTurns: Math.max(1, Math.min(MAX_TURNS_CAP, Math.round(params.maxTurns ?? DEFAULT_MAX_TURNS))),
@@ -1604,7 +1633,7 @@ export default function (pi: ExtensionAPI) {
 			roles.set(name, role);
 			persist({ op: "role_create", role });
 			return ok(
-				`Created role "${name}" (model ${role.config.model}, tools: ${toolNames.join(", ") || "none"}, maxTurns ${role.config.maxTurns}). Assign it to a sub-session to give it work.`,
+				`Created role "${name}" (model ${role.config.model}, thinking ${role.config.thinkingLevel}, tools: ${toolNames.join(", ") || "none"}, maxTurns ${role.config.maxTurns}). Assign it to a sub-session to give it work.`,
 				{ action: "agent_create", role: summarizeRole(role) },
 			);
 		},
@@ -1615,11 +1644,12 @@ export default function (pi: ExtensionAPI) {
 		prepareLoadout: modeLoadout,
 		label: "Role: update",
 		namespace: roleNamespace,
-		description: `Change a role agent: model, system prompt (fixed context), tool access, maxTurns, or append additional fixed context. Only the fields you pass change.`,
+		description: `Change a role agent: model, thinkingLevel (set "default" to clear), system prompt (fixed context), tool access, maxTurns, or append additional fixed context. Only the fields you pass change.`,
 		parameters: Type.Object({
 			name: Type.String({ description: "Existing role name." }),
 			description: Type.Optional(Type.String({ description: "New one-line description." })),
 			model: Type.Optional(Type.String({ description: 'New model "provider/model-id" (capability scores in agent_list).' })),
+			thinkingLevel: roleThinkingParam,
 			systemPrompt: Type.Optional(Type.String({ description: "Replacement fixed context / system prompt." })),
 			appendContext: Type.Optional(Type.String({ description: "Additional fixed context appended to the role." })),
 			tools: Type.Optional(Type.Array(Type.String(), { description: "Replacement tool list; [] removes tool access." })),
@@ -1641,16 +1671,17 @@ export default function (pi: ExtensionAPI) {
 				patch.tools = toolNames;
 			}
 			if (params.maxTurns !== undefined) patch.maxTurns = Math.max(1, Math.min(MAX_TURNS_CAP, Math.round(params.maxTurns)));
-			if (params.model !== undefined) {
-				const resolved = resolveModel(ctx, params.model);
-				if (!resolved.model) return fail(resolved.error ?? "model resolution failed", { action: "agent_update" });
+			if (params.model !== undefined || params.thinkingLevel !== undefined) {
+				const resolved = resolveRoleModel(ctx, params.model ?? role.config.model, params.thinkingLevel ?? role.config.thinkingLevel);
+				if ("error" in resolved) return fail(resolved.error, { action: "agent_update" });
 				patch.model = `${resolved.model.provider}/${resolved.model.id}`;
+				patch.thinkingLevel = resolved.thinkingLevel;
 			}
 			role.config = { ...role.config, ...patch, name: role.config.name };
 			if (params.appendContext?.trim()) role.contexts.push(params.appendContext.trim());
 			role.updatedAt = Date.now();
 			persist({ op: "role_update", name: role.config.name, patch, appendContext: params.appendContext?.trim() || undefined });
-			return ok(`Updated role "${role.config.name}". Now: model ${role.config.model}, tools: ${role.config.tools.join(", ") || "none"}, maxTurns ${role.config.maxTurns}.`, {
+			return ok(`Updated role "${role.config.name}". Now: model ${role.config.model}, thinking ${role.config.thinkingLevel ?? "default"}, tools: ${role.config.tools.join(", ") || "none"}, maxTurns ${role.config.maxTurns}.`, {
 				action: "agent_update",
 				role: summarizeRole(role),
 			});
@@ -1676,7 +1707,7 @@ export default function (pi: ExtensionAPI) {
 			lines.push(`Roles: ${roles.size}`);
 			for (const role of roles.values()) {
 				lines.push(
-					`  - ${role.config.name} · model ${role.config.model} · tools: ${role.config.tools.join(", ") || "none"} · maxTurns ${role.config.maxTurns} · ${formatUsage(role.usage)}`,
+					`  - ${role.config.name} · model ${role.config.model} · thinking ${role.config.thinkingLevel ?? "default"} · tools: ${role.config.tools.join(", ") || "none"} · maxTurns ${role.config.maxTurns} · ${formatUsage(role.usage)}`,
 				);
 				lines.push(`      ${role.config.description}`);
 			}
@@ -2439,6 +2470,7 @@ export default function (pi: ExtensionAPI) {
 			name: role.config.name,
 			description: role.config.description,
 			model: role.config.model,
+			thinkingLevel: role.config.thinkingLevel ?? "default",
 			tools: role.config.tools,
 			maxTurns: role.config.maxTurns,
 			contextChunks: role.contexts.length,
