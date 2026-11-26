@@ -213,7 +213,7 @@ export default function (pi: ExtensionAPI): void {
 
 					// 右侧:model · thinking(多 provider 时前置 provider)
 					const model = ctx?.model;
-					let right = model ? theme.fg("thinkingMedium", model.id) : dim("no-model");
+					let right = model ? theme.fg("thinkingMedium", sanitize(model.name ?? "") || model.id) : dim("no-model");
 					const thinking = ctx?.thinkingLevel;
 					if (model?.reasoning) {
 						right += dim(" · ") + (thinking && thinking !== "off" ? theme.fg(thinkingColor(thinking), thinking) : dim("thinking off"));
