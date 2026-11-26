@@ -14,6 +14,17 @@ const text = (value: unknown) => ({
 	details: {},
 });
 const err = (e: unknown) => (e instanceof Error ? e.message : String(e));
+export function extractFlowGuide(markdown: string): string {
+	const marks = [...markdown.matchAll(/^<!-- ldk:flow-guide:(start|end) -->\r?$/gm)];
+	const [start, end] = marks;
+	if (marks.length !== 2 || start[1] !== 'start' || end[1] !== 'end') {
+		throw new Error('Invalid Flow guide markers in the LDK package README.md.');
+	}
+	const guide = markdown.slice(start.index + start[0].length, end.index).trim();
+	if (!guide) throw new Error('Empty Flow guide in the LDK package README.md.');
+	return guide;
+}
+
 function starter(kind: Kind, name: string): Action | Flow {
 	if (kind === 'action') return { extends: 'builtin:action', template: '将 in 消息原样返回到 out 端口。' };
 	return {
@@ -71,7 +82,7 @@ export default function flowExtension(pi: ExtensionAPI) {
 		description:
 			'Get the Flow/Action authoring contract, builtin port defaults, typed messages, fork/join policies and a runnable example. Read before authoring a new graph.',
 		parameters: Type.Object({}),
-		execute: async () => text(readFileSync(new URL('./GUIDE.md', import.meta.url), 'utf8')),
+		execute: async () => text(extractFlowGuide(readFileSync(new URL('../../README.md', import.meta.url), 'utf8'))),
 	});
 	pi.registerTool({
 		name: 'flow_inspect',
