@@ -8,6 +8,18 @@ const MAX_TURNS = 12;
 const MAX_CALLS = 32;
 const MAX_BYTES = 8 * 1024 * 1024; // cumulative serialized prompt, schemas, replies and tool messages
 
+// Diagnostic only. Use fixed labels, never model text or a JSON.parse error (which can quote it).
+function describeParseFailure(text: string): string {
+	const start = text.search(/[^ \t\r\n]/); // Skip only JSON whitespace.
+	let preview = 'other';
+	if (start === -1) preview = 'none';
+	else if (text.startsWith('```', start) || text.startsWith('~~~', start)) preview = 'code-fence';
+	else if (text[start] === '{') preview = 'object-start';
+	else if (text[start] === '[') preview = 'array-start';
+	else if (text[start] === '"') preview = 'string-start';
+	return `${start === -1 ? 'empty' : 'invalid'}; bytes=${Buffer.byteLength(text, 'utf8')}; preview=${preview}`;
+}
+
 function hasToolHost(ctx: ExtensionContext): ctx is ExtensionToolContext {
 	return 'executeTool' in ctx && typeof ctx.executeTool === 'function' && 'tools' in ctx && Array.isArray(ctx.tools);
 }
@@ -98,7 +110,7 @@ export async function invokeTemplate(
 			try {
 				parsed = JSON.parse(text);
 			} catch {
-				throw fail('expected one raw JSON output bag');
+				throw fail(`expected one raw JSON output bag (${describeParseFailure(text)})`);
 			}
 			const result = checkBag(parsed, node.outputs, ctx.cwd, decision);
 			if (decision && Object.keys(result).length !== 1) throw fail('decision requires exactly one output');
