@@ -1,176 +1,115 @@
 # ldk
 
-一个 [PI package](https://pi.dev/packages)，把若干自定义扩展打包成一个整体分发。
-
-## 包含内容
-
-| 扩展 | 路径 | 说明 |
-|---|---|---|
-| 会话命令 | `extensions/sessions.ts` | `/session-new`(别名 `/sn`、`/clear`)、`/session-list`(别名 `/sl`、`/sessions`)、`/session-delete`(别名 `/sd`、`/sdel`)、`/session-delete-all`(别名 `/sda`、`/sdel-all`)、`/session-merge`(别名 `/sm`、`/merge`)。⚠️ `/clear` 是**开新会话**(当前对话存档保留),不是清屏。 |
-| 模型归属 | `extensions/model-attribution.ts` | 给历史中的助手回复打上生成它的 provider/model 标签，避免中途切换模型时把早前的回复误认成自己的。 |
-| MCP 适配器 | `extensions/mcp-adapter.ts` | 从 `.pi/mcp-adapter.json` 和 `~/.pi/agent/mcp-adapter.json` 读取 MCP server 配置并注册给 PI;`/mcp-adapter [list\|reload]` 查看状态或重新读取配置。 |
-| 图片生成 | `extensions/image-gen/` | `generate_image` 工具、`/imagine` 命令及图片模型处理逻辑。`/imagine [prompt]` 弹选 model/size/数量;`model=provider/id`、`n=2`、`size=1024x1024`、`out=dir`(相对路径不可含 `..`,需写到别处时用绝对路径)跳过对应选择器;`/imagine list`(或 `models`)列出已配置模型。 |
-| Flow 固定流程 | `extensions/flow/` | `/flow`、`/action` 或模型工具编辑定义，按命名端口、分支、并行阈值和人工关口运行。见 [Flow 固定流程](#flow-固定流程)。 |
-| 回复表单 | `extensions/reply-form/` | 模型用 `ask_form` 在输入区逐题提问，支持单选、多选、填空、回改和提交前预览。见[回复表单](#回复表单)。 |
-| 子会话工作台 | `extensions/session-agents/` | 角色 agent + 子会话(公共桌面)+ 经验记忆的大型任务拆分框架,详见[子会话工作台](#子会话工作台)。 |
-| 嵌入终端 | `extensions/terminal/` | 会话内呼出终端执行命令,可折叠(进程继续运行)或销毁(终止进程组),详见[嵌入终端](#嵌入终端)。 |
-| 循环保护 | `extensions/loop-guard/` | 检测无进展的工具周期和流式复读；引导无效时暂停，详见[循环保护](#循环保护)。 |
-| Markdown 编辑器 | `extensions/markdown-editor/` | `/md` 在原生输入和 Markdown 编辑模式之间切换;支持与 Pi 主题一致的源码高亮、滚动和发送二次确认,详见[Markdown 编辑模式](#markdown-编辑模式)。 |
-| 会话工作目录 | `extensions/workdir.ts` | 会话级「概念工作目录」:声明会话在某目录上工作,引导模型聚焦该目录、尽量不关注父目录/兄弟目录,详见[会话工作目录](#会话工作目录)。 |
-| 美化底栏 | `extensions/styled-footer.ts` | 用富文本分段状态栏替换默认底栏:彩色位置行 + 上下文进度条 + 扩展状态徽章,详见[美化底栏](#美化底栏)。 |
+一组可按需加载的 [Pi 扩展](https://pi.dev/packages)：管理会话、编排 Flow、分派角色任务，以及在终端内编辑、提问和运行命令。
 
 ## 安装
 
-**宿主兼容性：已验证 Pi 1.6.0。** `peerDependencies` 的 `*` 用于复用 Pi 自带的包，不代表所有历史或未来版本均已测试。升级 Pi 后重点检查 `/md` 确认发送、命令补全、源码高亮，以及底栏用量刷新。
-
-从远端仓库安装：
-
 ```bash
-pi install git:github.com/atom-l/pi-ldk
+pi install git:github.com/atom-l/pi-ldk        # 安装；加 @<tag 或提交> 固定版本，加 @<分支> 跟踪分支
+pi -e git:github.com/atom-l/pi-ldk            # 仅本次试用，不改 settings
 ```
 
-可以指定版本 / 分支 / 提交（`git:<repo>@<ref>`）：
+本文按 **Pi 1.6.1** 校对。`peerDependencies: "*"` 表示复用宿主包，不是全版本兼容保证。扩展以 Pi 进程的系统权限运行，可访问文件、凭证和会话历史；安装前请审阅来源。
 
-```bash
-pi install git:github.com/atom-l/pi-ldk@main
-```
+### 只加载部分扩展
 
-或者只在单次调用中试用，不写入 settings：
-
-```bash
-pi -e git:github.com/atom-l/pi-ldk
-```
-
-## 从 0.14.x 升级：MCP 和图片配置
-
-旧 `exposure` 或 `toolExposure` 配置中的 `codemode-deferred` 仍接受；LDK 注册前按 Pi 1.6 语义归一为 `codemode`，无需修改配置。
-
-**MCP：不用搬配置文件。** 原有全局/项目信任目录的 `mcp-adapter.json`、`directTools`、数组 `command` 和 `environment` 仍可用。新服务推荐直接写 Pi 的 `mcp.json`；同名原生条目优先（`-` 和 `_` 按同一命名空间处理）。默认由 Pi 在会话启动时连接并按需发现工具，不再自动注册代理、注入全量 `mcp_usage` 或拦截查询。显式的 `startupWait: false` 仍将注册延后到第一轮。
-
-**只有依赖旧增强行为才需要改配置**。例如旧脚本直接调用 `mcp_call__docs`，就在 **`mcp-adapter.json`** 的对应服务里加 `compat.callProxy`，不要把 `compat` 写入原生 `mcp.json`：
+在 Pi 的 `settings.json` 中用 `packages` 对象筛选。按包内的**入口文件**填写；例如图片扩展用 `extensions/image-gen/index.ts`，仅写目录不会选中它：
 
 ```json
-{
-  "mcpServers": {
-    "docs": { "url": "https://example.com/mcp", "compat": { "callProxy": true } }
-  }
-}
+{"packages":[{"source":"git:github.com/atom-l/pi-ldk","extensions":["extensions/sessions.ts","extensions/image-gen/index.ts"]}]}
 ```
 
-`compat.usageGuide`（详细工具说明）和 `compat.queryGuard`（查询参数检查）也是独立的逐服务开关，默认关闭。代理默认不做外层重试；设了 `retries` 也仅对服务器明确标为只读且未标为破坏性的工具重试。原生传输自己的重试策略不变。修改适配器配置后执行 `/mcp-adapter reload`；修改原生配置后执行 `/reload`。
+`[]` 不加载该类资源；`!pattern` 排除匹配项，`+path` / `-path` 精确包含 / 排除。调试本地扩展示例：`pi -e ./pi-ldk/extensions/session-agents`（从仓库父目录运行）。
 
-**图片：`/imagine` 和 `generate_image` 都保留，不要求打开 Code Mode。** 用 `/imagine list` 查看可用模型和首选后端（`native` / `legacy`）。Pi registry 已提供且凭证可用的 `image` 模型不再需要 `imageGeneration: true`。现有自定义网关、`imageGeneration` 条目、`PI_IMAGE_GEN_MODEL`、默认输出目录及指定文件名的用法不变；无需改造现有 `models.json`。不会自动重写任何配置文件。
+## 包含内容
 
-相同的 `provider/model-id` 只列一次。默认尺寸、单张优先使用原生接口；若有旧自定义传输设置（如 endpoint、请求体、headers）则保留旧路径。Pi 1.6 的标准图片接口没有 size/count 参数：显式请求尺寸或多张时，需要同名兼容配置，否则在请求前提示，不会静默丢参数或暗中发起多次生成。原生模型报错不会再用旧后端重发。参考图、预览和落盘仍由两个入口共享。
+| 功能（源码） | 入口 |
+|---|---|
+| [会话命令](extensions/sessions.ts) | `/session-new`（`/sn`、`/clear`）**开新会话，不删除已有会话文件，不是清屏**；`/session-list`（`/sl`、`/sessions`）切换会话。 |
+| 会话删除与合并 | `/session-delete`（`/sd`、`/sdel`）删选中的会话；`/session-delete-all`（`/sda`、`/sdel-all`）保留当前会话，确认后永久删除当前会话目录中列出的其他会话文件。`/session-merge`（`/sm`、`/merge`）合并对话转录并请求摘要；`/sm raw` 只合并转录。 |
+| [模型归属](extensions/model-attribution.ts) | 在请求副本中标出早先回复的 provider/model，不往旧记录补写标签；若模型在新回复开头复述标签，会清除该前缀。 |
+| [MCP 适配器](extensions/mcp-adapter.ts) / [图片生成](extensions/image-gen) | `/mcp-adapter list`、`/imagine list`；[原生与旧配置如何共存](#mcp-和图片配置)。 |
+| [Flow](extensions/flow) / [回复表单](extensions/reply-form) | [固定步骤与端口](#flow-固定流程)：`/flow`、`/action`、`flow_guide`；[需要用户决定时](#回复表单)：`ask_form`。 |
+| [子会话](extensions/session-agents) / [工作目录](extensions/workdir.ts) | [角色协作](#子会话工作台)：`/agent-mode`、`/agent-trace`；[会话范围](#会话工作目录)：`/wd`。 |
+| [循环保护](extensions/loop-guard) / [底栏](extensions/styled-footer.ts) | [`/loopguard status`](#循环保护) 查看最近暂停原因；[底栏](#美化底栏)显示路径、用量、模型和状态。 |
+| [Markdown 编辑器](extensions/markdown-editor) / [嵌入终端](extensions/terminal) | [`/md`](#markdown-编辑模式) 切换输入模式；[`/term`](#嵌入终端) 打开常驻 shell。 |
 
-**0.15.1 注意事项**：图片扩展只在 Pi 信任的项目中读取项目级 `.pi/models.json` 或 `models.json`；全局模型文件不受影响。不同提供商拥有同名模型时，请写完整的 `provider/model-id`。旧生图网关请配置最终地址：生成 POST 不会跟随重定向，网络失败也不会换传输重发。旧后端读不到参考图、端点不支持参考图或 Anthropic messages 不支持指定尺寸/多张时，会在请求前报错，不会降级为普通文生图。
+<a id="从-014x-升级mcp-和图片配置"></a>
 
-MCP 代理在等待连接或重试期间被移除、覆盖或替换时，尚未执行的调用会终止；不会自动转交给后来同名的服务器。已发出的调用无法因此撤销。
+## MCP 和图片配置
 
-**Windows 路径（0.15.2）**：例如 `/imagine out="D:\My Pictures\成品" 雪山`。支持完整盘符和标准 UNC 共享目录；不要写 `D:成品`（它依赖该盘的进程工作目录）。指定 `fileName` 时会替换 Windows 禁用的字符或设备名，实际文件名以返回的路径为准。不支持硬链接的卷会改用独占创建，保留同名避让，但写入过程中其他程序可能已看到文件。MCP stdio 优先使用 JSON `args` 数组，每个参数一个元素，不要给数组中的路径再包一层命令行引号。
+**MCP：不必迁移。** 新服务可直接配在 Pi 的 `mcp.json`。适配器仍读全局（默认 `~/.pi/agent/mcp-adapter.json`）和受信项目的 `.pi/mcp-adapter.json`；原生同名条目优先，`-` 与 `_` 视为同名。默认由 Pi 连接并发现工具；适配器顶层 `startupWait: false` 将注册推迟到首轮。旧 `directTools`、数组 `command`、`environment` 以及 `exposure` / `toolExposure` 中的 `codemode-deferred`（按 `codemode` 处理）仍可用。stdio 建议用 `args` 数组，每个参数一项，不要额外包引号。
 
-## 只加载部分扩展
-
-在 PI settings 里可以用对象形式缩小本包加载的资源范围：
+旧增强均为**逐服务、默认关闭**，只配在 `mcp-adapter.json`：`compat.callProxy` 提供 `mcp_call__服务名`，`compat.usageGuide` 附工具说明，`compat.queryGuard` 检查查询参数。例如：
 
 ```json
-{
-  "packages": [
-    {
-      "source": "git:github.com/atom-l/pi-ldk",
-      "extensions": ["extensions/sessions.ts", "extensions/image-gen"]
-    }
-  ]
-}
+{"mcpServers":{"docs":{"url":"https://example.com/mcp","compat":{"callProxy":true}}}}
 ```
 
-- `[]` 表示该类型一个都不加载；
-- `!pattern` 表示排除匹配到的 glob；
-- `+path` / `-path` 表示精确包含 / 排除某个路径。
+代理默认不重试；显式 `retries` 也只对服务端声明只读且非破坏性的工具生效。改适配器配置用 `/mcp-adapter reload`；改原生配置用 `/reload`。
 
-例如只需子会话工作台时用 `"extensions": ["extensions/session-agents"]`;
-开发调试单个扩展也可以直接按路径加载,不装包:
+**图片：** `/imagine [提示词]` 按可用模型和配置显示选择器；用 `model=provider/id`、`size=1024x1024`、`n=2` 跳过相应选择，`out=目录` 指定输出。`/imagine list`（或 `/imagine models`）列出模型和首选后端。模型用 `generate_image`，编辑已有图片用 `referenceImages`；两个入口都返回实际文件路径，不需要 Code Mode。
 
-```bash
-pi --extension ./pi-ldk/extensions/session-agents
-```
+- Pi registry 中凭证可用的 `image` 模型无需 `imageGeneration: true`；旧网关、`imageGeneration` 和 `PI_IMAGE_GEN_MODEL` 仍可用。不同提供商模型重名时写完整 `provider/model-id`。项目模型配置只在受信项目读取，不自动改写配置。
+- 默认尺寸、单张优先原生；显式设置的旧传输仍可使用。Pi 1.6.1 的标准图片接口仅支持默认尺寸和单张，指定尺寸或多张需同名兼容配置。已知不支持的组合在生成前报错；旧生成 POST 不跟随重定向，原生失败不换后端重发。
+- 默认写 `generated-images/`。相对输出目录不能含 `..`；可用绝对路径。Windows 可用完整盘符（如 `/imagine out="D:\My Pictures\成品" 雪山`）或标准 UNC 路径，不用 `D:成品`。同名文件不覆盖；文件名可能经清理，以返回路径为准。
 
 <!-- ldk:flow-guide:start -->
 
 ## Flow 固定流程
 
-Flow 固定的是步骤、数据接口和激活条件。比如一次依赖兼容性检查，可以要求收齐类型检查与集成测试的证据后才能给出结论。**“发现不兼容”是有效的业务结论，不等于工具没能运行。** LDK 不为此实现 Skill，也不把整个流程塞进一条提示词让模型自行遵守。
-
-在 Pi 终端输入 `/flow new 兼容性检查` 可打开带起点、终点和连线的图形工作台。模型可以按需调用 `flow_guide` 阅读本节；Pi 不会因为启动会话、创建或运行 Flow 就自动将这段手册加入上下文。
+Flow 是按显式步骤、端口和激活条件执行的图，不是 Skill。试用：`/flow new 兼容性检查` → 保存默认的 `start → end` → 让模型调用 `flow_run {"name":"兼容性检查"}`。两个节点只传递 `null` 信号，不额外调用模型。编写新流程前，模型可用 `flow_guide` 按需读取本节；启动会话或运行流程不自动注入手册。
 
 ### 定义与编辑
 
-- **Flow 必须有名**。`/flow view 名称` 打开只读节点图；`/flow new 名称`、`/flow edit 名称` 在工作台编辑草稿。节点按依赖层次排列，连线从上游卡片底边接到下游卡片顶边。窄窗折行或线路交叉、不能清楚画出连线时，卡片用 `↳` 标目标、`↰` 标来源；选中节点按 `Enter` 可查看全部相邻端口。宽窗可同时看图和选中节点的属性；窄窗用 `Enter` 看节点详情，`Esc` 返回。
-- 用 `↑` / `↓` 选节点（全屏模式也可点击节点或滚轮翻看），`m` 打开操作菜单，`a` 添加节点、`e` 改属性、`l` 按端口连线、`x` 移除连线、`c` 管理本 Flow 的 Action；`PgUp` / `PgDn` 翻页。`s` 或 `Ctrl+S` 校验并保存，不运行 Flow；连线或类型不合法会保留草稿，源文件被别的会话修改时不会静默覆盖。
-- `/action new 名称`、`/action edit 名称` 使用原生选择器和字段编辑器编辑父 Action、模板、输入输出、工具与收束策略。`/flow list`、`/action list` 用于选择并查看定义。需要直接粘贴、批改或修复原始 JSON 时可用 `/flow json 名称` 或 `/action json 名称`。模型仍用 `flow_inspect`、`flow_define` 操作相同的 JSON，无需迁移已有定义。
-- Action 是静态定义，节点是某处使用它的位置。每次执行产生独立状态；同一定义用两次不会共用输入输出。`global:名称` 在使用同一生效配置目录的会话间共享；`local:名称` 指当前 Flow 的 `actions`；节点内直接填写 `use: { ... }` 是匿名 Action，一个位置一份，复制后独立，保存 Flow 时一并保存。不靠字符串查找优先级猜测同名定义。
-- Blank Action (`builtin:action`) 是基础，会话模板负责说明怎样处理显式输入、调用哪些工具、输出什么。内置节点共享它的端口契约，但确定性的传递、判断、分派、收束不需要询问模型。`extends` 可引用内置、全局和本 Flow 的有名定义；全局定义不能反向引用某个 Flow 的私有定义。继承后覆盖的 `inputs`、`outputs` 各自整张替换，不把同名端口隐式合并。
-- 两个入口都会显示选中的**配置根目录**。本会话首次使用时，如 Pi 宿主工作目录已有 `.pi/` 就使用它，否则使用 `getAgentDir()`（包括 `PI_CODING_AGENT_DIR`，默认 `~/.pi/agent`）；选定后本会话内固定，`/reload` 重新选择。根下的 `ldk-flow/flows/`、`ldk-flow/actions/` 分别存普通 JSON 定义。文件名用用户名称的 UTF-8 十六进制编码，避免大小写不敏感的文件系统把两个名称混用。项目 `.pi` 与 Pi 的用户配置目录不是同一个命名空间；没有跨根隐式引用或合并。定义跟会话配置走，不跟随 LDK `/wd` 或嵌入终端 `cd`。不额外设 Flow 信任或授权模式，也不会借 Flow 获取 Pi 未提供的能力。
+- `/flow` 管理命名流程，`/action` 管理全局 Action。均支持 `list`、`view 名称`（只读）、`new 名称`、`edit 名称`、`json 名称`（原始 JSON）。模型用 `flow_inspect` 列出或读取定义，`flow_define` 校验保存，不执行。
+- 工作台用 `↑` / `↓` 或全屏单击选节点，`Enter` 看详情，`m` 打开菜单；`a` 添加、`e` 改属性、`l` 连线、`x` 断线、`c` 管理本流程的 Action。宽窗图文并排；窄窗折行或线路交叉时，`↳` 标目标、`↰` 标来源。`s` 或 `Ctrl+S` 保存；校验失败保留草稿，不静默覆盖外部修改。
+- 节点 `use` 可引用 `builtin:`、`global:`、`local:`（本 Flow 的 `actions`），或内联匿名 Action。自定义 Action 用 `extends` 继承；全局不能引用局部。重写 `inputs` 或 `outputs` 时替换整张端口表。多个节点复用同一定义，各自执行，不共享状态。
+- 首次访问定义时，宿主工作目录若已有 `.pi/` 就用它，否则用 `getAgentDir()`（支持 `PI_CODING_AGENT_DIR`，默认 `~/.pi/agent`）。本会话固定该根，`/reload` 重选。`ldk-flow/flows/`、`ldk-flow/actions/` 存 JSON，文件名是名称的 UTF-8 十六进制编码。定义不跨根合并，不随 `/wd` 或终端 `cd` 移动。
 
 ### 消息和连线
 
-节点可有多个命名输入、多个命名输出。线的两个端点均为 `[节点 ID, 端口名]`。声明例 `{"report":{"type":"object","fields":{"passed":{"type":"boolean"}}}}`；消息包例 `{"report":{"type":"object","value":{"passed":false}}}`。`fields` 中声明的字段必须存在，允许额外 JSON 字段。外层消息必须带具体类型，结构体中的字段则是普通 JSON 值，不再包一层消息。
+`from` 和 `to` 均为 `[节点ID,端口名]`。例如端口声明 `{"report":{"type":"object","fields":{"passed":{"type":"boolean"}}}}` 对应消息包 `{"report":{"type":"object","value":{"passed":false}}}`。`fields` 声明的字段必填，字段值是普通 JSON，允许额外字段。
 
-| 声明类型 | 消息值 |
-|---|---|
-| `null` | JSON `null`。是已到达的信号；未激活的连线没有消息。 |
-| `text` | 字符串，绝不会按内容猜作布尔或文件。 |
-| `boolean` | `true` 或 `false`，不是字符串。 |
-| `object` | JSON 对象，可预先约定字段及其类型。 |
-| `file` | 非空文件路径；相对路径按执行目录解析。传的是路径，不自动读、写或复制文件。 |
-| `any` | 只用于声明。实际发送时指定前五种之一，到达下游再按下游声明核验。 |
+消息有五种具体类型：`null` 是已到达的信号（未激活则没有消息）；`text` 是字符串；`boolean` 的 `false` 也是有效结果；`object` 是 JSON 对象；`file` 是非空路径，相对执行目录解析，不自动读写文件。第六种 `any` 仅供声明，不是可发送的类型。
 
-普通步骤等必需输入齐备，模板返回一个按输出口命名的 JSON 消息包，**不是带 Markdown 围栏的代码块**。声明 `tools: ["read", ...]` 才给该模板提供相应 Pi/LDK 可调用工具，工具仍经过 Pi 正常的验证、钩子和权限管线；不会拼进去主会话完整历史。模板不是在本机求值的 JavaScript。
-
-如果模板最后的文本不是合法 JSON，节点失败，可在 `flow_status` 中看到原因。例如 `invalid; bytes=86; preview=code-fence` 表示回复以代码围栏开头；`empty` 表示没有文本或只有 JSON 空白。`bytes` 是最终文本的 UTF-8 字节数，`preview` 仅是固定的形状标签，不记录回复片段、字段、值或解析器原文。合法 JSON 但端口、字段或类型不匹配仍按契约单独报错。失败不会触发模板或工具自动重试。
+普通节点等所需输入齐备。`template` 使用当前模型和显式输入，不含主会话历史，不执行 JavaScript。`tools: ["read"]` 只授予列出且 Pi 可调用的工具，照常经过参数验证和钩子。模板必须返回**纯 JSON 输出消息包**，不加围栏或解释。解析、端口或类型不符会报错，不自动重试。解析诊断中的 `bytes` 是 UTF-8 字节数，`preview=code-fence` 表示以围栏开头，`empty` 表示没有文本或只有 JSON 空白，不回显原文。
 
 ### 预设 Action
 
-| `builtin:` 后缀 | 规则 |
+| `builtin:` 后缀 | 默认端口与行为 |
 |---|---|
-| `action` / `task` | 通用空白步骤 / 任务步骤，默认 `in:any → out:any`。无模板时原样传递（一个输入到一个输出，或同名多端口），不调用模型。变换数据或使用工具时填写模板。 |
-| `start` | 唯一起点，运行输入对应其**输出口**。默认 `out:null`，无参启动即可发送信号。 |
-| `end` | 终点返回其输入包，默认 `in:any`。同一 Flow 可以有互斥的不同结局。 |
-| `decision` | 默认判断 `in:boolean`，只发送 `yes:null` 或 `no:null`。可用 `test: "报告.passed"` 读取输入值中的布尔字段；也可以用模板选一个命名输出口。 |
-| `fork` | 一个输入复制给声明的各个 worker 输出口，并发启动本组。 |
-| `join` | 声明每个 worker 的输入口，收束规则见下节。默认 `out:object`；可用模板处理已固定的记录。 |
-| `gate` | `question` 指明需要用户判断的事情。保留待答状态，用户用 `/flow answer 运行ID` 选择批准或拒绝，走 `yes` 或 `no`；Esc 保持等待。没有让模型代答的工具。 |
+| `start` / `end` | 唯一起点默认 `out:null`；`flow_run.input` 按起点**输出口**传消息。终点默认 `in:any`，返回输入包，可有互斥终点。 |
+| `action` / `task` | `in:any → out:any`。无模板时原样传递（单入单出或同名多口）；变换或使用工具时填模板。 |
+| `decision` | `in:boolean`，只发 `yes:null` 或 `no:null`。可用 `test:"report.passed"` 取布尔字段，或用模板选择一个输出口。 |
+| `gate` | `in:any`；用 `question` 提问。仅用户可在 `/flow answer 运行ID` 批准或拒绝，走 `yes:null` 或 `no:null`；`Esc` 保持等待。 |
+| `fork` / `join` | fork 把一个输入复制到各 worker 输出口；join 为各 worker 声明输入口，默认发 `out:object`。 |
 
 ### 并行收束
 
-`join` 策略包含三个独立设置：
+`join` 默认为 `all + succeeded + cancel`。自定义 `join` 时写全三个字段：
 
-| 字段 | 值 | 含义 |
-|---|---|---|
-| `waitFor` | `"all"` 或正整数 `n` | 本次 fork 的所有 worker，或先达到计数条件的 n 个不同 worker。数字超过实际 worker 数则不能启动。 |
-| `countOn` | `"succeeded"` / `"settled"` | 成功交付约定输出（包括 `false`、`null`），或任意终态（含执行失败和单个 worker 取消）。整个 Flow 被取消不触发收束。 |
-| `remaining` | `"cancel"` / `"finish"` | 阈值满足后，请求取消剩余 worker，或允许其自然结束；两者都不延迟下游。取消是协作式，不回滚已经发生的副作用。 |
+- `waitFor`：`"all"` 或正整数，按不同 worker 计数，不得超过 worker 数。
+- `countOn`：`"succeeded"` 计成功交付；`"settled"` 也计失败和单个 worker 取消。取消整个 Flow 不触发收束；阈值不可达则报错。
+- `remaining`：`"cancel"` 请求取消其他 worker（不回滚副作用），`"finish"` 让其自然完成。达到阈值即推进下游，只采样一次。
 
-缺省策略是 `all + succeeded + cancel`。达到阈值时运行器一次性固定采样，不是让模型猜完成度。结果按 **join 输入口名**关联到各 worker；默认 `out.value` 是这些记录的对象，每份有 `status`，成功携带 `outputs`，失败携带原因。模板要挑选、对比或汇总时，收到的是 `{out:{type:"object",value:这些记录}}`。迟到结果可查运行日志，但不追加到快照，更不会触发第二次收束。如果成功阈值已不可能达到，立即报错，不无限等待。
+快照以 **join 输入口名**为键；每条记录有 `status`，成功含 `outputs`，失败含 `error`。默认输出及 join 模板收到的输入均为 `{out:{type:"object",value:快照}}`。迟到结果记日志，不修改快照。
 
 ### 可运行示例：两路回执，任意一路结束即可推进
 
-把下面整段粘贴到 `/flow json 并行回执` 并保存，或交给 `flow_define` 作为 `definition`（`kind: "flow"`，`name: "并行回执"`）。两个 worker 引用同一个 Flow 私有 Action，但各自有独立执行。
+将以下 JSON 粘贴到 `/flow json 并行回执` 并保存；或调用 `flow_define`，设 `kind:"flow"`、`name:"并行回执"`、`definition` 为下列对象。再调用 `flow_run {"name":"并行回执"}`。两个 worker 各自调用模型，终点只收到先结束那一路的记录。
 
 ```json
 {
-  "name": "并行回执",
-  "actions": {
-    "回执": {"extends": "builtin:task", "template": "把输入 in 的原始消息完整复制到输出 out。例如收到 null 信号，返回 {\"out\":{\"type\":\"null\",\"value\":null}}。"}
+  "name":"并行回执",
+  "actions":{"回执":{"extends":"builtin:task","template":"把 in 消息原样复制到 out，只返回输出消息包。"}},
+  "nodes":{
+    "start":{"use":"builtin:start"}, "end":{"use":"builtin:end"},
+    "split":{"use":{"extends":"builtin:fork","outputs":{"A":{"type":"null"},"B":{"type":"null"}}}},
+    "甲":{"use":"local:回执"}, "乙":{"use":"local:回执"},
+    "collect":{"use":{"extends":"builtin:join","inputs":{"甲":{"type":"any"},"乙":{"type":"any"}},"join":{"waitFor":1,"countOn":"settled","remaining":"finish"}}}
   },
-  "nodes": {
-    "start": {"use": "builtin:start"},
-    "split": {"use": {"extends": "builtin:fork", "outputs": {"A":{"type":"null"}, "B":{"type":"null"}}}},
-    "甲": {"use": "local:回执"}, "乙": {"use": "local:回执"},
-    "collect": {"use": {"extends": "builtin:join", "inputs": {"甲":{"type":"any"}, "乙":{"type":"any"}}, "join":{"waitFor":1,"countOn":"settled","remaining":"finish"}}},
-    "end": {"use": "builtin:end"}
-  },
-  "edges": [
+  "edges":[
     {"from":["start","out"],"to":["split","in"]},
     {"from":["split","A"],"to":["甲","in"]}, {"from":["split","B"],"to":["乙","in"]},
     {"from":["甲","out"],"to":["collect","甲"]}, {"from":["乙","out"],"to":["collect","乙"]},
@@ -179,444 +118,86 @@ Flow 固定的是步骤、数据接口和激活条件。比如一次依赖兼容
 }
 ```
 
-再调用 `flow_run {"name":"并行回执"}`。如果只想先试一个完全不调用模型的 Flow，直接保存 `/flow new` 自动提供的 `start → end` 草稿即可。示例中的两份回执则会调用当前模型。
-
 ### 运行记录与边界
 
-- `flow_run` 启动时解析并固定节点、继承链、端口、模板、连线和策略，并给快照生成摘要。修改定义只影响下次启动。这个快照不冻结外部文件、模型服务或 Pi 的工具可用性。
-- 人工关口将运行停在原位，`flow_run` 返回运行 ID。用户答复后，无工具的步骤可继续；如需调用 Pi 工具，使用 `flow_continue {"id":"原运行 ID"}` 给同一运行接入新的调用上下文。它不能替用户批准，也不会重跑已完成的步骤。对于使用工具且 `remaining:finish` 的流程，下游立即推进，但外层工具可等迟到 worker 收尾再返回，以保留 Pi 的嵌套调用记录。
-- **运行卡片**：在 Pi 的全屏 TUI 中，运行期间就可以**点击工具行**展开或收起；完成后同样可以点击。展开后查看本次运行的拓扑、节点状态、最近事件、端口结果与错误，宽屏并排、窄屏上下排列。普通终端模式的鼠标由终端管理，使用 Pi 的“展开工具输出”快捷键（默认 `Ctrl+O`）或 `/flow status`。
-- **详细看板**：`/flow status` 选择本分支的运行，或用 `/flow status 运行ID` 直达。`←` / `→` 查看各节点，`Tab` 切换总览，`↑` / `↓` 或 `PgUp` / `PgDn` 翻看详情，`Esc` 退出。卡片只保留有限的近期事件和值预览；看板可查完整步骤列表，显示大值时也会截取预览，原始日志仍可通过模型工具 `flow_status` 获取。新运行记录启动时的拓扑；旧日志没有快照时只展示实际记录的节点，不借用最新版定义补图。`flow_cancel` / `/flow cancel ID` 请求取消运行和在途 worker。`drained:false` 表示还有收尾可能在进行，不应因此重跑外部写操作。
-- 状态属于**当前会话分支**；等待期间留在同一 Pi 进程即可答复。切换分支、退出或 reload 会解除旧运行并停止派发。日志保留，但不会在下一进程自动重放中断的文件修改或模型调用。print 模式退出也不会在后台留下服务。
-- 此版是有向无环图，不提供任意回跳。并行区域采用显式配对的 `fork → worker → join`；单个 worker 支持普通步骤链，不支持在一组 worker 内再嵌套 fork、跨组接线或从分支中提前 end。编辑时应明确报错，不以等待代替校验。普通步骤仍支持多入多出，互斥条件重新汇合不需要并行 `join`。
+- 启动时固定定义快照，修改只影响下次运行；不冻结外部文件、模型或工具。仅支持有向无环图。并行区须配对 `fork → worker → join`，worker 可由普通步骤串联，不支持嵌套 fork、跨组连线或提前 end；互斥分支汇合无需 join。
+- 人工关口返回运行 ID，不要重新启动。用户作答后，无工具步骤可继续；需要 Pi 工具时调用 `flow_continue {"id":"原运行ID"}` 接回同一运行，不代答或重放。`remaining:"finish"` 不挡下游；有工具的外层调用可能等迟到 worker 收尾才返回。
+- 在全屏 TUI，运行中和完成后均可点击工具行展开；普通终端用“展开工具输出”（默认 `Ctrl+O`）。`/flow status [运行ID]` 打开看板，`←` / `→` 换节点，`Tab` 切总览，`Esc` 退出。卡片与看板会截取长值，`flow_status` 可读本分支的运行日志和迟到结果；旧日志缺拓扑时不借新定义补图。
+- `flow_cancel` 或 `/flow cancel 运行ID` 请求取消。`drained:false` 表示可能仍在收尾，不要据此重做外部写操作。等待中的运行需要同一进程和分支；切换分支、退出或 reload 后日志保留，不自动重放。
 
 <!-- ldk:flow-guide:end -->
 
 ## 回复表单
 
-在 Pi 交互终端中，`ask_form` 启用时，模型会收到明确指引：**确实需要你拍板，就优先用回复表单，即使只有一个问题**。例如发布范围是你的选择时，模型应直接用表单问，不用先问「要不要打开表单」；需要一起确认的选项和备注放在同一份表单里。任务已明确、信息可以查到或你已授权模型判断时，则直接推进。
-
-你不必主动点名表单，也可以说「这次我手写」来要求普通文字提问。这里改的是模型的提问指引，不是检测问号的强制拦截；只有模型实际调用 `ask_form`，输入区才会切成逐页表单。
+`ask_form` 用单选、多选或文本题收集用户的决定。工具启用时，TUI 引导模型把相关问题合成一份表单，即使单题也优先使用；不是遇到问号就弹窗。任务已明确、可自行查证或已授权判断时不必问；要求手写或在 print / JSON / RPC 模式下则用文字。
 
 | 操作 | 按键 |
 |---|---|
-| 单选或多选 | `↑` / `↓` 移动，`空格` 选择或切换勾选，`退格` 清空；移动光标不算选择 |
-| 填空 | 直接输入或粘贴，`Enter` 换行 |
-| 翻题或回改 | `Tab` 下一题，`Shift+Tab` 上一题；最后一题的 `Tab` 进入预览 |
-| 查看整份回答 | `Ctrl+P` 预览，`↑` / `↓` 或 `PgUp` / `PgDn` 滚动；`Shift+Tab` 回到题目修改 |
-| 提交 | 在任一题、预览页或重填提示中按 `Shift+Enter` 发起提交，不必先翻到末页。确认框中 `Enter` 才发送，`Esc` 取消并返回原页，保留答案 |
-| 重新作答 | `Ctrl+R` 打开重填确认框；`Enter` 清除修改、恢复各题默认值并回到第一题，`Esc` 取消重填 |
-| 改为手写 | 作答页或预览页按 `Esc` 回到原输入框，保留原草稿。确认框中的 `Esc` 只取消该次操作，不退出问卷 |
+| 作答与回改 | 选择题 `↑↓` 移动、`空格` 选中或切换、`退格` 清空；填空题 `Enter` 换行。`Tab` / `Shift+Tab` 换题，末题 `Tab` 或 `Ctrl+P` 预览，`PgUp` / `PgDn` 滚动。 |
+| 提交 / 重填 | `Shift+Enter` 发起提交，`Ctrl+R` 发起重填；确认框里 `Enter` 才执行，`Esc` 返回原页。重填恢复默认值并回到首题。 |
+| 改为手写 | 作答页或预览页按 `Esc`，不发送表单草稿，回到原输入框。 |
 
-所有问题都允许留空。未填写或主动清空的题目，有默认值就按默认值提交，否则标为「已跳过」，不会替你猜答案。提交前，如果有题目不是你亲自作答的，确认框会列出已作答、采用默认值和留空的题数；全部亲自作答时则显示完成提示。随时可以预览最终答复，确认后模型收到与预览一致的内容。**已提交的回答会进入会话历史**，不要用它填写密码或密钥。print、JSON、RPC 等非 TUI 模式不弹终端控件，改由模型列出问题，等待书面回复。
-
-实现复用 Pi 官方 `questionnaire.ts` 示例采用的 `ctx.ui.custom()` 输入区和 `pi-tui` 文本编辑器，而不是改写全局编辑器。分题草稿参考 [Codex 的底部答题面板](https://github.com/openai/codex/blob/8727186a0a0e097f5e4496ba830f5d59c235b88c/codex-rs/tui/src/bottom_pane/request_user_input/mod.rs)，多选及取消与已答的区分参考 [OpenCode 的 question 工具](https://github.com/sst/opencode/blob/314842df119544845441fe6f7a3dec0bba857624/packages/core/src/tool/plugin/question.ts)。与 LDK 的 Markdown 编辑模式一致，`Shift+Enter` 只发起提交，确认后才发送；预览是可选步骤。
+所有题都可留空：确认提交时，有默认值则采用，无默认则标为跳过。默认值不是用户同意。已提交的回答会进入会话历史，**不要填写密码或密钥**。
 
 ## 子会话工作台
 
-`extensions/session-agents/`,面向"大型任务拆分"场景的三层协作架构:
-
-```
-会话模型(调度者)
-   │  ① 任务上下文 → 指派进子会话的上下文空间
-   ▼
-子会话 subsession(公共桌面:任务上下文 + desk + 工作日志)
-   │  ② 为子会话指派所需的角色 agent,协作多轮
-   ▼
-角色 agent(固定上下文 + 专属底层模型 + 各自的知识/视角)
-   │  ③ 完成后返回【结果】+【额外信息】
-   ▼
-经验记忆 insight(随会话沉淀,类 RAG 快速召回 + 主动启发)
-```
-
-核心思想:**任务不直接派给 agent**。任务本身的上下文先进入"子会话"这个
-公共的工作台;agent 是带着固定上下文与合适模型的"角色",被指派到子会话里,
-在公共桌面(desk)与工作日志上相互交流、协作完成任务。
-
-### 三层概念
-
-#### 1. 角色 agent(`agent_*`)
-
-一个**自带固定上下文的角色**:专属的知识、看待问题的角度、工作风格,以及
-为其挑选的底层模型与可选的思考等级(`thinkingLevel`)。角色只在被指派进子会话时工作。
-
-调度模型先看模型菜单或 `agent_list` 中该模型的 `thinking:` 档位，再按任务选择。**交付质量优先，不为省钱降低推理强度**；高风险、歧义大或难以验证的工作应给足推理，明确且容易核验的步骤则避免无益的等待。例如，若审查模型列出了 `high`，可在 `agent_create` 传 `thinkingLevel: "high"`。等级由 Pi 按当前模型及其配置（含 `thinkingLevelMap`）解析，不假设每个模型都有 `high`、`xhigh`，甚至 `off`。
-
-`agent_update` 可调整等级；换模型时若原档位不受支持，请同时选择新档位，或传 `thinkingLevel: "default"` 清除覆盖。未指定的新角色和旧角色保留原调用行为，不自动继承主会话等级。设置只作用于该角色的模型调用（包括工具调用后的续轮），不改变其他角色、主会话、独立的最终合成或 `maxTurns`。
-
-#### 2. 子会话(`subsession_*`)
-
-agent 们的**公共桌面**。任务上下文(目标、验收、背景数据、约束)指派进它的
-上下文空间;被指派的角色在其中协作:
-
-- **desk(公共桌面)**:findings(发现)/ decisions(决策)/ issues(异常) /
-  open(待决)/ artifacts(产出)/ notes(备注),agent 用内部工具 `desk_update` 写入;
-- **工作日志**:每个 agent 每轮的贡献记录,所有 agent 可见;
-- **运行时内部记录(仅用户可见)**:每个 agent 轮次的内部对话(指令 / 中间消息 /
-  工具调用 / 工具结果)捕获为 trace,只写进 tool result 的 `details`、**不进模型
-  上下文、也对他子会话不可见**;用户可点击 / `ctrl+e` 展开工具结果查看,或用
-  `/agent-trace`(别名 `/atrace`)实时追踪运行中的阻塞 / 后台子会话;
-- 完成时通过 `subsession_finish` 返回两部分:
-  1. **结果**:任务完成情况或结论;
-  2. **额外信息**:解决路径、中途遇到的异常与问题、可迁移的经验与启发。
-
-#### 3. 经验记忆(`insight_*`)
-
-结果与额外信息沉淀为**本会话内**的记忆记录(与会话绑定、随会话文件删除),
-提供**类 RAG 的召回/回溯**:
-
-- **快**:内存倒排索引 + BM25,无模型调用,毫秒级返回;
-- **主动提供启发**:`before_agent_start` 按当前输入自动召回最相关的经验,
-  注入系统提示的 `<session_agents_experience>` 段落(不相关自动跳过);
-- **可回溯**:每条记录带 kind、来源子会话、角色、时间、项目与命中词项;
-- 中英混合分词(拉丁整词 + CJK 一元/二元 gram),支持 kinds / detail 过滤。
-
-### 工作模式
-
-针对「模型使用 agent / subsession 积极性不高」的问题,提供三种工作模式,用 `/agent-mode`
-(别名 `/amode`)切换:
-
-| 模式 | 行为 |
-|---|---|
-| `off` | **无 agent 模式**:模型不在会话中调用 agent 功能,而在当前会话里线性地完成任务 |
-| `agent` | **agent 模式**:积极分解规划任务,优先用 `agent_*` + `subsession_*` 协作完成 |
-| `auto` | **自适应模式**(新会话默认):根据任务与问题的复杂度,自行决定是否使用 agent |
-
-```
-/agent-mode         # 弹出选项选择(推荐:上下键选中即切)
-/agent-mode off     # 也支持直接指定:无 agent,线性完成任务
-/agent-mode agent   # 直接指定:积极拆解协作
-/agent-mode auto    # 直接指定:按复杂度自适应(默认)
-```
-
-**当前模式常驻底栏**:以 `agent-mode:off|agent|auto` 显示在状态栏,随时可见;切换、
-resume、分支切换后自动同步。`/agent-mode` 不带参数时弹出选项列表(当前项带 ▸ 标记),
-选中即切换;也可直接传参数用于脚本 / 快捷方式;参数无法识别时回退到选项列表。
-
-三层保障确保模式真正生效:
-
-1. **提示词指引**:每次 `before_agent_start` 都注入 `<session_agents_work_mode>` 段落,
-   按当前模式明确告诉模型该怎么做(含 auto 模式的复杂度判断标准);
-2. **硬拦截**:off 模式下调用 `agent_*` / `subsession_*` 会被 `tool_call` 拦截拒绝,
-   并提示用户可切回 agent 模式(`insight_*` 记忆检索不受影响);
-3. **声明隐藏**:off 模式下 `prepareLoadout` 把 agent 工具从系统提示的工具列表里隐藏,
-   减少对模型的干扰。
-
-模式随会话持久化:切换写入 `mode_set` 操作,resume / 分支切换后按分支历史重放恢复;
-新建会话(无 `mode_set` 记录)一律为 `auto`。
-
-### 模型能力评分
-
-为让主模型在创建角色 / 指派任务时有选型依据,`models.json` 各模型条目支持 `capabilities`
-字段:维度名 → 1-100 的整数评分,数值越高能力越强。
-
-```json
-{
-  "id": "glm-5.3",
-  "capabilities": {
-    "通用知识与推理": 92,
-    "数学与形式推理": 90,
-    "代码能力": 91,
-    "任务规划能力": 88,
-    "速度": 60
-  }
-}
-```
-
-- **默认维度**:`通用知识与推理`、`数学与形式推理`、`代码能力`、`任务规划能力`、`速度`;
-  展示时默认维度在前,自定义维度按写入顺序在后;
-- **自由扩展**:维度名不限,只要名称能让模型看懂是什么能力(如 `长文本翻译`、`指令遵循`);
-  分数自动收敛到 1-100 整数,非法项忽略;`modelOverrides` 条目(key 为模型 id)同样支持
-  `capabilities`,与该模型 models[] 已有评分**按维度合并**(同名维度以 override 为准),
-  可用于给内置 provider 的模型补评分;
-- **不评多模态与长上下文**:输入模态(`input`)与上下文窗口(`contextWindow`)本就是
-  models.json 的既有配置,菜单直接展示,不做重复评分;
-- **生效方式**:`before_agent_start` 注入系统提示的 `<session_agents_models>` 模型菜单
-  (off 模式不注入;会话模型优先,带评分者次之,封顶 24 条),`agent_list` 同步列出评分
-  与关键元数据(模态 / 当前模型可选思考档位 / 窗口 / 输出上限 / 价格)。LDK 的能力评分随配置文件更新；可选档位则以 Pi 注册表当前加载的模型为准。
-
-评分是主观校准值,由用户自行标定;主模型按维度选型:勘察 / 批量读文件在能保证结果可靠的前提下看「速度」,
-写代码 / 评审看「代码能力」,任务拆解与最终合成看「任务规划能力」与「通用知识与推理」。
-
-### 会话工作目录
-
-给会话划定一个**概念上的工作范围**:声明当前会话在某个目录上工作,并引导模型把注意力
-聚焦在该目录之内——对其上方的**父目录**和同级的**兄弟目录**尽量不关注、不探查。用
-`/workdir`(别名 `/wd`)查看与切换:
-
-```
-/workdir                 # 弹出选项:切换到子目录 / 输入路径 / 重置为默认
-/workdir <路径>           # 直接切换到指定目录(相对路径以当前工作目录为基准)
-/workdir ~/proj/api      # 绝对路径;~ 会展开为家目录
-```
-
-**当前工作目录常驻底栏**:以 `wd:<完整路径>` 显示在状态栏(full path,不缩写);切换、resume、分支切换后自动同步。
-`/workdir` 不带参数时弹出选项列表——就近列出当前目录的**子目录**供快选(便于聚焦到子项目),
-也可选「输入路径…」手输,或「重置为默认目录」回到会话启动目录。
-
-> 这是**概念上的范围**,不改变进程 cwd,也**不硬性拦截**越界访问。它通过每次
-> `before_agent_start` 注入 `<session_working_directory>` 段落,软性引导模型的关注范围:
-> 主体工作限定在该目录及其子目录内,相对路径以该目录为基准,非必要不越界。
-
-> **不影响 `.pi` 目录**:工作目录与宿主 cwd 完全正交——不 `chdir`、不写 `ctx.cwd`。
-> 会话的 `.pi` 目录(扩展加载、`/reload`、`/mcp-adapter` 配置等)始终锚定**会话启动时的
-> 目录**,不随工作目录切换 / 恢复而改变。`/reload` 等命令不受任何影响。
-
-默认工作目录 = 会话启动目录(`ctx.cwd`)。切换 / 重置写入 `wd_set` 操作持久化,
-resume / 分支切换后按分支历史重放恢复;目标路径不存在、或不是目录时拒绝切换并保持原值。
-
-### 美化底栏
-
-`extensions/styled-footer.ts`,用 `ctx.ui.setFooter` 接管底栏,替换默认的「全暗色三行」样式,
-提供有层次的富文本状态栏:
-
-```
-/workspaces/proj/api · ⎇ main · ▸ coding                          ← 位置:full path·分支·会话名
-↑2.1M ↓45k R8.2M W12k CH80% $1.24 ▮▮▮▮▮▯▯▯▯▯ 45%·200k   (openai) gpt-5 · high
-▌ agent-mode:auto   ▌ wd:/workspaces/proj/api                     ← 扩展状态徽章(full path)
-```
-
-- **位置行**:工作路径(**full path**,青色)· git 分支(紫)· 会话名(琥珀);
-- **统计行**:token 用量 ↑↓RW、缓存命中 CH、花费 $,接**上下文进度条**(▮▮▯ 十格 + 百分比,
-  按阈值变色:>90% 红 / >70% 黄 / 其余绿)+ 右对齐 model 与 thinking 档位(多 provider 时前置 provider);
-- **徽章行**:各扩展 `setStatus` 的状态以 `▌ 文本` 徽章呈现(按语义配色),不再是裸文本堆叠。
-
-**配色分层**:各模块用**互不相同**的色相,便于视觉直接区分——路径(青 `syntaxVariable`)、
-分支(紫 `accent`)、会话名(琥珀 `syntaxString`)、model(深紫 `thinkingMedium`)、↑(蓝)、
-↓(青绿)、R(洋红)、W(橙)、CH(绿)、花费(黄),避免同色混淆(如早先分支/model/工作目录
-三处同紫、CH/花费同绿)。
-
-渲染按会话条目数缓存(`invalidate` 重算),避免每帧全量扫描。**纯渲染层改动**:不改变任何会话状态、
-`.pi` 解析、进程 cwd;`session_shutdown` 时还原默认底栏。
+任务交给**子会话**，不是直接交给角色。角色带固定指令、模型和获准使用的工具；子会话保存本次任务的目标、验收条件、共享桌面（发现、决策、问题、产物等）和工作日志。
 
 ### 工具一览
 
-| 工具 | 作用 |
+| 环节 | 模型工具与要点 |
 |---|---|
-| `agent_create` | 创建角色:name、description、systemPrompt(固定上下文)、model、thinkingLevel(从该模型可用档位选择)、tools、maxTurns |
-| `agent_update` | 修改角色配置或追加固定上下文 |
-| `agent_list` | 列出角色、子会话、可选模型清单(含能力评分与关键元数据) |
-| `agent_discard` | 丢弃角色(单个 / 全部) |
-| `subsession_create` | 创建子会话:task(目标与验收)、context(任务上下文)、assignments(指派角色)、synthesisModel(按能力评分选强推理模型) |
-| `subsession_run` | 跑一轮协作:参与者在公共桌面工作并给出贡献,返回本轮摘要与桌面状态;调度方式可选(见下) |
-| `subsession_probe` | 查后台作业进度 / 取结果(status / done / failed,可带 `wait=<秒>` 限时等待) |
-| `subsession_finish` | 收尾合成,返回【结果】+【额外信息】,并沉淀经验到记忆 |
-| `subsession_get` | 查看子会话:summary / desk / log / result |
-| `subsession_discard` | 丢弃子会话(单个 / 全部),同时取消该子会话在飞的后台作业 |
-| `insight_recall` | 类 RAG 检索**当前会话**已沉淀的结果与额外信息(query / kinds / limit / detail) |
-| `insight_add` | 主动记录一条经验 |
+| 选角色 | `agent_list` 查模型和角色，`agent_create` 建角色，`agent_update` 改配置，`agent_discard` 释放。 |
+| 给任务 | `subsession_create` 设置 `task`、`context` 和 `assignments`；`subsession_run` 可多轮工作，角色用 `desk_update` 写共享桌面。 |
+| 看进度 | `subsession_get` 查看 `summary` / `desk` / `log` / `result`。用户可展开工具结果或用 `/agent-trace`（`/atrace`）看内部调用记录，trace 不作为正文发给模型。 |
+| 收尾 | `subsession_finish` 返回**结果和额外信息**（方法、异常、经验）并沉淀记忆。合成模型优先级：`synthesisModel` → lead 角色模型（没设 lead 则取首个指派角色）→ 会话模型。`subsession_discard` 释放桌面并取消其在途后台作业。 |
+| 复用经验 | `insight_recall` 按 `query` 检索，可用 `kinds`、`limit`、`detail` 筛选；`insight_add` 手工记录。相关经验也可在后续任务开始时自动召回，不调用模型检索。 |
 
-另有内部工具 `desk_update`(exposure: deferred),仅供子会话内的 agent 写公共桌面。
+### 工作模式
 
-### 调度策略(由模型选择)
+`/agent-mode`（`/amode`）可选择模式，也可直接传 `auto`（默认，按复杂度拆分）、`agent`（积极协作）或 `off`（隐藏并拦截角色和子会话工具，不禁 `insight_*`）。模式显示在底栏，随分支恢复。
 
-`subsession_run` 的并发 / 阻塞行为**交给模型按问题特征自行选择**,而不是一刀切。三个开关相互独立:
+`subsession_run` 默认依次执行角色和轮次，并等待结果。三个开关独立：`parallelAgents:true` 并行同轮角色；`concurrentRounds:true` 允许同一子会话多轮重叠；`background:true` 立即返回作业 ID，稍后用 `subsession_probe {"job":"job-1","wait":30}` 收取（`wait` 最多 300 秒）。依赖前一轮发现时保持串行。
 
-| 开关 | 默认 | 何时开 |
-|---|---|---|
-| `parallelAgents` | `false`(串行) | 本轮参与者工作互不依赖(如分别勘察 / 风险评审)且想压低时延时开启;若后续 agent 应先读到前序 agent 的 desk 更新再动手,保持串行 |
-| `concurrentRounds` | `false`(串行) | 同子会话的多轮可流水线重叠执行时开启;若轮次顺序影响 desk 可读性,保持串行。desk / log 提交始终一致 |
-| `background` | `false`(阻塞) | 不必当场等结果、想继续干别的事时开启,立即返回 job 句柄,稍后用 `subsession_probe` 收结果;需要立即拿到结果则保持阻塞 |
+### 模型能力评分
 
-典型组合:
+`models.json` 的模型条目可加 `"capabilities":{"代码能力":92,"速度":75}`：维度自定、1–100 分；`modelOverrides` 按维度覆盖同名值。`agent_list` 列出能力评分及该模型在 Pi 中支持的 `thinkingLevel`。选档以交付质量优先，不假设每个模型都有 `high` 或 `off`。
 
-```
-# 串行 + 阻塞(默认):逐步推进,每轮都能看到前序 desk 更新
-subsession_run(name="auth", instruction="梳理现状")
-
-# 轮内并行:三个独立视角同时出结果,时延≈单个 agent
-subsession_run(name="review", instruction="分别从安全/性能/可维护性评审",
-               parallelAgents=true)
-
-# 后台派发:丢进后台继续干别的,稍后收割
-subsession_run(name="build", instruction="跑全量测试", background=true)
-   → { job: "job-3" }
-…(继续别的工作)…
-subsession_probe(job="job-3", wait=30)      # 限时等待并取结果
-```
-
-`subsession_probe` 用法:`job=<id>` 查单个作业、`name=<子会话>` 列出该子会话全部作业、
-都不传则列出全部;`wait=<秒>`(上限 300)表示愿意等多久——轮询还是等待,同样由模型
-自行取舍。作业状态:`running` / `done` / `failed` / `cancelled`;完成时返回与阻塞式
-`subsession_run` 完全相同的产物。
-
-生命周期:后台作业与工具调用生命周期解耦(自带 AbortController),会话关闭或
-`subsession_discard` 时自动取消,不留悬挂任务。
-
-### 典型流程(模型侧)
-
-```
-agent_create  name="explorer" model="ksyun/deepseek-v4.1-flash"
-              systemPrompt="你是勘察角色:关注事实与边界情况,结论必须带依据……"
-agent_create  name="critic" model="anthropic/claude-sonnet-4-5"
-              systemPrompt="你是挑剔的评审角色:关注风险、漏洞与异常……"
-
-subsession_create name="auth-refactor" title="鉴权重构"
-                  task="把 session 鉴权迁移到 OAuth,给出结论与风险"
-                  context="<背景资料、目录结构、约束>"
-                  assignments=[{agent:"explorer",focus:"现状勘察",lead:true},
-                               {agent:"critic",focus:"风险评审"}]
-
-subsession_run  name="auth-refactor" instruction="完成各自分工,把发现写上桌面"
-subsession_run  name="auth-refactor" instruction="基于桌面共识,给出方案草案" agents=["critic"]
-subsession_finish name="auth-refactor"
-# → 返回【结果】+【额外信息】,并沉淀经验
-
-insight_recall  query="OAuth 迁移 风险"      # 后续任务需要时召回
-```
-
-多张子会话可以并行派发(同一条消息里多次 `subsession_run`);同一子会话内的
-轮次自动串行。
-
-### 返回格式(`subsession_finish`)
-
-```
-# 子会话 "auth-refactor" — 鉴权重构
-
-## 结果 (result)
-<任务完成情况或结论:完整、可独立使用>
-
-## 额外信息 (extras)
-### 解决路径
-### 异常与问题
-### 经验与启发
-
-(已沉淀 N 条经验到本会话记忆;本会话后续任务可调用 insight_recall 召回)
-```
+`agent_create` / `agent_update` 可指定角色档位。换模型时，旧档位不兼容才需同时换档，或传 `"default"` 清除覆盖。新角色不指定档位时走默认调用方式，不自动继承主会话档位。角色工具续轮沿用该轮档位，不影响主会话、其他角色、最终合成或 `maxTurns`。
 
 ### 生命周期与持久化
 
-| 数据 | 生命周期 | 存储 |
-|---|---|---|
-| 角色、子会话(desk/log/结果) | 与会话相同 | 会话 custom entry(不进模型上下文),resume / 分支切换后重放恢复 |
-| 经验记忆 | 与会话相同 | 会话 custom entry(不进模型上下文),resume / 分支切换后重放恢复;各会话隔离、不互通,删除会话即删除其经验。finish 沉淀的经验随 `sub_finish` entry 原子落盘 |
+角色、桌面、工作日志和经验随**当前会话分支**保存与恢复，不是跨会话知识库。丢弃子会话不删除已沉淀的经验；回退不会召回分支点以后的记录。`/session-merge` 不复制经验，删除会话文件也会删除其中的经验。旧版共享 `session-agents/insights.jsonl` 不再读写或自动清理。工具结果、trace 和工作日志有大小限制，不宜当作完整审计存档。
 
-模型可随时 `agent_discard` / `subsession_discard` 主动释放;子会话被丢弃后,
-其已沉淀的经验仍可通过 `insight_recall` 召回(限本会话内)。经验记忆与会话
-绑定:各会话互相隔离,只检索当前会话/当前分支的记录;删除会话文件即删除其
-全部经验(rewind 到更早的分支点后,该点之后沉淀的经验也不再召回)。
+## 会话工作目录
 
-### 实测记录
+`/workdir`（`/wd`）选择子目录、输入路径或重置；`/wd <路径>` 直接切换。相对路径以当前会话工作目录解析，默认是宿主启动目录。切换随分支保存，底栏显示 `wd:`。它引导模型关注该目录，**不是权限边界，不改变进程 cwd，也不移动宿主的 `.pi` 配置**。新建嵌入终端取它作起点，已有终端的 `cd` 与它相互独立。
 
-1. 端到端:2 角色 → 子会话 → 协作轮(desk 写入)→ finish 返回【结果】+【额外信息】✅
-2. `insight_recall` 召回上一会话沉淀的经验(BM25 排序 + 出处 + 命中词项)✅
-3. 新任务自动注入 `<session_agents_experience>` 且被模型主动引用 ✅
-4. 会话 resume 后角色 / 子会话(desk、log、assignments、usage、结果)完整恢复 ✅
-5. 协作 agent 反向发现并已修复的缺陷:`appendEntry` 引用别名污染操作日志
-   (persist 前 `structuredClone`)、`desk_update` 不落盘(新增 `sub_desk` op)、
-   角色统计恢复归零(新增 `role_stats` op)✅
+## 美化底栏
 
-### 限制与说明
-
-- agent 单条工具结果注入历史时截断到 32 KB;单次工具结果返回给调用模型
-  截断到 48 KB(完整内容保留在子会话工作日志中)。
-- 子会话工作日志超过 80 条时自动裁剪旧条目(保留最近 60 条)。
-- 经验记忆与会话绑定(存于会话文件的 custom entry,`customType: session-agents-v2`),
-  各会话互相隔离、不互通:`insight_recall` 与自动注入只检索当前会话/当前分支
-  的记录;`rewind` 后更早分支点之后的经验不再召回;删除会话文件即删除其全部
-  经验(使用 `/session-delete`、`/session-delete-all` 同理)。
-- 旧版共享文件 `session-agents/insights.jsonl`(位于会话配置目录下,如默认的
-  `~/.pi/agent/session-agents/insights.jsonl`)**不再读取、不再写入、也不会自动
-  删除**;如确认不需要可手动清理。经验沉淀节奏可用 `subsession_discard` 控制。
-- `/session-merge` 只把源会话的对话转录注入为上下文,不复制 custom entry——
-  源会话的经验不随 merge 迁移,仍留在其会话文件中(隔离语义的一部分)。
-- 授予角色工具时注意权限:嵌套工具调用与模型调用走同样的权限钩子,但
-  也可以授予 `agent_create` / `subsession_*` 让角色自行再拆解任务(无深度
-  上限,请自行控制)。
-- 合成(subsession_finish)使用:子会话 synthesisModel > lead 角色的模型 >
-  会话模型。
+位置行显示宿主路径、Git 分支和会话名；统计行显示用量、缓存、费用、上下文占比和模型（优先配置的显示名，否则用 ID），推理模型另显思考档位。徽章显示各扩展状态。底栏只改变展示，不切换目录或模型。
 
 ## 循环保护
 
-`extensions/loop-guard/` 默认开启，直接监听当前 Pi 会话的事件。没有后台进程、网络请求或额外模型调用，也不会扫描历史会话。
+默认开启，不增加模型调用。检查连续无进展的内建工具决策，以及当前回复正文或可见思考块的复读；不因运行时间、压缩率或连续报错次数单独停机。一般先在下一次自然请求中引导，同一模式再次形成才暂停；同一流式块出现持续长段复读时可直接暂停。
 
-- **检测**：比较连续工具决策的动作、参数和结果，也检查当前回复的文本和宿主实际提供的思考增量是否大段复读。不因运行时间、压缩率或连续报错次数单独判定循环。并行批次不算多次独立决策；换说法的纯语义绕圈、不可见的推理可能漏检。
-- **干预**：仅检测到疑似重复时保持静默；若有下一次自然模型请求，才加入策略引导。引导后的一个完整观察窗口内，同一模式重新形成才暂停；若模型已转向别的目标，旧引导不能用来中止后来的正常重访。同一回复内部没有投递机会时，只对同一内容块中持续重复的长段落止损，不把隔着新内容的两段复读拼在一起。暂停不是回滚。
-- **位置提示**：引导、暂停和首次实际折叠都会当场提示。本次运行结束后（包括自动暂停），回复下面另有一条「本次介入记录」，列出动作和位置。例如「第 5 次模型回复开始：已加入策略引导；依据：第 4 次模型回复 · read 工具结果」。流式位置标注正文/思考块编号和已接收长度，不回显原文。末尾记录是用户可见的扩展条目，不修改回答、不进入模型上下文；没有介入就没有记录。非 TUI 模式使用通知或 stderr，不混入模型正文。
-- **继续**：暂停原因与模型提示分开显示。补充指令即可继续；扩展仅在下次请求的上下文中保守折叠可确认的重复片段，不改写原会话。不能安全去重时原样保留；不会调用 `/compact`。只为最近一次暂停保留临时恢复信息。
-- **控制**：`/loopguard status` 查看状态和最近暂停原因；`/loopguard restore` 清除去重和检测状态，按完整上下文继续；`/loopguard off` 适合明确要求重复验证等任务，`/loopguard on` 重新开启。这些命令都不会自行发送消息。切换会话或重新加载后恢复默认设置，切换分支或压缩后丢弃旧恢复范围。
+只在实际介入时提示位置。补充指令即可继续；去重只折叠发给模型的上下文副本，不改历史、不回滚副作用。`/loopguard status` 看最近原因，`/loopguard restore` 清除去重和检测状态，`/loopguard off` / `/loopguard on` 开关检测；这些子命令都不发送新消息。
 
 ## Markdown 编辑模式
 
-`extensions/markdown-editor/` 提供可切换的 Markdown 输入模式。新会话始终使用 Pi 原生输入框，执行 `/md` 进入编辑模式，再次执行 `/md` 恢复之前的编辑器。
+新会话默认原生输入。`/md` 切换到随 Pi 主题高亮的 Markdown 源码编辑器，再次执行恢复原编辑器。沿用原生补全、历史、粘贴和滚动，不另设预览区。
 
-编辑模式下：
-
-- 直接输入 Markdown 源码，样式复用 Pi 的 Markdown 主题与代码高亮：标题加粗（一级标题同时加下划线），并支持粗体、斜体、行内代码、链接、列表和代码围栏。
-- 不生成底部同步预览，只在源码编辑区内显示样式，配色跟随当前 Pi 主题。
-- 命令或参数候选菜单打开时，`Enter` 优先按原生行为选择候选；没有候选菜单时，单行有效 Pi 命令直接执行，不需要二次确认。
-- 普通 Markdown 或未识别的 `/...` 文本中，`Enter` 只插入换行，不发送消息。
-- `Shift+Enter` 打开发送确认框；确认框中按 `Enter` 发送，按 `Esc` 取消并保留草稿。
-- 复用原生编辑器的光标、历史、粘贴和滚动能力。源码区按终端高度自适应，长文本不会无限撑高，也不增加额外预览高度。
-
-> Pi 暂无等价的公开确认提交方法。若升级后内部提交方法不存在，确认操作**不会发送**，会恢复切换前的编辑器并保留草稿；不会用模拟 `Enter` 或直接调用 `onSubmit` 代替。若无法可靠判断可见源码行数，则保留 Pi 原生渲染，不给补全列表误加高亮。
+- `Enter` 优先选择打开的补全候选；没有候选时，单行有效 Pi 命令直接执行，其余文本换行。
+- `Shift+Enter` 发起发送，确认框 `Enter` 才发送，`Esc` 保留草稿。若升级后宿主提交接口不可用，恢复原编辑器并保留草稿，不模拟发送。
 
 ## 嵌入终端
 
-`extensions/terminal/`,在会话里呼出一个终端执行命令,随时可以折叠回 pi 会话,
-也可以彻底销毁。新建终端从当前会话的 `/workdir` 启动；未设置时使用 pi 的启动目录。
-重新打开已有终端会保留它自己的目录。终端里的 `cd` 不会修改会话的 `/workdir`。
-在 Linux（`/proc`）、macOS（`lsof`）和 Windows 的 `cmd.exe` 中，提示符与相对路径补全会跟随 shell 的实际目录；无法读取时保留上次已知目录。
+`/term`（别名 `/terminal`）打开默认终端 `main`；`/term <名称>` 或 `/term open [名称]` 打开或新建。`new <名称>` 新建，`list` 列状态，`destroy <名称>`（或 `kill`）确认销毁，`help` 查看用法。仅 TUI 可打开面板；这是行式 shell，不是 PTY，不适合 `vim`、`top` 等全屏程序。
 
-Windows 下使用 `cmd.exe` 时，终端按启动时的活动代码页读写命令、标准输出和错误输出（包括简体中文 CP936 和 UTF-8）。无法查询控制台时尝试系统 OEM 代码页；也可以在启动 pi 前设置 `PI_TERMINAL_CMD_CODEPAGE`（如 `936` 或 `65001`）与实际代码页匹配。终端不会主动执行 `chcp` 或改变宿主的代码页。若手动切换代码页，请新建终端；自行采用其他编码输出的程序需要单独配置。
-目录跟踪使用 cmd 的 `PROMPT`；覆盖 `PROMPT` 或执行 `echo off` 可能中断更新。其他 Windows shell 不使用此 cmd 协议。
-
-### 命令
-
-| 命令 | 作用 |
+| 操作 | 按键 / 行为 |
 |---|---|
-| `/term` | 打开(或新建)默认终端会话 `main` |
-| `/term open [name]` | 打开(或新建)指定会话;`/term <name>` 也可直接用名字打开 |
-| `/term new <name>` | 新建并打开指定会话 |
-| `/term list` | 列出所有终端会话及状态 |
-| `/term destroy <name>` | 销毁会话(确认后先 `SIGTERM`、宽限期后 `SIGKILL` 终止进程组,不留僵尸 / 孤儿进程) |
-| `/term kill <name>` | 同 `/term destroy`(别名) |
-| `/term help` | 用法 |
-| `/terminal …` | 与 `/term` 完全相同的别名(如 `/terminal list`) |
+| 执行、补全 | `Enter` 执行，`↑↓` 查历史；`Tab` 补命令或 shell 当前目录下的路径，多项先补公共前缀，再按列候选。 |
+| 看输出 | `PgUp` / `PgDn` 滚动面板；全屏模式支持面板内滚轮。缓冲保留最近 5000 行；`Ctrl+L` 清空可见输出。 |
+| 折叠 / 销毁 | `Esc` 折叠，shell 和输出继续；`Ctrl+X` 再按一次确认销毁。`Ctrl+C` 中断也可能使 shell 退出。普通命令完成不关面板；shell 退出则自动关闭，同名重开会新建。 |
 
-### 交互(终端内)
-
-| 按键 | 作用 |
-|---|---|
-| `Enter` | 执行当前输入行 |
-| `Tab` | 补全常用内建命令、pi 启动环境 `PATH` 中的命令，或以终端当前目录为基准的路径；多项匹配时先补公共前缀，再按一次列出候选，不执行命令 |
-| `↑` / `↓` | 历史命令 |
-| `PgUp` / `PgDn` | 终端获得焦点时，按页回看终端输出，不滚动 pi 聊天记录 |
-| 鼠标滚轮 | 在 pi 全屏模式下，指针位于终端面板内时滚动终端输出；面板外仍由 pi 处理 |
-| `Ctrl+C` | 中断前台进程组(SIGINT)；已知限制：终端会话自身也在该进程组内，shell 可能随之退出 |
-| `Ctrl+L` | 清空可见输出缓冲 |
-| `Esc` | **折叠**:关闭终端界面,进程继续运行、输出继续累积,回到 pi 会话 |
-| `Ctrl+X` | **销毁**:再按一次确认后终止进程组并清理会话 |
-
-### 退出、折叠与销毁
-
-终端的 shell 退出（例如输入 `exit`）后，面板会自动关闭并返回 pi，无需再按 `Esc`。
-折叠期间退出的终端也会从 `/term list` 中移除；再次打开同名终端会启动新的 shell。
-普通命令执行结束不会关闭面板。
-
-- **折叠(`Esc`)**:只关掉界面,shell 进程与输出缓冲都继续存活。随时再 `/term`
-  返回,能看到折叠期间累积的输出。适合「让 dev server 在后台跑着,先回 pi 干别的」。
-- **销毁(`Ctrl+X` 或 `/term destroy <name>`)**:先 `SIGTERM`,宽限期(1.5s)后仍未
-  退出再 `SIGKILL`,对整个进程组发信号,一次性结束进程树。
-
-### 进程生命周期
-
-每个会话用**独立进程组**(`detached`)启动用户 shell:销毁/清理时 `process.kill(-pid)`
-对整棵树发信号,既不误杀 pi 自身所在进程组,也不留僵尸 / 孤儿进程。命令通过 stdin
-逐行喂给同一个常驻 shell,因此 `cd` / 环境变量等状态跨命令保持。
-
-会话关闭(`session_shutdown`)时兜底 dispose 全部终端,保证不漏进程。
-
-### 限制与说明
-
-- 这是**面向执行命令的行式终端**,不是完整 VT 终端仿真器(未引入 PTY / 终端仿真库):
-  输出按行汇总到缓冲区,适合构建 / 服务 / git 等命令的持续输出观察;`vim` / `top`
-  这类全屏交互式程序不在目标场景内。
-- 单个会话输出缓冲保留最近 5000 行,更早的丢弃。
-- 终端仅在交互(`tui`)模式可用;非交互模式调用会提示。
-- 命令以 pi 进程的操作系统权限执行,请按需控制使用范围。
-
-## 说明
-
-- 扩展所需的 PI 宿主包通过 `peerDependencies` 提供（`@earendil-works/pi-agent-core`、`@earendil-works/pi-ai`、`@earendil-works/pi-coding-agent`、`@earendil-works/pi-tui`、`typebox`），**不要**把它们挪进 `dependencies`。
-- 扩展以与 PI 相同的操作系统权限运行，能访问文件、凭证和会话历史；安装第三方来源前请先审阅源码。
+会话关闭时清理终端。Unix 向 shell 进程组发信号；Windows 终止 shell 进程，**不保证终止所有后代进程**。Windows `cmd.exe` 按启动代码页读写，不主动改 `chcp`。必要时在启动 Pi 前设置 `PI_TERMINAL_CMD_CODEPAGE=936` 或 `65001` 与实际代码页一致；手动切换后请新建终端。覆盖 `PROMPT` 或 `echo off` 可能使目录跟踪失效。
