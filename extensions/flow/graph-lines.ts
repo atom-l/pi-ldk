@@ -32,6 +32,69 @@ const symbols: Record<string, string> = {
 };
 const glyph = (kind: string) => (Object.hasOwn(symbols, kind) ? symbols[kind] : '▣');
 
+type Card = Diagram['nodes'][number] & {
+	x: number;
+	width: number;
+	anchor: number;
+	feeds: Set<string>;
+	exit: boolean;
+};
+type Row = { level: number; cards: Card[]; rail?: string };
+
+/** Register only routes that can be drawn without implying a false junction.
+ * The same anchors drive the borders, the rail and the card's hit rectangle. */
+function connectRows(above: Row, below: Row, links: Map<string, Flow['edges']>, width: number) {
+	const pairs = above.cards.flatMap((a) =>
+		below.cards.flatMap((b) => (links.get(a.id)?.some((e) => e.to[0] === b.id) ? [{ a, b }] : [])),
+	);
+	if (!pairs.length) return;
+	// Group edges that share a card. A single horizontal trunk is truthful for
+	// a star; independent trunks may share this row only if their spans are disjoint.
+	const buses = [];
+	while (pairs.length) {
+		const group = [pairs.pop()!];
+		for (const edge of group) {
+			for (let i = pairs.length - 1; i >= 0; i--) {
+				if (pairs[i].a === edge.a || pairs[i].b === edge.b) group.push(pairs.splice(i, 1)[0]);
+			}
+		}
+		const anchors = group.flatMap(({ a, b }) => [a.anchor, b.anchor]);
+		const star = group.every((e) => e.a === group[0].a) || group.every((e) => e.b === group[0].b);
+		buses.push({ group, star, lo: Math.min(...anchors), hi: Math.max(...anchors) });
+	}
+	const cells = new Uint8Array(width); // up=1, right=2, down=4, left=8
+	let drawn = false;
+	for (const bus of buses) {
+		if (!bus.star || buses.some((other) => other !== bus && other.lo <= bus.hi && bus.lo <= other.hi)) continue;
+		for (const { a, b } of bus.group) {
+			a.exit = true;
+			b.feeds.add(a.id);
+			cells[a.anchor] |= 1;
+			cells[b.anchor] |= 4;
+		}
+		for (let x = bus.lo; x < bus.hi; x++) {
+			cells[x] |= 2;
+			cells[x + 1] |= 8;
+		}
+		drawn = true;
+	}
+	if (drawn) {
+		const glyphs = ' ╵╶└╷│┌├╴┘─┴┐┤┬┼';
+		below.rail = Array.from(cells, (bits) => glyphs[bits])
+			.join('')
+			.trimEnd();
+	}
+}
+
+function border(card: Card, top: boolean): string {
+	const socket = top ? card.feeds.size > 0 : card.exit;
+	const anchor = card.anchor - card.x;
+	const bar = socket
+		? '─'.repeat(anchor - 1) + (top ? '┴' : '┬') + '─'.repeat(card.width - anchor - 2)
+		: '─'.repeat(card.width - 2);
+	return top ? `╭${bar}╮` : `╰${bar}╯`;
+}
+
 /** Draw node cards by dependency level. Outgoing routes carry the *actual* port names;
  * cards placed side by side need not be connected. Invalid/cyclic drafts remain editable. */
 export function diagramLines(
@@ -50,9 +113,11 @@ export function diagramLines(
 	const { nodes, edges } = graph;
 	if (!nodes.length) return [truncateToWidth(theme.fg('dim', '（尚无节点）'), width)];
 	const links = new Map(nodes.map((n) => [n.id, [] as Flow['edges']]));
+	const incoming = new Map(nodes.map((n) => [n.id, [] as Flow['edges']]));
 	const degree = new Map(nodes.map((n) => [n.id, 0]));
 	for (const e of edges) {
 		links.get(e.from[0])?.push(e);
+		incoming.get(e.to[0])?.push(e);
 		if (links.has(e.from[0]) && degree.has(e.to[0])) degree.set(e.to[0], degree.get(e.to[0])! + 1);
 	}
 	const queue = nodes.filter((n) => !degree.get(n.id)).map((n) => n.id),
@@ -88,96 +153,86 @@ export function diagramLines(
 	const dim = (s: string) => theme.fg('dim', s),
 		cut = (s: string, w: number) => truncateToWidth(s, Math.max(0, w), '…');
 	const columns = width >= 88 ? 3 : width >= 50 ? 2 : 1;
-	let priorRow: typeof visible = [];
-	// Only draw a shared rail for an actual fan-out/fan-in; unrelated branches
-	// must not look connected. Non-adjacent edges remain labeled on their source.
-	function rail(row: typeof visible) {
-		const center = (i: number, len: number) => {
-			const w = Math.floor((width - 2 * (len - 1)) / len);
-			return i * (w + 2) + Math.floor(w / 2);
+	// Lay out *physical* rows first, including wrapping and the limit window. Any
+	// spare column is assigned to a real card, not silently lost between two rails.
+	const layout: Row[] = [];
+	for (let i = 0; i < visible.length; ) {
+		const level = visible[i].level,
+			chunk: typeof visible = [];
+		while (i < visible.length && visible[i].level === level && chunk.length < columns) chunk.push(visible[i++]);
+		const space = width - 2 * (chunk.length - 1);
+		const row: Row = {
+			level,
+			cards: chunk.map((n, j) => {
+				const left = Math.floor((j * space) / chunk.length),
+					w = Math.floor(((j + 1) * space) / chunk.length) - left,
+					x = left + 2 * j;
+				return { ...n, x, width: w, anchor: x + Math.floor(w / 2), feeds: new Set(), exit: false };
+			}),
 		};
-		const pairs = priorRow.flatMap((n, i) =>
-			row.flatMap((m, j) => ((links.get(n.id) ?? []).some((e) => e.to[0] === m.id) ? [[i, j]] : [])),
-		);
-		if (!pairs.length || (new Set(pairs.map((p) => p[0])).size > 1 && new Set(pairs.map((p) => p[1])).size > 1)) return;
-		const cells = Array<number>(width).fill(0); // up, right, down, left
-		for (const [i, j] of pairs) {
-			const a = center(i, priorRow.length),
-				b = center(j, row.length);
-			cells[a] |= 1;
-			cells[b] |= 4;
-			for (let x = Math.min(a, b); x < Math.max(a, b); x++) {
-				cells[x] |= 2;
-				cells[x + 1] |= 8;
-			}
-		}
-		const glyphs = ' ╵╶└╷│┌├╴┘─┴┐┤┬┼';
-		out.push(
-			dim(
-				cells
-					.map((v) => glyphs[v])
-					.join('')
-					.trimEnd(),
-			),
-		);
+		const previous = layout.at(-1);
+		if (width >= 8 && level >= 0 && previous && previous.level < level) connectRows(previous, row, links, width);
+		layout.push(row);
 	}
 	if (first) out.push(dim(`↑ 另有 ${first} 个节点`));
-	for (let i = 0; i < visible.length; ) {
-		const level = visible[i].level;
-		out.push(dim(level < 0 ? '┄ 未排序（草稿中有环或悬空连接）' : `┄ 第 ${level + 1} 层`));
-		let firstRow = true;
-		while (i < visible.length && visible[i].level === level) {
-			const row: typeof visible = [];
-			while (i < visible.length && visible[i].level === level && row.length < columns) row.push(visible[i++]);
-			if (firstRow && level >= 0 && width >= 8) rail(row);
-			firstRow = false;
-			priorRow = row;
-			const w = Math.floor((width - 2 * (row.length - 1)) / row.length),
-				rowStart = out.length;
-			const cards = row.map((n) => {
-				const active = n.id === opts.selected,
-					badge = opts.badges?.get(n.id);
-				const destinations = links.get(n.id) ?? [];
-				const head = `${active ? '▸ ' : ''}${glyph(n.kind)} ${clean(n.id)}`;
-				const rows = [
-					active ? theme.fg('accent', head) : theme.bold(head),
-					theme.fg(
-						badge?.startsWith('failed')
-							? 'error'
-							: badge?.startsWith('done')
-								? 'success'
-								: badge === 'waiting'
-									? 'warning'
-									: badge === 'started'
-										? 'accent'
-										: 'muted',
-						[clean(n.kind), badge ? clean(badge) : ''].filter(Boolean).join(' · '),
+	for (const { level, cards: row, rail } of layout) {
+		if (rail) out.push(dim(rail));
+		const rowStart = out.length;
+		const cards = row.map((n) => {
+			const active = n.id === opts.selected,
+				badge = opts.badges?.get(n.id);
+			const destinations = links.get(n.id) ?? [];
+			const head = `${active ? '▸ ' : ''}${glyph(n.kind)} ${clean(n.id)}`;
+			const rows = [
+				active ? theme.fg('accent', head) : theme.bold(head),
+				theme.fg(
+					badge?.startsWith('failed')
+						? 'error'
+						: badge?.startsWith('done')
+							? 'success'
+							: badge === 'waiting'
+								? 'warning'
+								: badge === 'started'
+									? 'accent'
+									: 'muted',
+					[clean(n.kind), badge ? clean(badge) : '', level < 0 ? '未排序' : `第 ${level + 1} 层`]
+						.filter(Boolean)
+						.join(' · '),
+				),
+			];
+			// An off-row or crossing wire must not appear attached to a neighbouring card.
+			const remote = incoming.get(n.id)?.filter((e) => !n.feeds.has(e.from[0])) ?? [];
+			if (remote.length) {
+				const e = remote[0];
+				rows.push(
+					dim(
+						`↰ ${clean(e.from[0])}.${clean(e.from[1])} → ${clean(e.to[1])}${remote.length > 1 ? ` (+${remote.length - 1})` : ''}`,
 					),
-				];
-				for (const e of destinations.slice(0, 3))
-					rows.push(dim(`↳ ${clean(e.from[1])} → ${clean(e.to[0])}.${clean(e.to[1])}`));
-				if (destinations.length > 3) rows.push(dim(`… 另有 ${destinations.length - 3} 条连线`));
-				return rows;
-			});
-			if (w < 8) {
-				out.push(...cards[0].map((s) => cut(s, w)));
-				opts.onCard?.(row[0].id, rowStart, out.length - 1, 0, w);
-				continue;
-			}
-			const bar = '─'.repeat(w - 2);
-			out.push(row.map(() => dim(`╭${bar}╮`)).join('  '));
-			for (let j = 0; j < Math.max(...cards.map((c) => c.length)); j++)
-				out.push(
-					cards
-						.map((c) => {
-							const s = cut(c[j] ?? '', w - 4);
-							return `${dim('│')} ${s}${' '.repeat(Math.max(0, w - 4 - visibleWidth(s)))} ${dim('│')}`;
-						})
-						.join('  '),
 				);
-			out.push(row.map(() => dim(`╰${bar}╯`)).join('  '));
-			row.forEach((n, i) => opts.onCard?.(n.id, rowStart, out.length - 1, i * (w + 2), w));
+			}
+			for (const e of destinations.slice(0, 3))
+				rows.push(dim(`↳ ${clean(e.from[1])} → ${clean(e.to[0])}.${clean(e.to[1])}`));
+			if (destinations.length > 3) rows.push(dim(`… 另有 ${destinations.length - 3} 条连线`));
+			return rows;
+		});
+		if (width < 8) {
+			out.push(...cards[0].map((s) => cut(s, width)));
+			opts.onCard?.(row[0].id, rowStart, out.length - 1, 0, width);
+			continue;
 		}
+		out.push(row.map((n) => dim(border(n, true))).join('  '));
+		for (let j = 0; j < Math.max(...cards.map((c) => c.length)); j++)
+			out.push(
+				cards
+					.map((c, k) => {
+						const w = row[k].width,
+							s = cut(c[j] ?? '', w - 4);
+						return `${dim('│')} ${s}${' '.repeat(Math.max(0, w - 4 - visibleWidth(s)))} ${dim('│')}`;
+					})
+					.join('  '),
+			);
+		out.push(row.map((n) => dim(border(n, false))).join('  '));
+		row.forEach((n) => opts.onCard?.(n.id, rowStart, out.length - 1, n.x, n.width));
 	}
 	if (first + visible.length < sorted.length) out.push(dim(`↓ 另有 ${sorted.length - first - visible.length} 个节点`));
 	return out.map((s) => truncateToWidth(s, width, '…'));
