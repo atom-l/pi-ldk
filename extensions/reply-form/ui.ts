@@ -24,7 +24,7 @@ const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 
 // Draft.preview() is the payload. Unlike prose word-wrap, preserve even runs of
 // spaces, indentation, empty lines and trailing spaces at soft line breaks.
-function previewLines(text: string, width: number): string[] {
+export function previewLines(text: string, width: number): string[] {
 	const lines: string[] = [];
 	for (const logical of text.split('\n')) {
 		if (visibleWidth(logical) <= width) {
@@ -54,8 +54,11 @@ export function createReplyUI(
 	draft: Draft,
 	finish: (outcome: 'submitted' | 'manual') => void,
 	keybindings: KeybindingsManager,
+	// Embedded requests may dismiss instead of handing control to the main chat editor.
+	presentation?: { contextLabel: string; escapeLabel: string },
 ): Component & Focusable {
 	const { questions, title } = draft.form;
+	const escapeLabel = presentation?.escapeLabel ?? '手写';
 	const color = (name: ThemeColor) => (s: string) => theme.fg(name, s);
 	const editorTheme: EditorTheme = {
 		borderColor: color('accent'),
@@ -265,8 +268,8 @@ export function createReplyUI(
 			? '提交预览'
 			: `${FORM_LABEL}  ${index + 1}/${questions.length} · ${kindLabels[q.kind]} · ${q.required ? '建议作答' : '选填'}`;
 		const footer = inPreview
-			? '↑↓ 滚动 · Shift+Tab 回改 · Shift+Enter 提交 · Ctrl+R 重填 · Esc 手写'
-			: `${editor ? 'Enter 换行' : '↑↓ 移动 · 空格选择 · 退格清空'} · Tab ${index + 1 === questions.length ? '预览' : '下一题'} · Shift+Tab 上一题 · Ctrl+P 预览 · Shift+Enter 提交 · Ctrl+R 重填 · Esc 手写`;
+			? `↑↓ 滚动 · Shift+Tab 回改 · Shift+Enter 提交 · Ctrl+R 重填 · Esc ${escapeLabel}`
+			: `${editor ? 'Enter 换行' : '↑↓ 移动 · 空格选择 · 退格清空'} · Tab ${index + 1 === questions.length ? '预览' : '下一题'} · Shift+Tab 上一题 · Ctrl+P 预览 · Shift+Enter 提交 · Ctrl+R 重填 · Esc ${escapeLabel}`;
 		let header = fg('accent', heading),
 			help = fg('muted', footer);
 		const warning = notice ? fg('warning', notice) : [];
@@ -289,7 +292,7 @@ export function createReplyUI(
 			help = [
 				theme.fg(
 					'muted',
-					inPreview ? 'Shift+Enter 提交 · ↑↓ 滚动 · Esc 手写' : 'Shift+Enter 提交 · Tab 继续 · Esc 手写',
+					inPreview ? `Shift+Enter 提交 · ↑↓ 滚动 · Esc ${escapeLabel}` : `Shift+Enter 提交 · Tab 继续 · Esc ${escapeLabel}`,
 				),
 			];
 		}
@@ -346,7 +349,12 @@ export function createReplyUI(
 				if (!finished) tui.requestRender();
 			}
 		},
-		render,
+		render(width) {
+			const lines = render(width);
+			return presentation && width > 1
+				? [theme.fg('accent', truncateToWidth(presentation.contextLabel, width, '…')), ...lines]
+				: lines;
+		},
 		invalidate() {
 			editor?.invalidate();
 			cachedPreview = undefined;

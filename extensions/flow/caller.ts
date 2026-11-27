@@ -29,6 +29,9 @@ export class Caller {
 			wake();
 		});
 	}
+	get attached() {
+		return this.current;
+	}
 	attach(ctx: ExtensionToolContext) {
 		if (this.current || this.users) throw new Error('Run already has a live Pi caller');
 		this.current = ctx;

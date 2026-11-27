@@ -147,6 +147,7 @@ export default function flowExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: 'flow_run',
 		label: 'Flow: run',
+		reachesTools: () => 'all',
 		renderCall: toolHeading('运行流程'),
 		renderResult: renderRun,
 		exposure: 'model-only',
@@ -179,12 +180,17 @@ export default function flowExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: 'flow_continue',
 		label: 'Flow: continue',
+		reachesTools: () => 'all',
 		renderCall: toolHeading('继续流程'),
 		renderResult: renderRun,
 		exposure: 'model-only',
 		description:
-			'After a human has answered a gate, reattach this Pi tool call to the existing run so subsequent tool-enabled actions can use a live caller. Does not approve a gate, restart a run or replay actions.',
-		parameters: Type.Object({ id: Type.String() }),
+			'Reattach a live caller to the same Flow after a deferred gate or a requested host-only tool. For a host request, pass requestId after the real top-level call, plus toolCallId if needed. Do not retry a side effect. Does not approve a gate or restart actions.',
+		parameters: Type.Object({
+			id: Type.String(),
+			requestId: Type.Optional(Type.String()),
+			toolCallId: Type.Optional(Type.String()),
+		}),
 		execute: async (callId, p, s, update, ctx) => {
 			const tick =
 				ctx.mode === 'tui' && update
@@ -194,7 +200,7 @@ export default function flowExtension(pi: ExtensionAPI) {
 			try {
 				const start = tick && runs.views.get(p.id);
 				if (start && tick) tick(start);
-				return toolText(await runs.resume(ctx, p.id, s), { frame: runs.views.get(p.id) });
+				return toolText(await runs.resume(ctx, p.id, s, p.requestId, p.toolCallId), { frame: runs.views.get(p.id) });
 			} finally {
 				unsubscribe?.();
 			}

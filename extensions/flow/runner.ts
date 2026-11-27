@@ -1,9 +1,13 @@
 import { checkBag, forkPlan, type Bag, type Compiled, type ForkPlan, type Msg, type Resolved } from './contract.ts';
 
+import type { FlowToolEvent } from './runtime-types.ts';
+
 type Worker = { status: 'succeeded'; outputs: Bag } | { status: 'failed'; error: string } | { status: 'cancelled' };
 type Snapshot = Record<string, Worker>;
 export type RunEvent =
-	| { type: 'node_start' | 'node_pruned'; id: string; kind: string }
+	| FlowToolEvent
+	| { type: 'context_read'; id: string; source: string; version: string }
+	| { type: 'node_start' | 'node_pruned' | 'node_cancelled'; id: string; kind: string }
 	| { type: 'node_finish'; id: string; kind: string; outputs: Bag }
 	| { type: 'node_failed'; id: string; kind: string; error: string }
 	| { type: 'gate'; id: string; question: string; answer: boolean }
@@ -19,6 +23,8 @@ type Options = {
 	cwd: string;
 	signal?: AbortSignal;
 	event?: (e: RunEvent) => void;
+	/** Delivered inputs, observed only after this node is actually activated. */
+	inputs?: (node: string, inputs: Bag) => void;
 	invoke: (node: Resolved, inputs: Bag, signal: AbortSignal, id: string) => Promise<Bag>;
 	gate: (id: string, question: string, signal: AbortSignal, inputs: Bag) => Promise<boolean>;
 };
@@ -97,7 +103,10 @@ export function startRun(graph: Compiled, input: Bag, opt: Options) {
 			emit({ type: 'node_finish', id, kind, outputs });
 			return outputs;
 		} catch (e) {
-			if (signal.aborted) throw signal.reason;
+			if (signal.aborted) {
+				emit({ type: 'node_cancelled', id, kind });
+				throw signal.reason;
+			}
 			emit({ type: 'node_failed', id, kind, error: message(e) });
 			if (e instanceof Error && e.name === 'AbortError') throw e;
 			throw new Error(`${id}: ${message(e)}`);
@@ -162,9 +171,11 @@ export function startRun(graph: Compiled, input: Bag, opt: Options) {
 							for (const id of b.nodes) {
 								const node = graph.nodes[id];
 								const inputs = Object.fromEntries(edges.map((e) => [e.to[1], outputs[e.from[1]]]));
-								outputs = await step(id, signal, () =>
-									invoke(id, checkBag(inputs, node.inputs, opt.cwd), signal),
-								);
+								outputs = await step(id, signal, () => {
+									const delivered = checkBag(inputs, node.inputs, opt.cwd);
+									opt.inputs?.(id, delivered);
+									return invoke(id, delivered, signal);
+								});
 								edges = links.get(id)!.outs;
 							}
 							signal.throwIfAborted();
@@ -188,6 +199,7 @@ export function startRun(graph: Compiled, input: Bag, opt: Options) {
 		master.signal.throwIfAborted();
 		return step(joinId, master.signal, () => {
 			const envelope: Bag = { out: { type: 'object', value: snap } };
+			opt.inputs?.(joinId, envelope);
 			return n.template ? invoke(joinId, envelope, master.signal) : checkBag(envelope, n.outputs, opt.cwd);
 		});
 	}
@@ -210,7 +222,12 @@ export function startRun(graph: Compiled, input: Bag, opt: Options) {
 			emit({ type: 'node_pruned', id, kind: n.kind });
 			return undefined;
 		};
-		if (n.kind === 'start') return step(id, sig, () => checkBag(input, n.outputs, opt.cwd));
+		if (n.kind === 'start')
+			return step(id, sig, () => {
+				const bag = checkBag(input, n.outputs, opt.cwd);
+				opt.inputs?.(id, bag);
+				return bag;
+			});
 		if (n.kind === 'join') {
 			const g = groups.get(id)!;
 			const seeds = await evaluate(g.fork);
@@ -228,6 +245,7 @@ export function startRun(graph: Compiled, input: Bag, opt: Options) {
 		if (!Object.keys(ins).length) return skip();
 		return step(id, sig, async () => {
 			const bag = checkBag(ins, n.inputs, opt.cwd);
+			opt.inputs?.(id, bag);
 			if (n.kind === 'end') return bag;
 			if (n.kind === 'fork')
 				return checkBag(

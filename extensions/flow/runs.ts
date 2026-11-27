@@ -7,6 +7,9 @@ import { presentation, RUN_ENTRY } from './run-frames.ts';
 import type { RunFrame } from './run-board.ts';
 import { invokeTemplate } from './template.ts';
 import { Caller } from './caller.ts';
+import { FlowKnowledge } from './knowledge.ts';
+import { FlowHumanUI } from './human.ts';
+import { FlowHostRelay } from './host-relay.ts';
 
 type Phase = 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
 type Summary = {
@@ -15,15 +18,17 @@ type Summary = {
 	version: string;
 	phase: Phase;
 	pending: string[];
+	requests?: { node: string; question: string; kind: 'approval' | 'question' | 'host' }[];
 	drained: boolean;
 	output?: Bag;
 	error?: string;
 };
 type Journal = { id: string; summary?: Summary; step?: RunEvent; graph?: Diagram };
-type Gate = { question: string; inputs?: Bag; answer: (yes: boolean) => void };
+type Gate = { question: string; inputs?: Bag; signal: AbortSignal; answer: (yes: boolean, handBack?: boolean) => void };
 type Reply = Summary & { instruction?: string; gates?: { node: string; question: string; inputs?: Bag }[] };
 type Live = {
 	summary: Summary;
+	relay?: FlowHostRelay;
 	stop: () => void;
 	gates: Map<string, Gate>;
 	resume?: (ctx: ExtensionToolContext, s?: AbortSignal) => Promise<Reply>;
@@ -34,6 +39,12 @@ const why = (e: unknown) => (e instanceof Error ? e.message : String(e));
 export function runBook(pi: ExtensionAPI) {
 	const live = new Map<string, Live>();
 	const views = presentation();
+	const human = new FlowHumanUI();
+	let hidden = new Set<string>();
+	// Only declaration names: never import the outer prompt or messages into an Action.
+	pi.on('before_agent_start', (e) => {
+		hidden = new Set(e.systemPromptOptions.hiddenTools);
+	});
 	const record = (l: Live, data: Journal) => {
 		if (live.get(l.summary.id) !== l) return;
 		pi.appendEntry(RUN_ENTRY, structuredClone(data));
@@ -44,7 +55,11 @@ export function runBook(pi: ExtensionAPI) {
 		views.reset(ctx);
 		const old = [...live.values()];
 		live.clear(); // Detach first: cancellation/drain callbacks must not write to another branch.
-		for (const l of old) l.stop();
+		hidden.clear();
+		for (const l of old) {
+			l.stop();
+			l.relay?.close();
+		}
 	}
 	pi.on('session_start', (_event, ctx) => reset(ctx));
 	pi.on('session_tree', (_event, ctx) => reset(ctx));
@@ -71,12 +86,49 @@ export function runBook(pi: ExtensionAPI) {
 		const controller = new AbortController();
 		const abort = () => controller.abort();
 		const caller = new Caller();
+		const knowledge = new FlowKnowledge((reader, source, version) =>
+			record(l, { id, step: { type: 'context_read', id: reader, source, version } }),
+		);
 		const usesTools = Object.values(graph.nodes).some((node) => node.tools?.length);
 		const l: Live = { summary, stop: abort, gates: new Map() };
 		live.set(id, l);
 		let wake: (() => void) | undefined;
-		const reply = (): Reply => ({
+		let handoff: { node: string; question: string; inputs?: Bag } | undefined;
+		const forms = new Map<string, string>();
+		const relay = new FlowHostRelay(
+			pi,
+			ctx,
+			id,
+			() => {
+				if (live.get(id) !== l) return;
+				refresh();
+				if (relay.requests().length) wake?.();
+			},
+			(name) => !hidden.has(name),
+		);
+		l.relay = relay;
+		const reply = () => ({
 			...structuredClone(summary),
+			...(!summary.drained && summary.output
+				? {
+						instruction:
+							'The main path finished. A late Action may still need tools: call flow_continue with this id to finish pending work. Never restart.',
+					}
+				: {}),
+			...(handoff
+				? {
+						handoff: structuredClone(handoff),
+						instruction:
+							'The user approved and handed this stage back to the initiating session. Perform the agreed work, then flow_continue the same id. Do not restart.',
+					}
+				: {}),
+			...(relay.requests().length
+				? {
+						hostRequests: relay.requests(),
+						hostInstruction:
+							'Only the initiating model can issue these model-only tools. If appropriate, call the exact tool with the shown arguments as a top-level call, then flow_continue with this id and requestId. Do not repeat side effects to find a result. Never supply invented tool output.',
+					}
+				: {}),
 			...(l.gates.size
 				? {
 						gates: [...l.gates].map(([node, g]) => ({ node, question: g.question, inputs: g.inputs })),
@@ -86,8 +138,19 @@ export function runBook(pi: ExtensionAPI) {
 		});
 		const refresh = () => {
 			summary.pending = [...l.gates.keys()];
+			const requests: NonNullable<Summary['requests']> = [
+				...[...l.gates].map(([node, g]) => ({
+					node,
+					question: g.question.slice(0, 240),
+					kind: 'approval' as const,
+				})),
+				...[...forms].map(([node, question]) => ({ node, question, kind: 'question' as const })),
+				...relay.requests().map((r) => ({ node: r.node, question: r.tool, kind: 'host' as const })),
+			];
+			if (requests.length) summary.requests = requests;
+			else delete summary.requests;
 			if (summary.phase === 'running' || summary.phase === 'waiting')
-				summary.phase = l.gates.size ? 'waiting' : 'running';
+				summary.phase = requests.length || handoff ? 'waiting' : 'running';
 			stamp(l);
 		};
 		const topology = diagramFrom(graph);
@@ -106,18 +169,55 @@ export function runBook(pi: ExtensionAPI) {
 			const run = startRun(graph, bag, {
 				cwd: ctx.cwd,
 				signal: controller.signal,
-				invoke: (node, inputs, s, nodeId) =>
-					node.tools?.length
-						? caller.use(s, (current) => invokeTemplate(current, node, inputs, s, nodeId))
-						: invokeTemplate(ctx, node, inputs, s, nodeId),
-				event: (step) => record(l, { id, step }),
+				inputs: (nodeId, inputs) => knowledge.begin(nodeId, inputs),
+				invoke: async (node, inputs, s, nodeId) => {
+					if (!node.template) return invokeTemplate(ctx, node, inputs, s, nodeId);
+					const base =
+						node.tools?.length || handoff
+							? await caller.use(s, async (current) => current)
+							: (caller.attached ?? ctx);
+					const localTools = knowledge.localTools(nodeId);
+					if (base.mode === 'tui' && base.hasUI && typeof base.ui.custom === 'function') {
+						const ask = human.askTool(base, { runId: id, flow: graph.name, node: nodeId });
+						localTools.push({
+							...ask,
+							execute: (args, signal) =>
+								caller.use(signal, async () => {
+									forms.set(nodeId, '等待用户填写回复表单');
+									refresh();
+									try {
+										return await ask.execute(args, signal);
+									} finally {
+										forms.delete(nodeId);
+										refresh();
+									}
+								}),
+						});
+					}
+					return invokeTemplate(base, node, inputs, s, nodeId, {
+						withHost: (signal, fn) => caller.use(signal, fn),
+						localTools,
+						getLocalTools: () => [...localTools, ...relay.localTools(nodeId)],
+						hostToolVisible: (name) => !hidden.has(name),
+						onTool: (step) => {
+							knowledge.observe(step);
+							record(l, { id, step });
+						},
+					});
+				},
+				event: (step) => {
+					knowledge.observe(step);
+					record(l, { id, step });
+				},
 				gate: (node, question, s, inputs?: Bag) =>
 					new Promise<boolean>((resolve, reject) => {
 						if (s.aborted) {
 							reject(new Error('Gate cancelled'));
 							return;
 						}
+						const dialog = new AbortController();
 						const close = () => {
+							dialog.abort();
 							s.removeEventListener('abort', cancel);
 							l.gates.delete(node);
 							refresh();
@@ -129,14 +229,35 @@ export function runBook(pi: ExtensionAPI) {
 						l.gates.set(node, {
 							question,
 							inputs,
-							answer: (yes) => {
+							signal: dialog.signal,
+							answer: (yes, handBack) => {
+								if (yes && handBack) {
+									handoff = { node, question, inputs };
+									wake?.();
+								}
 								close();
 								resolve(yes);
 							},
 						});
 						s.addEventListener('abort', cancel, { once: true });
 						refresh();
-						wake?.();
+						if (ctx.mode !== 'tui' || !ctx.hasUI || typeof ctx.ui.custom !== 'function') {
+							wake?.();
+							return;
+						}
+						const gate = l.gates.get(node)!;
+						void human.gate(ctx, { runId: id, flow: graph.name, node, question, inputs }, dialog.signal).then(
+							(choice) => {
+								if (live.get(id) !== l || l.gates.get(node) !== gate) return;
+								if (choice === undefined)
+									wake?.(); // Esc: release caller for discussion; still pending.
+								else if (choice === 'handoff') gate.answer(true, true);
+								else gate.answer(choice);
+							},
+							() => {
+								if (l.gates.get(node) === gate) wake?.();
+							},
+						);
 					}),
 			});
 			const main = run.done
@@ -156,15 +277,22 @@ export function runBook(pi: ExtensionAPI) {
 				summary.drained = true;
 				stamp(l);
 				if (live.get(id) === l) live.delete(id);
+				relay.close();
 			});
 			l.resume = async (current, s) => {
-				if (l.gates.size) return reply(); // A new tool call cannot approve a gate.
+				if (l.gates.size || relay.requests().length) return reply(); // A new tool call cannot approve a gate.
 				caller.attach(current);
+				if (handoff) {
+					handoff = undefined;
+					refresh();
+				}
 				s?.addEventListener('abort', abort, { once: true });
 				if (s?.aborted) abort();
 				try {
 					await Promise.race([
-						usesTools ? drain : main,
+						usesTools || summary.output || summary.phase === 'failed' || summary.phase === 'cancelled'
+							? drain
+							: main,
 						new Promise<void>((resolve) => {
 							wake = resolve;
 						}),
@@ -184,6 +312,7 @@ export function runBook(pi: ExtensionAPI) {
 			summary.drained = true;
 			stamp(l);
 			live.delete(id);
+			relay.close();
 			throw error;
 		} finally {
 			detach?.();
@@ -204,6 +333,7 @@ export function runBook(pi: ExtensionAPI) {
 			if (!live.has(key) && !s.drained) {
 				if (s.phase === 'waiting' || s.phase === 'running') s.phase = 'interrupted';
 				s.pending = [];
+				delete s.requests;
 				s.error ??= 'Runtime ended before drain; inspect side effects before rerunning. No automatic replay.';
 			}
 		if (!id) return [...runs.values()];
@@ -211,6 +341,7 @@ export function runBook(pi: ExtensionAPI) {
 		return {
 			...runs.get(id),
 			steps,
+			...(live.get(id)?.relay?.requests().length ? { hostRequests: live.get(id)!.relay!.requests() } : {}),
 			gates: [...(live.get(id)?.gates ?? [])].map(([node, g]) => ({ node, question: g.question, inputs: g.inputs })),
 		};
 	}
@@ -230,17 +361,34 @@ export function runBook(pi: ExtensionAPI) {
 		if (!key) return;
 		const gate = l.gates.get(key);
 		if (!gate) return;
-		const pick = await ctx.ui.select(
-			`${l.summary.name} · ${key}\n${gate.question}${gate.inputs ? `\n${JSON.stringify(gate.inputs).slice(0, 2048)}` : ''}`,
-			['批准', '拒绝'],
-		);
-		if (!pick) return; // Esc leaves the gate pending, never an implicit yes/no.
+		let choice: boolean | 'handoff' | undefined;
+		if (ctx.mode === 'tui' && typeof ctx.ui.custom === 'function') {
+			choice = await human.gate(
+				ctx,
+				{ runId: id, flow: l.summary.name, node: key, question: gate.question, inputs: gate.inputs },
+				gate.signal,
+			);
+		} else {
+			const pick = await ctx.ui.select(
+				`${l.summary.name} · ${key}\n${gate.question}${gate.inputs ? `\n${JSON.stringify(gate.inputs).slice(0, 2048)}` : ''}`,
+				['批准', '拒绝'],
+			);
+			choice = pick === '批准' ? true : pick === '拒绝' ? false : undefined;
+		}
+		if (choice === undefined) return;
 		if (live.get(id) !== l || l.gates.get(key) !== gate) throw new Error('This gate is no longer pending.');
-		gate.answer(pick === '批准');
+		gate.answer(choice !== false, choice === 'handoff');
 		ctx.ui.notify(`已记录。如后续步骤使用 Pi 工具，请让模型调用 flow_continue（id: ${id}），不要重新启动。`, 'info');
 	}
-	async function resume(ctx: ExtensionToolContext, id: string, s?: AbortSignal) {
+	async function resume(ctx: ExtensionToolContext, id: string, s?: AbortSignal, requestId?: string, toolCallId?: string) {
 		const l = live.get(id);
+		if (requestId) {
+			if (!l?.relay) throw new Error('No live host tool request in this run.');
+			if (!l.relay.accept(ctx, requestId, toolCallId))
+				throw new Error(
+					'No unambiguous matching host result. Check the actual tool call ID; do not repeat a side effect.',
+				);
+		}
 		if (l?.resume) return l.resume(ctx, s);
 		return inspect(ctx, id); // Already finished; never rerun side effects.
 	}

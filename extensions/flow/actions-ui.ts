@@ -16,7 +16,7 @@ const labels: Record<Field, string> = {
 	inputs: '输入端口 · inputs',
 	outputs: '输出端口 · outputs',
 	template: '模型模板 · template',
-	tools: '允许的工具 · tools',
+	tools: '所需工具 · tools（非授权列表）',
 	test: '布尔判断路径 · test',
 	question: '人工关口问题 · question',
 	join: '并行收束策略 · join',
@@ -55,7 +55,7 @@ function summary(a: Action, k: Field): string {
 		case 'outputs':
 			return `${Object.keys(a[k]!).length} 个（整组覆盖）`;
 		case 'tools':
-			return a.tools!.length ? `${a.tools!.length} 个 · ${preview(a.tools![0])}` : '无工具（显式空列表）';
+			return a.tools!.length ? `${a.tools!.length} 个 · ${preview(a.tools![0])}` : '无指定依赖（仍使用宿主工具）';
 		case 'join':
 			return policy(a.join!);
 		default:
@@ -115,13 +115,13 @@ async function editTools(ctx: Ctx, original: string[] | undefined): Promise<stri
 		const rows: Row<string | number>[] = [
 			['done', '应用工具设置'],
 			['add', '添加工具名称'],
-			['none', '禁用全部工具（空列表）'],
+			['none', '清空所需工具（不禁用宿主工具）'],
 			['inherit', `移除覆盖 · ${inherit}`],
 		];
 		value?.forEach((t, i) => rows.push([i, `移除 · ${preview(t)}`]));
 		const choice = await menu(
 			ctx,
-			`允许的工具 · ${value === undefined ? inherit : `${value.length} 个（整组覆盖）`}`,
+			`所需工具 · ${value === undefined ? inherit : `${value.length} 个（整组覆盖）`}`,
 			rows,
 		);
 		if (choice === undefined) return original;
@@ -335,7 +335,7 @@ export async function viewAction(ctx: Ctx, action: Action, title = 'Action 属�
 			if (Object.keys(action[k]!).length) portLines(action[k]!, '  ');
 			else lines.push('  显式空组');
 		} else if (k === 'tools') {
-			if (!action.tools!.length) lines.push('  无工具');
+			if (!action.tools!.length) lines.push('  无指定依赖（仍使用宿主工具）');
 			for (const t of action.tools!) lines.push(`  ${clean(t)}`);
 		} else if (k === 'join') lines.push(`  waitFor / countOn / remaining：${clean(policy(action.join!))}`);
 		else for (const line of String(value).split('\n')) lines.push(`  ${clean(line)}`);

@@ -3,20 +3,25 @@ import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type 
 import type { Bag } from './contract.ts';
 import { clean, diagramLines, type Diagram } from './graph-lines.ts';
 import type { RunEvent } from './runner.ts';
+import type { FlowToolEvent } from './runtime-types.ts';
 
 /** Display snapshot, never the execution protocol. A tail need not include node_start. */
+export type RunRequest = { node: string; question: string; kind: 'approval' | 'question' | 'host' };
 export type RunFrame = {
 	id: string;
 	name: string;
 	phase: string;
 	drained: boolean;
 	pending: string[];
+	requests?: RunRequest[];
 	graph?: Diagram;
 	steps: RunEvent[];
 	error?: string;
 	output?: Bag;
 	omitted?: number;
 	historical?: boolean;
+	// Latest calls evicted from the bounded card tail (full viewer replays the journal).
+	earlierTools?: FlowToolEvent[];
 	// Last known state of nodes whose earlier events no longer fit the card's tail.
 	earlier?: Record<string, { kind: string; state: string; route?: string }>;
 };
@@ -43,7 +48,8 @@ type WorkerView = {
 
 function project(f: RunFrame) {
 	const nodes = new Map<string, NodeView>(),
-		workers = new Map<string, WorkerView>();
+		workers = new Map<string, WorkerView>(),
+		calls = new Map<string, FlowToolEvent>();
 	const node = (id: string, kind?: string) => {
 		const n = nodes.get(id) ?? { id, kind: kind ?? '?', state: '—' };
 		if (kind) n.kind = kind;
@@ -52,14 +58,29 @@ function project(f: RunFrame) {
 	};
 	for (const n of f.graph?.nodes ?? []) node(n.id, n.kind);
 	for (const [id, info] of Object.entries(f.earlier ?? {})) Object.assign(node(id, info.kind), info);
+	function observeCall(e: FlowToolEvent) {
+		// Call IDs are scoped to an Action conversation, not to a Flow.
+		const key = JSON.stringify([e.id, e.callId]);
+		calls.delete(key);
+		calls.set(key, e);
+		node(e.id);
+	}
+	for (const e of f.earlierTools ?? []) observeCall(e);
 	let phase = f.phase,
 		error = f.error,
 		output = f.output;
 	for (const e of f.steps) {
 		if (!e || typeof e !== 'object') continue;
 		switch (e.type) {
+			case 'action_tool_start':
+			case 'action_tool_finish':
+				observeCall(e);
+				break;
 			case 'node_start':
 				node(e.id, e.kind).state = 'started';
+				break;
+			case 'node_cancelled':
+				node(e.id, e.kind).state = 'cancelled';
 				break;
 			case 'node_pruned':
 				node(e.id, e.kind).state = 'pruned';
@@ -118,15 +139,27 @@ function project(f: RunFrame) {
 	}
 	// A persisted terminal/interrupted summary takes precedence over a partial event tail.
 	if (!['running', 'waiting'].includes(f.phase)) phase = f.phase;
-	for (const id of f.pending) node(id, 'gate').state = 'waiting';
-	// A worker may outlive run_finish. No node_cancelled event exists; don't invent one.
+	// A succeeded-but-undrained run can still have a request in a late worker.
+	const live = !f.drained && !f.historical && ['running', 'waiting', 'succeeded'].includes(phase);
+	const requests = live ? [...(f.requests ?? [])] : [];
+	const gates = live ? f.pending : [];
+	const approvals = new Set(requests.filter((r) => r.kind === 'approval').map((r) => r.node));
+	for (const id of gates) {
+		node(id, 'gate');
+		if (!approvals.has(id)) requests.push({ kind: 'approval', node: id, question: '' }); // legacy journal
+	}
+	for (const r of requests) node(r.node).state = 'waiting';
+	// Older journals do not have node_cancelled. Never infer cancellation from run_finish.
 	if (f.drained || f.historical || phase === 'interrupted') {
 		for (const n of nodes.values()) if (n.state === 'started') n.state = 'no finish';
 		for (const w of workers.values()) if (w.state === 'started') w.state = 'no finish';
 	}
 	return {
 		nodes,
+		requests,
+		gates,
 		workers: [...workers.values()],
+		calls: [...calls.values()],
 		phase,
 		error,
 		output,
@@ -220,11 +253,23 @@ function portTrees(bag: Bag): string[] {
 function workerTitle(w: WorkerView) {
 	return `${w.late ? 'late · ' : ''}${w.state}  ${clean(w.forkId)} / ${clean(w.input)}`;
 }
+// Action-level evidence, distinct from Pi's bounded native nestedCalls audit.
+function callTitle(e: FlowToolEvent, terminal = false) {
+	const state = e.type === 'action_tool_start' ? (terminal ? '未见结束' : '调用中') : e.isError ? '失败' : '完成';
+	return `${clean(e.id)} · ${clean(e.tool)} · ${state} · #${clean(e.callId)}`;
+}
+const auditNote = '此处不记录参数或工具返回值。Pi 的嵌套调用审计有数量和大小上限；交由主会话执行的工具可另有原生工具行。';
 function eventTitle(e: RunEvent | undefined): string {
 	if (!e) return '尚无事件';
 	switch (e.type) {
+		case 'context_read':
+			return `${clean(e.id)} · 查阅 ${clean(e.source)} · #${clean(e.version).slice(0, 16)}`;
+		case 'action_tool_start':
+		case 'action_tool_finish':
+			return `${clean(e.id)} · ${clean(e.tool)} · ${e.type === 'action_tool_start' ? '开始' : e.isError ? '失败' : '完成'} · #${clean(e.callId)}`;
 		case 'node_start':
 		case 'node_pruned':
+		case 'node_cancelled':
 		case 'node_failed':
 		case 'node_finish':
 			return `${clean(e.id)} · ${e.type.slice(5)}${e.type === 'node_finish' && ['gate', 'decision'].includes(e.kind) ? ` → ${clean(Object.keys(e.outputs ?? {}).join(', '))}` : ''}${e.type === 'node_failed' ? `: ${clean(e.error)}` : ''}`;
@@ -261,11 +306,16 @@ function topology(f: RunFrame, b: Board, w: number, t: Theme, max?: number, sele
 		...(observed.length > n ? [`… +${observed.length - n} nodes`] : []),
 	];
 }
+function requestText(r: RunRequest) {
+	const label = { host: '等待主会话工具', question: '待答问题', approval: '待答 gate' }[r.kind];
+	return `${label} · ${clean(r.node)}${r.question ? `：${clean(r.question)}` : ''}`;
+}
 function resultInfo(f: RunFrame, b: Board, t: Theme, max: number) {
 	const lines: string[] = [];
 	if (b.error) lines.push(t.fg('error', `! ${clean(b.error)}`));
-	if (f.pending.length)
-		lines.push(t.fg('warning', `待答 gate · ${f.pending.map(clean).join(', ')}`), `/flow answer ${clean(f.id)}`);
+	for (const r of b.requests.slice(0, max)) lines.push(t.fg('warning', requestText(r)));
+	if (b.requests.length > max) lines.push(t.fg('dim', `… 另有 ${b.requests.length - max} 个待处理请求`));
+	if (b.gates.length) lines.push(`/flow answer ${clean(f.id)}`);
 	if (b.output) lines.push(section(t, '运行结果'), ...(max === Infinity ? portTrees(b.output) : ports(b.output, max)));
 	return lines;
 }
@@ -291,21 +341,22 @@ export function runCard(frame: RunFrame, expanded: boolean, theme: Theme): Compo
 			const status = `/flow status ${clean(frame.id)}`;
 			const split = width >= 78;
 			const result = resultInfo(frame, b, theme, expanded && split ? 3 : 1);
-			const lines = [title(frame, b, theme), theme.fg('dim', progress(frame, b))];
-			const latest = eventTitle(frame.steps.at(-1));
+			const lines = [title(frame, b, theme)];
 			if (!expanded) {
-				lines.push(...(result.length ? result.slice(0, 2) : [latest]));
-				if (result.length && frame.steps.at(-1)?.type.startsWith('worker_')) lines.push(latest);
+				// Internal progress belongs in the details, never in the folded row.
+				if (!frame.drained && b.phase === 'succeeded') lines.push(theme.fg('dim', '结果已就绪 · not drained'));
+				lines.push(...result);
 				lines.push(theme.fg('dim', `▸ 展开详情 · ${status}`));
 			} else {
+				lines.push(theme.fg('dim', progress(frame, b)));
 				const lw = split ? Math.floor((width - 3) * 0.54) : width;
 				const recent = frame.steps.findLast((e) => 'id' in e);
-				const selected = frame.pending[0] ?? (recent && 'id' in recent ? recent.id : undefined);
+				const selected = b.requests[0]?.node ?? (recent && 'id' in recent ? recent.id : undefined);
 				const left = [
 					section(theme, '拓扑 / 节点'),
 					...topology(frame, b, Math.max(1, lw), theme, split ? 3 : 1, selected),
 				];
-				const right = split ? [...result] : result.slice(0, 2);
+				const right = [...result];
 				if (!split && b.workers.length) right.push(`Worker · ${workerTitle(b.workers.at(-1)!)}`);
 				if (split && b.workers.length) {
 					right.push(section(theme, 'Workers'));
@@ -315,6 +366,13 @@ export function runCard(frame: RunFrame, expanded: boolean, theme: Theme): Compo
 						else if (w.outputs) right.push(`  ↳ ${ports(w.outputs, 1)[0]}`);
 					}
 					if (b.workers.length > 3) right.push(`… +${b.workers.length - 3} workers`);
+				}
+				if (b.calls.length) {
+					const calls = b.calls.slice(split ? -3 : -1).reverse();
+					right.push(
+						section(theme, '工具调用 · 按节点'),
+						...calls.map((e) => callTitle(e, frame.drained || frame.historical)),
+					);
 				}
 				const recentCount = split ? 4 : 2;
 				right.push(
@@ -355,7 +413,8 @@ function detail(f: RunFrame, b: Board, n: NodeView, t: Theme) {
 	if (n.state === '—') lines.push(f.omitted ? '保留的事件中没有此节点' : '尚无执行记录');
 	if (n.error) lines.push(t.fg('error', clean(n.error)));
 	if (n.gate) lines.push(`${clean(n.gate.question)} → ${n.gate.answer ? 'yes' : 'no'}`);
-	if (f.pending.includes(n.id)) lines.push(`/flow answer ${clean(f.id)}`);
+	for (const r of b.requests) if (r.node === n.id) lines.push(t.fg('warning', requestText(r)));
+	if (b.gates.includes(n.id)) lines.push(`/flow answer ${clean(f.id)}`);
 	if (n.join) {
 		lines.push(section(t, 'Join · 已采纳的快照'));
 		for (const [k, v] of Object.entries(n.join.snapshot ?? {})) {
@@ -364,6 +423,13 @@ function detail(f: RunFrame, b: Board, n: NodeView, t: Theme) {
 			if (v.status === 'succeeded') lines.push(...portTrees(v.outputs));
 		}
 	}
+	const calls = b.calls.filter((e) => e.id === n.id);
+	if (calls.length)
+		lines.push(
+			section(t, '工具调用 · 节点调用 ID'),
+			...calls.map((e) => callTitle(e, f.drained || f.historical)),
+			t.fg('dim', auditNote),
+		);
 	if (n.outputs) lines.push(section(t, n.kind === 'end' ? '结束端口' : '输出端口'), ...portTrees(n.outputs));
 	if (f.graph) {
 		for (const { from, to } of f.graph.edges)

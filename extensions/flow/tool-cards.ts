@@ -23,16 +23,13 @@ function payload(r: AgentToolResult<Display>) {
 	}
 }
 export function toolHeading(label: string) {
-	return (args: Record<string, unknown>, theme: Theme, ctx: ToolRenderContext) =>
-		new Text(
-			theme.fg('toolTitle', theme.bold(label)) +
-				' ' +
-				fmt(args?.name ?? args?.id ?? '') +
-				' ' +
-				theme.fg('dim', ctx.keyHint('app.tools.expand', '展开/收起')),
-			0,
-			0,
+	return (args: Record<string, unknown>, theme: Theme, ctx: ToolRenderContext) => {
+		const text = ctx.lastComponent instanceof Text ? ctx.lastComponent : new Text('', 0, 0);
+		text.setText(
+			`${theme.fg('toolTitle', theme.bold(label))} ${fmt(args?.name ?? args?.id ?? '')} ${ctx.keyHint('app.tools.expand', '展开/收起')}`,
 		);
+		return text;
+	};
 }
 export function presentRun(book: Book) {
 	return (

@@ -7,7 +7,7 @@ import type { RunEvent } from './runner.ts';
 // The runner's journal is the source of truth. Renderers get a small, independent
 // projection; never feed truncated values back to the interpreter or the model.
 export const RUN_ENTRY = 'ldk-flow-run-v1';
-type Stamp = Pick<RunFrame, 'id' | 'name' | 'phase' | 'drained' | 'pending' | 'error' | 'output'>;
+type Stamp = Pick<RunFrame, 'id' | 'name' | 'phase' | 'drained' | 'pending' | 'requests' | 'error' | 'output'>;
 export type PresentationEntry = { id: string; summary?: Stamp; graph?: Diagram; step?: RunEvent };
 const RECENT = 120;
 const clip = (s: string, n: number) => (s.length <= n ? s : s.slice(0, n) + '…');
@@ -76,19 +76,45 @@ function apply(f: RunFrame, j: PresentationEntry, full = false) {
 		f.name = s.name;
 		f.phase = s.phase;
 		f.drained = s.drained;
-		f.pending = [...s.pending];
+		const canWait = !s.drained && ['running', 'waiting', 'succeeded'].includes(s.phase);
+		f.pending = canWait ? [...s.pending] : [];
+		// Copy only public prompt text, never relay arguments, tool results or form answers.
+		f.requests = canWait
+			? (s.requests ?? []).map(({ node, kind, question }) => ({
+					node,
+					kind,
+					question: full ? question : clip(question, 600),
+				}))
+			: [];
 		f.error = s.error && (full ? s.error : clip(s.error, 600));
 		if (s.output) f.output = full ? s.output : previewBag(s.output);
 	}
 	if (j.step) {
-		f.steps.push(full ? j.step : previewStep(j.step));
+		const step = j.step;
+		if (step.type === 'run_cancelled' || step.type === 'run_failed') {
+			f.pending = [];
+			f.requests = [];
+		} else if (step.type === 'node_cancelled') {
+			f.pending = f.pending.filter((id) => id !== step.id);
+			f.requests = f.requests?.filter((r) => r.node !== step.id);
+		}
+		f.steps.push(full ? step : previewStep(step));
 		if (!full && f.steps.length > RECENT) {
 			const old = f.steps.shift()!;
 			f.omitted = (f.omitted ?? 0) + 1;
+			if (old.type === 'action_tool_start' || old.type === 'action_tool_finish') {
+				// Keep recent evidence visible when later deterministic steps fill the tail.
+				const calls = (f.earlierTools ?? []).filter((c) => c.id !== old.id || c.callId !== old.callId);
+				f.earlierTools = [...calls.slice(-2), old];
+			}
 			if ('kind' in old) {
-				const state = { node_start: 'started', node_finish: 'done', node_failed: 'failed', node_pruned: 'pruned' }[
-					old.type
-				];
+				const state = {
+					node_start: 'started',
+					node_finish: 'done',
+					node_failed: 'failed',
+					node_pruned: 'pruned',
+					node_cancelled: 'cancelled',
+				}[old.type];
 				const route =
 					old.type === 'node_finish' && (old.kind === 'gate' || old.kind === 'decision')
 						? Object.keys(old.outputs).join(', ')
@@ -97,6 +123,14 @@ function apply(f: RunFrame, j: PresentationEntry, full = false) {
 			}
 		}
 	}
+}
+// An old tool result or detached viewer cannot issue requests on a dead caller.
+export function markHistorical(f: RunFrame) {
+	f.historical = true;
+	f.pending = [];
+	f.requests = [];
+	if (!f.drained && (f.phase === 'waiting' || f.phase === 'running')) f.phase = 'interrupted';
+	return f;
 }
 const blank = (id: string): RunFrame => ({ id, name: 'Flow', phase: 'running', drained: false, pending: [], steps: [] });
 type Watch = (f: RunFrame) => void;
@@ -152,6 +186,8 @@ export function presentation() {
 	function reset(ctx?: ExtensionContext) {
 		for (const t of active.values()) {
 			if (t.timer) clearTimeout(t.timer);
+			markHistorical(t.frame);
+			if (t.full) markHistorical(t.full.frame);
 			t.listeners.clear();
 		}
 		active.clear();
@@ -182,11 +218,7 @@ export function presentation() {
 			apply(f, j, full);
 		}
 		if (!found) return undefined;
-		if (!live) f.historical = true;
-		if (!live && !f.drained && (f.phase === 'waiting' || f.phase === 'running')) {
-			f.phase = 'interrupted';
-			f.pending = [];
-		}
+		if (!live) markHistorical(f);
 		if (!live && !full) cacheFrame(f);
 		return f;
 	}
