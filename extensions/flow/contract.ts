@@ -276,6 +276,11 @@ function resolver(globals: Record<string, unknown>, locals: Record<string, unkno
 	}
 	return { ref, action };
 }
+// Inspect inherited ports during editing, when the surrounding draft is not yet a valid DAG.
+export function resolveUse(use: string | Action, globals: Record<string, Action>, locals: Record<string, Action>): Resolved {
+	const r = resolver(globals, locals);
+	return structuredClone(typeof use === 'string' ? r.ref(use, true, 'node.use') : r.action(use, true, 'node.use'));
+}
 export function validateAction(id: string, action: Action, globals: Record<string, Action>): void {
 	name(id, 'global action');
 	const defs = { ...record(globals, 'globals'), [id]: action };

@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { ExtensionAPI, ExtensionContext, ExtensionToolContext } from '@earendil-works/pi-coding-agent';
 import { checkBag, type Bag, type Compiled } from './contract.ts';
-import { startRun } from './runner.ts';
+import { startRun, type RunEvent } from './runner.ts';
+import { diagramFrom, type Diagram } from './graph-lines.ts';
+import { presentation, RUN_ENTRY } from './run-frames.ts';
+import type { RunFrame } from './run-board.ts';
 import { invokeTemplate } from './template.ts';
 import { Caller } from './caller.ts';
 
-const ENTRY = 'ldk-flow-run-v1';
 type Phase = 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
 type Summary = {
 	id: string;
@@ -17,7 +19,7 @@ type Summary = {
 	output?: Bag;
 	error?: string;
 };
-type Journal = { id: string; summary?: Summary; step?: unknown };
+type Journal = { id: string; summary?: Summary; step?: RunEvent; graph?: Diagram };
 type Gate = { question: string; inputs?: Bag; answer: (yes: boolean) => void };
 type Reply = Summary & { instruction?: string; gates?: { node: string; question: string; inputs?: Bag }[] };
 type Live = {
@@ -31,20 +33,30 @@ const why = (e: unknown) => (e instanceof Error ? e.message : String(e));
 // Definitions are shared by config root. Runs and their journal belong only to this Pi branch.
 export function runBook(pi: ExtensionAPI) {
 	const live = new Map<string, Live>();
+	const views = presentation();
 	const record = (l: Live, data: Journal) => {
-		if (live.get(l.summary.id) === l) pi.appendEntry(ENTRY, structuredClone(data));
+		if (live.get(l.summary.id) !== l) return;
+		pi.appendEntry(RUN_ENTRY, structuredClone(data));
+		views.update(data);
 	};
 	const stamp = (l: Live) => record(l, { id: l.summary.id, summary: l.summary });
-	function reset() {
+	function reset(ctx?: ExtensionContext) {
+		views.reset(ctx);
 		const old = [...live.values()];
 		live.clear(); // Detach first: cancellation/drain callbacks must not write to another branch.
 		for (const l of old) l.stop();
 	}
-	pi.on('session_start', reset);
-	pi.on('session_tree', reset);
-	pi.on('session_shutdown', reset);
+	pi.on('session_start', (_event, ctx) => reset(ctx));
+	pi.on('session_tree', (_event, ctx) => reset(ctx));
+	pi.on('session_shutdown', () => reset());
 
-	async function launch(ctx: ExtensionToolContext, graph: Compiled, input: unknown, signal?: AbortSignal) {
+	async function launch(
+		ctx: ExtensionToolContext,
+		graph: Compiled,
+		input: unknown,
+		signal?: AbortSignal,
+		progress?: (f: RunFrame) => void,
+	) {
 		const start = Object.values(graph.nodes).find((n) => n.kind === 'start')!;
 		const supplied =
 			input ??
@@ -78,8 +90,19 @@ export function runBook(pi: ExtensionAPI) {
 				summary.phase = l.gates.size ? 'waiting' : 'running';
 			stamp(l);
 		};
+		const topology = diagramFrom(graph);
+		views.open(id, ctx, topology);
+		const detach = progress && views.watch(id, 'launch', progress);
 		try {
-			stamp(l);
+			record(l, { id, summary, graph: topology });
+			// Pi's native result region accepts clicks once it has its first partial result.
+			if (progress) {
+				try {
+					progress(views.get(id)!);
+				} catch {
+					/* UI observers never control execution. */
+				}
+			}
 			const run = startRun(graph, bag, {
 				cwd: ctx.cwd,
 				signal: controller.signal,
@@ -162,13 +185,15 @@ export function runBook(pi: ExtensionAPI) {
 			stamp(l);
 			live.delete(id);
 			throw error;
+		} finally {
+			detach?.();
 		}
 	}
 	function inspect(ctx: ExtensionContext, id?: string) {
 		const runs = new Map<string, Summary>();
 		const steps: unknown[] = [];
 		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type !== 'custom' || entry.customType !== ENTRY) continue;
+			if (entry.type !== 'custom' || entry.customType !== RUN_ENTRY) continue;
 			const j = entry.data as Journal | undefined;
 			if (!j?.id || (id && j.id !== id)) continue;
 			if (j.summary) runs.set(j.id, structuredClone(j.summary));
@@ -219,5 +244,5 @@ export function runBook(pi: ExtensionAPI) {
 		if (l?.resume) return l.resume(ctx, s);
 		return inspect(ctx, id); // Already finished; never rerun side effects.
 	}
-	return { launch, inspect, cancel, answer, resume };
+	return { launch, inspect, cancel, answer, resume, views };
 }
