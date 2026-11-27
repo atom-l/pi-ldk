@@ -1,7 +1,15 @@
 import type { AgentToolResult, ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Text } from '@earendil-works/pi-tui';
-import { Draft, formParams, parseForm, type Answer, type Form } from './model.ts';
+import { Draft, FORM_LABEL, formParams, parseForm, type Answer, type Form } from './model.ts';
 import { createReplyUI } from './ui.ts';
+
+// Pi omits its standard tools/rules sections when a custom system prompt is used.
+// A small, TUI-only section keeps the decision rule visible without changing the loadout.
+const FORM_POLICY = [
+	'需要用户拍板时，默认调用 ask_form，而不是在正文列问题。哪怕只有一个问题，也不必等用户点名表单。',
+	'例如：由用户选择实施范围、在互斥方案中取舍，或补充无法从上下文查到的必要信息。选一项用 single，可选多项用 multi，自由回答用 text。把本轮相关问题合成一次调用，单独调用后等待答复。',
+	'请求已经明确、答案可自行查证或用户已授权你判断时，直接推进，不制造问题。用户明确要求手写或纯文字时按其要求，不弹表单。',
+].join('\n');
 
 type Dismissal = 'manual' | 'unavailable' | 'interrupted';
 type Details = { status: 'submitted'; answers: Answer[] } | { status: Dismissal };
@@ -18,11 +26,11 @@ function written(form: Form, status: 'manual' | 'unavailable') {
 	);
 	const notice =
 		status === 'manual'
-			? '已切换为手写。没有提交答题卡或接受默认答案；请在原输入框回复。'
-			: '当前没有交互式答题卡。请把以下问题作为普通消息呈现给用户，等待书面回复；不要代答或再次打开答题卡。';
+			? '已切换为手写。没有提交表单或接受默认答案；请在原输入框回复。'
+			: `当前无法打开${FORM_LABEL}。请把以下问题作为普通消息呈现给用户，等待书面回复；不要代答或再次打开表单。`;
 	return result(`${notice}\n\n${lines.join('\n\n')}`, { status }, status === 'manual');
 }
-const interrupted = () => result('答题卡已中断；没有提交任何回答。', { status: 'interrupted' }, true);
+const interrupted = () => result(`${FORM_LABEL}已中断；没有提交任何回答。`, { status: 'interrupted' }, true);
 
 export default function replyFormExtension(pi: ExtensionAPI) {
 	let active: AbortController | undefined;
@@ -36,18 +44,31 @@ export default function replyFormExtension(pi: ExtensionAPI) {
 	pi.on('session_start', reset);
 	pi.on('session_shutdown', reset);
 	pi.on('session_tree', reset);
-	pi.on('before_agent_start', (event) => {
+	pi.on('before_agent_start', (event, ctx) => {
 		if (event.messageType === 'user') awaitingWritten = false;
+		const opts = event.systemPromptOptions;
+		if (
+			ctx.mode === 'tui' &&
+			ctx.hasUI &&
+			!awaitingWritten &&
+			opts.forceSystemPrompt === undefined &&
+			opts.selectedTools.includes('ask_form') &&
+			!opts.hiddenTools.includes('ask_form')
+		) {
+			opts.sections.ldk_reply_form = FORM_POLICY;
+		} else {
+			delete opts.sections.ldk_reply_form;
+		}
 	});
 
 	pi.registerTool({
 		name: 'ask_form',
-		label: '答题卡',
+		label: FORM_LABEL,
 		description:
-			'Ask the user for decisions or clarification using a paged reply form with single choice, multiple choice and text questions. A default is a suggestion, not consent. The user may submit a partial form. On confirmation, a blank uses its default if present, otherwise it is skipped. Do not infer consent or a value for skipped questions. If the user chooses manual input, wait for their written reply.',
-		promptSnippet: 'Ask one or more questions in a reviewable, user-confirmed reply form.',
+			'Default interactive way to obtain a user-owned decision, preference, or missing requirement, even for a single question. Ask via single choice, multiple choice or free text; no need to ask permission to open the form first. A default is a suggestion, not consent. The user may submit a partial form. On confirmation, a blank uses its default if present, otherwise it is skipped. Do not infer consent or a value for skipped questions. If the user chooses manual input, wait for their written reply.',
+		promptSnippet: 'Collect a needed user decision or clarification (one or more questions) in a reply form.',
 		promptGuidelines: [
-			'When you need the user to answer questions or choose what to do, use ask_form with the related questions in a single call instead of a long prose questionnaire, unless the user prefers plain text. Call ask_form by itself, not alongside other tools; wait for the actual answers before acting.',
+			'In the interactive terminal, use ask_form instead of asking for a decision in prose, even for one question. Batch related questions in one standalone call. Respect a request for plain text; when no user input is needed, proceed without asking.',
 		],
 		exposure: 'model-only',
 		executionMode: 'sequential',
@@ -76,7 +97,7 @@ export default function replyFormExtension(pi: ExtensionAPI) {
 						}
 						return createReplyUI(tui, theme, draft, done, kb);
 					},
-					{ blocked: { kind: 'question', message: '等待填写答题卡' } },
+					{ blocked: { kind: 'question', message: `等待填写${FORM_LABEL}` } },
 				);
 				if (controller.signal.aborted || active !== controller) return interrupted();
 				if (outcome === 'manual') {
@@ -94,7 +115,7 @@ export default function replyFormExtension(pi: ExtensionAPI) {
 		},
 		// Tool-call deltas are incomplete and have not been validated: do not render raw args here.
 		renderCall(_args, theme) {
-			return new Text(theme.fg('toolTitle', theme.bold('答题卡')), 0, 0);
+			return new Text(theme.fg('toolTitle', theme.bold(FORM_LABEL)), 0, 0);
 		},
 	});
 }

@@ -1,6 +1,7 @@
 import { Type } from 'typebox';
 import { Check } from 'typebox/value';
 
+export const FORM_LABEL = '回复表单';
 const MAX_QUESTIONS = 24;
 const MAX_OPTIONS = 32;
 const MAX_OPTION = 160;
@@ -90,8 +91,8 @@ function checkedValue(q: Question, value: Value): Value {
 
 /** Parse a tool payload without mutating it or inventing IDs, choices or approvals. */
 export function parseForm(raw: unknown): Form {
-	if (!Check(formParams, raw)) throw new Error('答题卡结构不符，请检查字段类型、数量、长度及选项是否重复');
-	const title = label(raw.title ?? '答题卡', '标题', MAX_TITLE);
+	if (!Check(formParams, raw)) throw new Error(`${FORM_LABEL}结构不符，请检查字段类型、数量、长度及选项是否重复`);
+	const title = label(raw.title ?? FORM_LABEL, '标题', MAX_TITLE);
 	const ids = new Set<string>();
 	const questions = Array.from(raw.questions, (input, i): Question => {
 		const name = `第 ${i + 1} 题`;

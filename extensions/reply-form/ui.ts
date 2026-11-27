@@ -14,7 +14,7 @@ import {
 	type TUI,
 	type KeybindingsManager,
 } from '@earendil-works/pi-tui';
-import { type Draft, MAX_TEXT_LENGTH } from './model.ts';
+import { type Draft, FORM_LABEL, MAX_TEXT_LENGTH } from './model.ts';
 
 type Page = 'question' | 'preview' | 'confirm' | 'reset';
 const kindLabels = { single: '单选', multi: '多选', text: '文本' };
@@ -263,7 +263,7 @@ export function createReplyUI(
 			inPreview = page === 'preview';
 		const heading = inPreview
 			? '提交预览'
-			: `答题卡  ${index + 1}/${questions.length} · ${kindLabels[q.kind]} · ${q.required ? '建议作答' : '选填'}`;
+			: `${FORM_LABEL}  ${index + 1}/${questions.length} · ${kindLabels[q.kind]} · ${q.required ? '建议作答' : '选填'}`;
 		const footer = inPreview
 			? '↑↓ 滚动 · Shift+Tab 回改 · Shift+Enter 提交 · Ctrl+R 重填 · Esc 手写'
 			: `${editor ? 'Enter 换行' : '↑↓ 移动 · 空格选择 · 退格清空'} · Tab ${index + 1 === questions.length ? '预览' : '下一题'} · Shift+Tab 上一题 · Ctrl+P 预览 · Shift+Enter 提交 · Ctrl+R 重填 · Esc 手写`;
@@ -299,7 +299,7 @@ export function createReplyUI(
 			if (cachedPreview?.width !== width) cachedPreview = { width, lines: previewLines(preview, width) };
 			body = cachedPreview.lines;
 		} else {
-			if (title !== '答题卡') body.push(...fg('dim', title));
+			if (title !== FORM_LABEL) body.push(...fg('dim', title));
 			body.push(...wrap(q.prompt));
 			const value = draft.value(index);
 			q.options?.forEach((option, k) => {
