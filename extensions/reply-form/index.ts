@@ -44,7 +44,7 @@ export default function replyFormExtension(pi: ExtensionAPI) {
 		name: 'ask_form',
 		label: '答题卡',
 		description:
-			'Ask the user for decisions or clarification using a paged reply form with single choice, multiple choice and text questions. A default is a suggestion, not consent. Only confirmed answers count. If the user chooses manual input, wait for their written reply.',
+			'Ask the user for decisions or clarification using a paged reply form with single choice, multiple choice and text questions. A default is a suggestion, not consent. The user may submit a partial form. On confirmation, a blank uses its default if present, otherwise it is skipped. Do not infer consent or a value for skipped questions. If the user chooses manual input, wait for their written reply.',
 		promptSnippet: 'Ask one or more questions in a reviewable, user-confirmed reply form.',
 		promptGuidelines: [
 			'When you need the user to answer questions or choose what to do, use ask_form with the related questions in a single call instead of a long prose questionnaire, unless the user prefers plain text. Call ask_form by itself, not alongside other tools; wait for the actual answers before acting.',
@@ -84,10 +84,6 @@ export default function replyFormExtension(pi: ExtensionAPI) {
 					return written(form, 'manual');
 				}
 				if (outcome !== 'submitted') return interrupted();
-				for (let i = 0; i < form.questions.length; i++) {
-					const problem = draft.problem(i);
-					if (problem) throw new Error(`Cannot submit question ${i + 1}: ${problem}`);
-				}
 				return result(draft.preview(), { status: 'submitted', answers: draft.answers() });
 			} finally {
 				close = undefined;

@@ -2,6 +2,8 @@ import type { Theme, ThemeColor } from '@earendil-works/pi-coding-agent';
 import {
 	Editor,
 	Key,
+	isKeyRelease,
+	isKeyRepeat,
 	matchesKey,
 	truncateToWidth,
 	visibleWidth,
@@ -66,7 +68,8 @@ export function createReplyUI(
 		},
 	};
 	let page: Page = 'question',
-		resetFrom: 'question' | 'preview' = 'question';
+		resetFrom: 'question' | 'preview' = 'question',
+		confirmFrom: Exclude<Page, 'confirm'> = 'question';
 	let index = 0,
 		cursor = 0,
 		offset = 0,
@@ -132,9 +135,8 @@ export function createReplyUI(
 		finish(outcome);
 	}
 	function input(data: string) {
-		if (matchesKey(data, Key.escape)) return end('manual');
-		// ProcessTerminal supplies a complete bracketed paste event. Only the
-		// text page accepts one; pasted keys (including Y) are never actions.
+		// ProcessTerminal supplies a complete bracketed paste event. A pasted
+		// Enter/escape sequence must never request, confirm or dismiss a submission.
 		if (data.startsWith(pasteStart)) {
 			if (page === 'question' && editor && data.endsWith(pasteEnd)) {
 				if (data.length - pasteStart.length - pasteEnd.length > 2 * MAX_TEXT_LENGTH)
@@ -143,11 +145,32 @@ export function createReplyUI(
 			}
 			return;
 		}
-		if (page === 'confirm' || page === 'reset') {
-			const letter = (key: 'y' | 'n') => matchesKey(data, key) || matchesKey(data, Key.shift(key));
-			if (letter('n')) page = page === 'confirm' ? 'preview' : resetFrom;
-			else if (letter('y')) {
-				if (page === 'confirm') return end('submitted');
+		// A held or released shortcut must not accept or dismiss a second dialog.
+		const escape = matchesKey(data, Key.escape);
+		const requestSubmit = matchesKey(data, Key.shift('enter'));
+		const enter = matchesKey(data, Key.enter);
+		if (
+			isKeyRelease(data) ||
+			(isKeyRepeat(data) && (escape || requestSubmit || (enter && (page === 'confirm' || page === 'reset'))))
+		)
+			return;
+		if (page === 'confirm') {
+			if (escape) page = confirmFrom;
+			else if (enter) end('submitted');
+			return;
+		}
+		if (escape) {
+			if (page === 'reset') page = resetFrom;
+			else end('manual');
+			return;
+		}
+		if (requestSubmit) {
+			confirmFrom = page;
+			page = 'confirm';
+			return;
+		}
+		if (page === 'reset') {
+			if (enter) {
 				draft.reset();
 				question(0);
 			}
@@ -168,13 +191,7 @@ export function createReplyUI(
 			return;
 		}
 		if (page === 'preview') {
-			if (matchesKey(data, Key.enter)) {
-				const bad = questions.findIndex((_, i) => draft.problem(i) !== undefined);
-				if (bad !== -1) {
-					question(bad);
-					notice = draft.problem(bad)!;
-				} else page = 'confirm';
-			} else if (matchesKey(data, Key.up)) offset = Math.max(0, offset - 1);
+			if (matchesKey(data, Key.up)) offset = Math.max(0, offset - 1);
 			else if (matchesKey(data, Key.down)) offset++;
 			else if (matchesKey(data, Key.home)) offset = 0;
 			else if (matchesKey(data, Key.end)) offset = Number.MAX_SAFE_INTEGER;
@@ -182,17 +199,14 @@ export function createReplyUI(
 		}
 		if (matchesKey(data, Key.ctrl('p'))) return showPreview();
 		if (matchesKey(data, Key.tab)) {
-			notice = draft.problem(index) ?? '';
-			if (!notice) {
-				if (index + 1 < questions.length) question(index + 1);
-				else showPreview();
-			}
+			if (index + 1 < questions.length) question(index + 1);
+			else showPreview();
 			return;
 		}
 		if (editor) {
 			// Editor.setText(prefill) creates an undo entry; it is not a user edit.
 			if (editorPristine && keybindings.matches(data, 'tui.editor.undo')) return;
-			if (matchesKey(data, Key.enter)) editor.insertTextAtCursor('\n');
+			if (enter) editor.insertTextAtCursor('\n');
 			else editor.handleInput(data);
 			return;
 		}
@@ -223,22 +237,36 @@ export function createReplyUI(
 		if (width < 2) return [width > 0 ? '>' : ''];
 		const wrap = (s: string) => wrapTextWithAnsi(s, width);
 		const fg = (c: ThemeColor, s: string) => wrap(s).map(color(c));
-		if (page === 'confirm' || page === 'reset') {
-			const confirm = page === 'confirm';
+		if (page === 'confirm') {
+			const answers = draft.answers();
+			const counts = { user: 0, default: 0, skipped: 0 };
+			for (const { source } of answers) counts[source]++;
+			const complete = counts.user === answers.length;
 			return [
-				...fg('warning', confirm ? '确认提交？' : '重新作答？'),
-				...wrap(confirm ? 'Y 提交刚刚预览的整份答案' : 'Y 清空所有修改、恢复默认，从第一题重填'),
-				...fg('muted', `N ${confirm ? '返回预览' : '取消重填'} · Esc 退出手写（不提交）`),
+				...fg(complete ? 'accent' : 'warning', complete ? '确认提交？' : '未全部作答，确认提交？'),
+				...wrap(
+					complete
+						? `已全部作答，共 ${counts.user} 题。`
+						: `已作答 ${counts.user} 题，采用默认值 ${counts.default} 题，留空 ${counts.skipped} 题。`,
+				),
+				...fg('muted', 'Enter 确认提交 · Esc 取消并返回原页'),
+			];
+		}
+		if (page === 'reset') {
+			return [
+				...fg('warning', '重新作答？'),
+				...wrap('将清除本次修改、恢复默认值，从第一题重填。'),
+				...fg('muted', 'Enter 确认重填 · Esc 取消并返回原页 · Shift+Enter 提交现有答案'),
 			];
 		}
 		const q = questions[index],
 			inPreview = page === 'preview';
 		const heading = inPreview
 			? '提交预览'
-			: `答题卡  ${index + 1}/${questions.length} · ${kindLabels[q.kind]} · ${q.required ? '必答' : '可跳过'}`;
+			: `答题卡  ${index + 1}/${questions.length} · ${kindLabels[q.kind]} · ${q.required ? '建议作答' : '选填'}`;
 		const footer = inPreview
-			? '↑↓ 滚动 · Shift+Tab 回改 · Enter 确认 · Ctrl+R 重填 · Esc 手写'
-			: `${editor ? 'Enter 换行' : '↑↓ 移动 · 空格选择 · 退格清空'} · Tab ${index + 1 === questions.length ? '预览' : '下一题'} · Shift+Tab 上一题 · Ctrl+P 预览 · Ctrl+R 重填 · Esc 手写`;
+			? '↑↓ 滚动 · Shift+Tab 回改 · Shift+Enter 提交 · Ctrl+R 重填 · Esc 手写'
+			: `${editor ? 'Enter 换行' : '↑↓ 移动 · 空格选择 · 退格清空'} · Tab ${index + 1 === questions.length ? '预览' : '下一题'} · Shift+Tab 上一题 · Ctrl+P 预览 · Shift+Enter 提交 · Ctrl+R 重填 · Esc 手写`;
 		let header = fg('accent', heading),
 			help = fg('muted', footer);
 		const warning = notice ? fg('warning', notice) : [];
@@ -259,7 +287,10 @@ export function createReplyUI(
 		if (header.length + help.length + editorLines.length + warning.length + 7 > tui.terminal.rows) {
 			header = [theme.fg('accent', inPreview ? '提交预览' : `${index + 1}/${questions.length} ${kindLabels[q.kind]}`)];
 			help = [
-				theme.fg('muted', inPreview ? '↑↓ 滚动 · Enter 确认 · Esc 手写' : 'Tab 继续 · Shift+Tab 回改 · Esc 手写'),
+				theme.fg(
+					'muted',
+					inPreview ? 'Shift+Enter 提交 · ↑↓ 滚动 · Esc 手写' : 'Shift+Enter 提交 · Tab 继续 · Esc 手写',
+				),
 			];
 		}
 		let body: string[] = [],
@@ -277,7 +308,7 @@ export function createReplyUI(
 				const marker = q.kind === 'multi' ? (selected ? '[x]' : '[ ]') : selected ? '(●)' : '( )';
 				body.push(...fg(k === cursor ? 'accent' : 'text', `${k === cursor ? '>' : ' '} ${marker} ${option}`));
 			});
-			if (q.default !== undefined) body.push(...fg('dim', '未修改时使用本题默认值'));
+			if (q.default !== undefined) body.push(...fg('dim', '此题留空时将采用默认值'));
 		}
 		// Leave room for the host footer. The body (including the full prompt
 		// and each option's continuation lines) can always be paged manually.

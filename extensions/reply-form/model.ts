@@ -26,7 +26,12 @@ const questionSchema = Type.Object(
 					'Optional prefill, not approval. Text: nonblank string. Single: one exact option. Multi: nonempty list of distinct exact options.',
 			}),
 		),
-		required: Type.Optional(Type.Boolean({ description: 'Defaults to true; false allows skipping.' })),
+		required: Type.Optional(
+			Type.Boolean({
+				description:
+					'Whether an answer is requested (default true). Advisory only: the user can leave any question blank.',
+			}),
+		),
 	},
 	{ additionalProperties: false },
 );
@@ -137,7 +142,7 @@ export class Draft {
 		return Array.isArray(value) ? [...value] : value;
 	}
 
-	// Explicit empty edits mask defaults; only reset() restores an untouched form.
+	// Keep empty edits visible in the editor. Resolve defaults only for preview/submission.
 	set(index: number, value: Value): void {
 		this.edits.set(index, checkedValue(this.question(index), value));
 	}
@@ -145,16 +150,13 @@ export class Draft {
 		this.edits.clear();
 	}
 
-	problem(index: number): string | undefined {
-		return this.question(index).required && empty(this.value(index)) ? '此题必答，请先填写答案' : undefined;
-	}
-
 	answers(): Answer[] {
-		return this.form.questions.map(({ id, prompt }, i) => {
-			const value = this.value(i);
-			return value === undefined || empty(value)
-				? { id, prompt, value: null, source: 'skipped' }
-				: { id, prompt, value, source: this.edits.has(i) ? 'user' : 'default' };
+		return this.form.questions.map(({ id, prompt, default: fallback }, i) => {
+			const edit = this.edits.get(i);
+			const useEdit = edit !== undefined && !empty(edit);
+			const value = useEdit ? edit : fallback;
+			if (value === undefined) return { id, prompt, value: null, source: 'skipped' };
+			return { id, prompt, value: Array.isArray(value) ? [...value] : value, source: useEdit ? 'user' : 'default' };
 		});
 	}
 
@@ -163,14 +165,7 @@ export class Draft {
 		return [
 			this.form.title,
 			...this.answers().map(({ id, prompt, value, source }, i) => {
-				const state =
-					source === 'default'
-						? '默认值'
-						: source === 'user'
-							? '已作答'
-							: this.form.questions[i].required
-								? '必答未填写'
-								: '已跳过';
+				const state = source === 'default' ? '默认值' : source === 'user' ? '已作答' : '已跳过';
 				const text = Array.isArray(value) ? value.map((v) => `• ${v}`).join('\n') : value;
 				return `${i + 1}. [${id}] ${prompt}\n【${state}】${text === null ? '' : `\n${text}`}`;
 			}),

@@ -199,13 +199,13 @@ Flow 固定的是步骤、数据接口和激活条件。比如一次依赖兼容
 | 填空 | 直接输入或粘贴，`Enter` 换行 |
 | 翻题或回改 | `Tab` 下一题，`Shift+Tab` 上一题；最后一题的 `Tab` 进入预览 |
 | 查看整份回答 | `Ctrl+P` 预览，`↑` / `↓` 或 `PgUp` / `PgDn` 滚动；`Shift+Tab` 回到题目修改 |
-| 重新作答 | `Ctrl+R`，再按 `Y` 清除本次修改并恢复各题默认值；`N` 保留 |
-| 提交 | 在预览页按 `Enter` 进入确认，再按 `Y` 才发送；`N` 回预览。连按 `Enter` 不会提交 |
-| 改为手写 | 任意页面按 `Esc`。回到原输入框，原草稿保留；未确认的表单答案不会提交 |
+| 提交 | 在任一题、预览页或重填提示中按 `Shift+Enter` 发起提交，不必先翻到末页。确认框中 `Enter` 才发送，`Esc` 取消并返回原页，保留答案 |
+| 重新作答 | `Ctrl+R` 打开重填确认框；`Enter` 清除修改、恢复各题默认值并回到第一题，`Esc` 取消重填 |
+| 改为手写 | 作答页或预览页按 `Esc` 回到原输入框，保留原草稿。确认框中的 `Esc` 只取消该次操作，不退出问卷 |
 
-题目可有默认值，直接翻页即可沿用；选填题可以留空，必答题没有答案时会提示。预览会标明哪些是默认值、哪些是你填写的。确认提交后，模型收到预览中的答复并继续工作。**已提交的回答会进入会话历史**，不要用它填写密码或密钥。print、JSON、RPC 等非 TUI 模式不弹终端控件，改由模型列出问题，等待书面回复。
+所有问题都允许留空。未填写或主动清空的题目，有默认值就按默认值提交，否则标为「已跳过」，不会替你猜答案。提交前，如果有题目不是你亲自作答的，确认框会列出已作答、采用默认值和留空的题数；全部亲自作答时则显示完成提示。随时可以预览最终答复，确认后模型收到与预览一致的内容。**已提交的回答会进入会话历史**，不要用它填写密码或密钥。print、JSON、RPC 等非 TUI 模式不弹终端控件，改由模型列出问题，等待书面回复。
 
-实现复用 Pi 官方 `questionnaire.ts` 示例采用的 `ctx.ui.custom()` 输入区和 `pi-tui` 文本编辑器，而不是改写全局编辑器。分题草稿参考 [Codex 的底部答题面板](https://github.com/openai/codex/blob/8727186a0a0e097f5e4496ba830f5d59c235b88c/codex-rs/tui/src/bottom_pane/request_user_input/mod.rs)，多选及取消与已答的区分参考 [OpenCode 的 question 工具](https://github.com/sst/opencode/blob/314842df119544845441fe6f7a3dec0bba857624/packages/core/src/tool/plugin/question.ts)。LDK 不采用最后一题直接发送的行为，而是固定经过预览和确认。
+实现复用 Pi 官方 `questionnaire.ts` 示例采用的 `ctx.ui.custom()` 输入区和 `pi-tui` 文本编辑器，而不是改写全局编辑器。分题草稿参考 [Codex 的底部答题面板](https://github.com/openai/codex/blob/8727186a0a0e097f5e4496ba830f5d59c235b88c/codex-rs/tui/src/bottom_pane/request_user_input/mod.rs)，多选及取消与已答的区分参考 [OpenCode 的 question 工具](https://github.com/sst/opencode/blob/314842df119544845441fe6f7a3dec0bba857624/packages/core/src/tool/plugin/question.ts)。与 LDK 的 Markdown 编辑模式一致，`Shift+Enter` 只发起提交，确认后才发送；预览是可选步骤。
 
 ## 子会话工作台
 
