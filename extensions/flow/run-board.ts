@@ -6,7 +6,7 @@ import type { RunEvent } from './runner.ts';
 import type { FlowToolEvent } from './runtime-types.ts';
 
 /** Display snapshot, never the execution protocol. A tail need not include node_start. */
-export type RunRequest = { node: string; question: string; kind: 'approval' | 'question' | 'host' };
+export type RunRequest = { node: string; question: string; kind: 'approval' | 'question' | 'host' | 'handoff' };
 export type RunFrame = {
 	id: string;
 	name: string;
@@ -307,7 +307,7 @@ function topology(f: RunFrame, b: Board, w: number, t: Theme, max?: number, sele
 	];
 }
 function requestText(r: RunRequest) {
-	const label = { host: '等待主会话工具', question: '待答问题', approval: '待答 gate' }[r.kind];
+	const label = { host: '等待主会话工具', handoff: '已交回主会话', question: '待答问题', approval: '待答 gate' }[r.kind];
 	return `${label} · ${clean(r.node)}${r.question ? `：${clean(r.question)}` : ''}`;
 }
 function resultInfo(f: RunFrame, b: Board, t: Theme, max: number) {

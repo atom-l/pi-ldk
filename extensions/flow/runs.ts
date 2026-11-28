@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { ExtensionAPI, ExtensionContext, ExtensionToolContext } from '@earendil-works/pi-coding-agent';
 import { checkBag, type Bag, type Compiled } from './contract.ts';
-import { startRun, type RunEvent } from './runner.ts';
+import { startRun, type GateAnswer, type RunEvent } from './runner.ts';
 import { diagramFrom, type Diagram } from './graph-lines.ts';
 import { presentation, RUN_ENTRY } from './run-frames.ts';
-import type { RunFrame } from './run-board.ts';
+import type { RunFrame, RunRequest } from './run-board.ts';
 import { invokeTemplate } from './template.ts';
 import { Caller } from './caller.ts';
 import { FlowKnowledge } from './knowledge.ts';
@@ -18,21 +18,29 @@ type Summary = {
 	version: string;
 	phase: Phase;
 	pending: string[];
-	requests?: { node: string; question: string; kind: 'approval' | 'question' | 'host' }[];
+	requests?: RunRequest[];
 	drained: boolean;
 	output?: Bag;
 	error?: string;
 };
 type Journal = { id: string; summary?: Summary; step?: RunEvent; graph?: Diagram };
 type Gate = { question: string; inputs?: Bag; signal: AbortSignal; answer: (yes: boolean, handBack?: boolean) => void };
+type Handoff = { node: string; question: string; inputs?: Bag };
+type Held = { request: Handoff; release: () => void };
 type Reply = Summary & { instruction?: string; gates?: { node: string; question: string; inputs?: Bag }[] };
 type Live = {
 	summary: Summary;
 	relay?: FlowHostRelay;
 	stop: () => void;
 	gates: Map<string, Gate>;
+	held: Map<string, Held>;
 	resume?: (ctx: ExtensionToolContext, s?: AbortSignal) => Promise<Reply>;
 };
+function handoffDetails(l?: Live) {
+	if (!l?.held.size) return {};
+	const requests = Array.from(l.held.values(), (h) => structuredClone(h.request));
+	return { handoff: requests[0], ...(requests.length > 1 ? { handoffs: requests } : {}) };
+}
 const why = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 // Definitions are shared by config root. Runs and their journal belong only to this Pi branch.
@@ -90,10 +98,9 @@ export function runBook(pi: ExtensionAPI) {
 			record(l, { id, step: { type: 'context_read', id: reader, source, version } }),
 		);
 		const usesTools = Object.values(graph.nodes).some((node) => node.tools?.length);
-		const l: Live = { summary, stop: abort, gates: new Map() };
+		const l: Live = { summary, stop: abort, gates: new Map(), held: new Map() };
 		live.set(id, l);
 		let wake: (() => void) | undefined;
-		let handoff: { node: string; question: string; inputs?: Bag } | undefined;
 		const forms = new Map<string, string>();
 		const relay = new FlowHostRelay(
 			pi,
@@ -115,9 +122,9 @@ export function runBook(pi: ExtensionAPI) {
 							'The main path finished. A late Action may still need tools: call flow_continue with this id to finish pending work. Never restart.',
 					}
 				: {}),
-			...(handoff
+			...(l.held.size
 				? {
-						handoff: structuredClone(handoff),
+						...handoffDetails(l),
 						instruction:
 							'The user approved and handed this stage back to the initiating session. Perform the agreed work, then flow_continue the same id. Do not restart.',
 					}
@@ -144,13 +151,14 @@ export function runBook(pi: ExtensionAPI) {
 					question: g.question.slice(0, 240),
 					kind: 'approval' as const,
 				})),
+				...[...l.held.keys()].map((node) => ({ node, question: '已批准；待主会话实施后继续', kind: 'handoff' as const })),
 				...[...forms].map(([node, question]) => ({ node, question, kind: 'question' as const })),
 				...relay.requests().map((r) => ({ node: r.node, question: r.tool, kind: 'host' as const })),
 			];
 			if (requests.length) summary.requests = requests;
 			else delete summary.requests;
 			if (summary.phase === 'running' || summary.phase === 'waiting')
-				summary.phase = requests.length || handoff ? 'waiting' : 'running';
+				summary.phase = requests.length ? 'waiting' : 'running';
 			stamp(l);
 		};
 		const topology = diagramFrom(graph);
@@ -172,10 +180,7 @@ export function runBook(pi: ExtensionAPI) {
 				inputs: (nodeId, inputs) => knowledge.begin(nodeId, inputs),
 				invoke: async (node, inputs, s, nodeId) => {
 					if (!node.template) return invokeTemplate(ctx, node, inputs, s, nodeId);
-					const base =
-						node.tools?.length || handoff
-							? await caller.use(s, async (current) => current)
-							: (caller.attached ?? ctx);
+					const base = node.tools?.length ? await caller.use(s, async (current) => current) : (caller.attached ?? ctx);
 					const localTools = knowledge.localTools(nodeId);
 					if (base.mode === 'tui' && base.hasUI && typeof base.ui.custom === 'function') {
 						const ask = human.askTool(base, { runId: id, flow: graph.name, node: nodeId });
@@ -210,7 +215,7 @@ export function runBook(pi: ExtensionAPI) {
 					record(l, { id, step });
 				},
 				gate: (node, question, s, inputs?: Bag) =>
-					new Promise<boolean>((resolve, reject) => {
+					new Promise<GateAnswer>((resolve, reject) => {
 						if (s.aborted) {
 							reject(new Error('Gate cancelled'));
 							return;
@@ -231,12 +236,23 @@ export function runBook(pi: ExtensionAPI) {
 							inputs,
 							signal: dialog.signal,
 							answer: (yes, handBack) => {
+								let decision: GateAnswer = yes;
 								if (yes && handBack) {
-									handoff = { node, question, inputs };
+									const waitForContinue = new Promise<void>((done) => {
+										const release = () => {
+											s.removeEventListener('abort', release);
+											l.held.delete(node);
+											if (s.aborted) refresh();
+											done();
+										};
+										l.held.set(node, { request: { node, question, inputs }, release });
+										s.addEventListener('abort', release, { once: true });
+									});
+									decision = { approved: true, waitForContinue };
 									wake?.();
 								}
 								close();
-								resolve(yes);
+								resolve(decision);
 							},
 						});
 						s.addEventListener('abort', cancel, { once: true });
@@ -282,8 +298,8 @@ export function runBook(pi: ExtensionAPI) {
 			l.resume = async (current, s) => {
 				if (l.gates.size || relay.requests().length) return reply(); // A new tool call cannot approve a gate.
 				caller.attach(current);
-				if (handoff) {
-					handoff = undefined;
+				if (l.held.size) {
+					for (const h of l.held.values()) h.release();
 					refresh();
 				}
 				s?.addEventListener('abort', abort, { once: true });
@@ -341,6 +357,7 @@ export function runBook(pi: ExtensionAPI) {
 		return {
 			...runs.get(id),
 			steps,
+			...handoffDetails(live.get(id)),
 			...(live.get(id)?.relay?.requests().length ? { hostRequests: live.get(id)!.relay!.requests() } : {}),
 			gates: [...(live.get(id)?.gates ?? [])].map(([node, g]) => ({ node, question: g.question, inputs: g.inputs })),
 		};

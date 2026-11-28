@@ -19,6 +19,9 @@ export type RunEvent =
 	| { type: 'run_cancelled' }
 	| { type: 'run_failed'; error: string }
 	| { type: 'run_finish'; outputs: Bag };
+// Record the human decision immediately, but do not deliver its port while
+// the user has handed the work to the initiating session.
+export type GateAnswer = boolean | { approved: true; waitForContinue: Promise<void> };
 type Options = {
 	cwd: string;
 	signal?: AbortSignal;
@@ -26,7 +29,7 @@ type Options = {
 	/** Delivered inputs, observed only after this node is actually activated. */
 	inputs?: (node: string, inputs: Bag) => void;
 	invoke: (node: Resolved, inputs: Bag, signal: AbortSignal, id: string) => Promise<Bag>;
-	gate: (id: string, question: string, signal: AbortSignal, inputs: Bag) => Promise<boolean>;
+	gate: (id: string, question: string, signal: AbortSignal, inputs: Bag) => Promise<GateAnswer>;
 };
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const nil: Msg = { type: 'null', value: null };
@@ -254,10 +257,15 @@ export function startRun(graph: Compiled, input: Bag, opt: Options) {
 					opt.cwd,
 				);
 			if (n.kind === 'gate') {
-				const question = n.question ?? id,
-					answer = await opt.gate(id, question, sig, bag);
+				const question = n.question ?? id;
+				const decision = await opt.gate(id, question, sig, bag);
 				sig.throwIfAborted();
+				const answer = typeof decision === 'boolean' ? decision : decision.approved;
 				emit({ type: 'gate', id, question, answer });
+				if (typeof decision !== 'boolean') {
+					await decision.waitForContinue;
+					sig.throwIfAborted();
+				}
 				return { [answer ? 'yes' : 'no']: nil };
 			}
 			if (n.kind === 'decision') {
