@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { compile, validateAction, type Action, type Flow } from './contract.ts';
-import { globalsFor, listDefs, readDef, rootFor, saveDef } from './store.ts';
+import { archiveFlow, flowRevision, globalsFor, listDefs, readDef, readFlowSnapshot, rootFor, saveDef } from './store.ts';
 import { runBook } from './runs.ts';
 import { clean, diagramFrom } from './graph-lines.ts';
 import { flowWorkbench } from './workbench.ts';
@@ -20,10 +20,15 @@ const text = (value: unknown) => ({
 });
 const err = (e: unknown) => (e instanceof Error ? e.message : String(e));
 // The list is a view: sanitizing its labels must not change the referenced definition.
-async function chooseName(ctx: ExtensionCommandContext, title: string, names: string[]): Promise<string | undefined> {
+async function chooseName(
+	ctx: ExtensionCommandContext,
+	title: string,
+	names: string[],
+	signal?: AbortSignal,
+): Promise<string | undefined> {
 	if (!names.length) return undefined;
 	const labels = names.map((n, i) => `${i + 1}. ${clean(n)}`);
-	const picked = await ctx.ui.select(clean(title), labels);
+	const picked = await ctx.ui.select(clean(title), labels, signal ? { signal } : undefined);
 	return picked === undefined ? undefined : names[labels.indexOf(picked)];
 }
 export function extractFlowGuide(markdown: string): string {
@@ -45,14 +50,14 @@ function starter(kind: Kind, name: string): Action | Flow {
 		edges: [{ from: ['start', 'out'], to: ['end', 'in'] }],
 	};
 }
-function put(root: string, kind: Kind, name: string, value: unknown) {
+function put(root: string, kind: Kind, name: string, value: unknown, expectedFlowRevision?: string | null) {
 	if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Definition must be a JSON object.');
 	const globals = globalsFor(root);
 	if (kind === 'flow') {
 		if ((value as Flow).name !== name) throw new Error('Flow.name must match the name being saved.');
 		compile(value, globals);
 	} else validateAction(name, value as Action, { ...globals, [name]: value as Action });
-	saveDef(root, kind, name, value);
+	saveDef(root, kind, name, value, expectedFlowRevision);
 	return { root, kind, name, saved: true };
 }
 
@@ -85,18 +90,20 @@ export default function flowExtension(pi: ExtensionAPI) {
 	const runs = runBook(pi);
 	let pinnedRoot: string | undefined;
 	let epoch = 0;
+	let scope = new AbortController();
+	function invalidateScope() {
+		epoch++;
+		scope.abort();
+		scope = new AbortController();
+	}
 	// A directory created during a run by another tool does not silently move the editor.
 	const storage = (ctx: ExtensionContext) => (pinnedRoot ??= rootFor(ctx));
 	pi.on('session_start', () => {
-		epoch++;
+		invalidateScope();
 		pinnedRoot = undefined;
 	});
-	pi.on('session_tree', () => {
-		epoch++;
-	});
-	pi.on('session_shutdown', () => {
-		epoch++;
-	});
+	pi.on('session_tree', invalidateScope);
+	pi.on('session_shutdown', invalidateScope);
 	const renderRun = presentRun(runs);
 	pi.registerTool({
 		name: 'flow_guide',
@@ -115,7 +122,9 @@ export default function flowExtension(pi: ExtensionAPI) {
 			'List names in the session config root by omitting name or passing "". Pass an exact name from the list to read its complete definition. Local and anonymous actions are inside their owning flow.',
 		parameters: Type.Object({
 			kind: kindParam,
-			name: Type.Optional(Type.String({ description: 'Omit or pass "" to list names; otherwise use the exact definition name.' })),
+			name: Type.Optional(
+				Type.String({ description: 'Omit or pass "" to list names; otherwise use the exact definition name.' }),
+			),
 		}),
 		execute: async (_id, { kind, name }, _s, _u, ctx) => {
 			const root = storage(ctx);
@@ -146,6 +155,45 @@ export default function flowExtension(pi: ExtensionAPI) {
 				put(storage(ctx), p.kind, p.name, p.definition),
 				p.kind === 'flow' ? { diagram: diagramFrom(p.definition as Flow) } : {},
 			),
+	});
+	function requireDeleteUI(ctx: ExtensionContext) {
+		if (!ctx.hasUI || (ctx.mode !== 'tui' && ctx.mode !== 'rpc'))
+			throw new Error('删除 Flow 需要用户在交互界面确认；未更改任何定义。');
+	}
+	// Both entry points act on the same revision the user was asked about, never on a run ID.
+	async function confirmArchive(ctx: ExtensionContext, root: string, name: string, signal: AbortSignal) {
+		requireDeleteUI(ctx);
+		signal.throwIfAborted();
+		const version = flowRevision(root, name);
+		const confirm = '移到回收目录';
+		const shown = clean(name);
+		const title = [
+			`删除 Flow：${shown}`,
+			...(shown === name ? [] : [`名称的 UTF-8 编码：${Buffer.from(name).toString('hex')}`]),
+			`配置根：${clean(root)}`,
+			'仅移出活动定义；文件保留，已有运行、历史记录和全局 Action 不变。',
+		].join('\n');
+		const choice = await ctx.ui.select(title, ['取消', confirm], { signal, blockedKind: 'permission' });
+		signal.throwIfAborted();
+		const result = { root, kind: 'flow' as const, name };
+		if (choice !== confirm) return { ...result, deleted: false as const };
+		return { ...result, deleted: true as const, archivePath: archiveFlow(root, name, version) };
+	}
+	pi.registerTool({
+		name: 'flow_delete',
+		label: 'Flow: archive definition',
+		description:
+			'Request user confirmation to move one exact named Flow definition out of the active catalog into recoverable storage. Does not purge files, cancel runs, delete history, or delete global Actions. No force or bulk mode.',
+		exposure: 'model-only',
+		executionMode: 'sequential',
+		annotations: { readOnlyHint: false, destructiveHint: true },
+		parameters: Type.Object({ name: nameParam }, { additionalProperties: false }),
+		execute: async (_id, { name }, s, _u, ctx) => {
+			const abort = s ?? ctx.signal;
+			return text(
+				await confirmArchive(ctx, storage(ctx), name, abort ? AbortSignal.any([scope.signal, abort]) : scope.signal),
+			);
+		},
 	});
 	pi.registerTool({
 		name: 'flow_run',
@@ -229,6 +277,22 @@ export default function flowExtension(pi: ExtensionAPI) {
 		execute: async (_id, p) => text(runs.cancel(p.id)),
 	});
 
+	async function deleteCommand(ctx: ExtensionCommandContext, root: string, specified?: string) {
+		requireDeleteUI(ctx);
+		const signal = scope.signal;
+		let name = specified;
+		if (!name) {
+			const names = listDefs(root, 'flow');
+			if (!names.length) {
+				ctx.ui.notify('尚无可删除的 Flow 定义', 'info');
+				return;
+			}
+			name = await chooseName(ctx, `选择要删除的 Flow · ${root}`, names, signal);
+			if (!name) return;
+		}
+		const r = await confirmArchive(ctx, root, name, signal);
+		ctx.ui.notify(r.deleted ? `已移到回收目录：${clean(r.archivePath)}` : '已取消，Flow 定义未更改。', 'info');
+	}
 	async function browse(ctx: ExtensionCommandContext, root: string, kind: Kind, name: string) {
 		const v = readDef(root, kind, name);
 		if (ctx.mode !== 'tui') {
@@ -255,14 +319,20 @@ export default function flowExtension(pi: ExtensionAPI) {
 		raw = false,
 	) {
 		if (revision !== epoch) throw new Error('会话或分支已切换，请重新打开。');
-		const original = create ? undefined : readDef(root, kind, name);
 		if (create && listDefs(root, kind).includes(name)) throw new Error(`Already exists: ${name}`);
+		const snapshot = !create && kind === 'flow' ? readFlowSnapshot(root, name) : undefined;
+		const original = create ? undefined : snapshot ? snapshot.definition : readDef(root, kind, name);
 		const save = (v: unknown) => {
 			if (epoch !== revision) throw new Error('会话或分支已切换，未保存。');
-			const current = listDefs(root, kind).includes(name) ? readDef(root, kind, name) : undefined;
-			if (JSON.stringify(current) !== JSON.stringify(original))
-				throw new Error('定义在编辑期间已被更改，未覆盖。请重新打开。');
-			put(root, kind, name, v);
+			if (kind === 'flow') {
+				// Compare under the same store lock as archiving. An old editor must not resurrect its deleted Flow.
+				put(root, kind, name, v, snapshot?.revision ?? null);
+			} else {
+				const current = listDefs(root, kind).includes(name) ? readDef(root, kind, name) : undefined;
+				if (JSON.stringify(current) !== JSON.stringify(original))
+					throw new Error('定义在编辑期间已被更改，未覆盖。请重新打开。');
+				put(root, kind, name, v);
+			}
 		};
 		let draft = structuredClone(original ?? starter(kind, name));
 		if (raw || ctx.mode !== 'tui') return jsonEditor(ctx, root, kind, name, draft, save);
@@ -294,13 +364,17 @@ export default function flowExtension(pi: ExtensionAPI) {
 		pi.registerCommand(kind, {
 			description:
 				kind === 'flow'
-					? '编辑命名流程 / 查看运行；/flow answer <id> 回答人工关口。'
+					? '编辑命名流程 / 查看运行；/flow delete [名称] 移到回收目录，/flow answer <id> 回答人工关口。'
 					: '查看、新建或编辑全局 Action；Flow 专有 Action 在 /flow 内编辑。',
 			handler: async (args, ctx) => {
 				try {
 					const root = storage(ctx),
 						revision = epoch;
 					const [, op = '', arg = ''] = /^(\S+)?(?:\s+([\s\S]*))?$/.exec(args.trim())!;
+					if (kind === 'flow' && op === 'delete') {
+						await deleteCommand(ctx, root, arg || undefined);
+						return;
+					}
 					if (kind === 'flow' && op === 'answer') {
 						await runs.answer(ctx, arg);
 						return;
@@ -367,11 +441,16 @@ export default function flowExtension(pi: ExtensionAPI) {
 					}
 					if (op)
 						throw new Error(
-							`/${kind} [list | view 名称 | new 名称 | edit 名称 | json 名称${kind === 'flow' ? ' | status [id] | answer id | cancel id' : ''}]`,
+							`/${kind} [list | view 名称 | new 名称 | edit 名称 | json 名称${kind === 'flow' ? ' | delete [名称] | status [id] | answer id | cancel id' : ''}]`,
 						);
 					const choices = ['新建…', ...names.map((n, i) => `${i + 1}. 编辑：${clean(n)}`)];
+					if (kind === 'flow' && names.length) choices.push('删除 Flow…');
 					const pick = await ctx.ui.select(`${kind} · ${clean(root)}`, choices);
 					if (!pick || revision !== epoch) return;
+					if (pick === '删除 Flow…') {
+						await deleteCommand(ctx, root);
+						return;
+					}
 					const create = pick === choices[0];
 					const name = create ? (await ctx.ui.input(`新 ${kind} 名称`))?.trim() : names[choices.indexOf(pick) - 1];
 					if (name) await editDefinition(ctx, root, kind, name, create, revision);
