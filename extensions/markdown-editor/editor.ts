@@ -1,5 +1,5 @@
-import { CustomEditor, getMarkdownTheme, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
-import { matchesKey, type EditorTheme, type MarkdownTheme, type TUI } from "@earendil-works/pi-tui";
+import { CustomEditor, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { matchesKey, type Editor, type MarkdownTheme } from "@earendil-works/pi-tui";
 
 /** CSI/OSC/APC sequences, including Pi's APC cursor markers, are never source text. */
 const ANSI_SEQUENCE_SOURCE = String.raw`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[_P^][^\x07\x1b]*(?:\x07|\x1b\\))`;
@@ -149,6 +149,24 @@ export function highlightMarkdownSourceLines(lines: string[], visibleSourceRows:
 	}
 }
 
+/** Decorate a native Editor frame without changing its layout, input handling or buffer. */
+export function markdownSourceFrame(editor: Editor, nativeLines: string[]): string[] {
+	try {
+		const rows: unknown = Reflect.get(editor, 'renderedVisibleLineCount');
+		// Don't guess from total height: borders, overflow notices and suggestions are native UI.
+		if (typeof rows !== 'number' || !Number.isInteger(rows) || rows <= 0 || rows > nativeLines.length - 2) {
+			return nativeLines;
+		}
+		const styled = [...nativeLines];
+		highlightMarkdownSourceLines(styled, rows);
+		return styled;
+	} catch {
+		// A theme can be unavailable (even its style callbacks read host state lazily).
+		// Discard partial highlighting, never block editing or expose the source in a diagnostic.
+		return nativeLines;
+	}
+}
+
 export class MarkdownEditor extends CustomEditor {
 	onRequestSubmit: (() => void) | undefined;
 	/** Return true only when the current input is a command Pi can execute. */
@@ -187,13 +205,6 @@ export class MarkdownEditor extends CustomEditor {
 	}
 
 	override render(width: number): string[] {
-		const sourceLines = [...super.render(width)];
-		const rows: unknown = Reflect.get(this, 'renderedVisibleLineCount');
-		// Do not guess from total height: borders, overflow notices and suggestions
-		// are native UI, not Markdown. Return the original layout if unsure.
-		if (typeof rows === 'number' && Number.isInteger(rows) && rows > 0 && rows <= sourceLines.length - 2) {
-			highlightMarkdownSourceLines(sourceLines, rows);
-		}
-		return sourceLines;
+		return markdownSourceFrame(this, super.render(width));
 	}
 }

@@ -1,6 +1,6 @@
 import type { AgentToolResult, ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { Text } from '@earendil-works/pi-tui';
-import { Draft, FORM_LABEL, formParams, parseForm, type Answer, type Form } from './model.ts';
+import { Draft, FOLLOWUP_GUIDE, FORM_LABEL, formParams, parseForm, type Answer, type Form } from './model.ts';
 import { createReplyUI } from './ui.ts';
 
 // Pi omits its standard tools/rules sections when a custom system prompt is used.
@@ -8,6 +8,7 @@ import { createReplyUI } from './ui.ts';
 const FORM_POLICY = [
 	'需要用户拍板时，默认调用 ask_form，而不是在正文列问题。哪怕只有一个问题，也不必等用户点名表单。',
 	'例如：由用户选择实施范围、在互斥方案中取舍，或补充无法从上下文查到的必要信息。选一项用 single，可选多项用 multi，自由回答用 text。把本轮相关问题合成一次调用，单独调用后等待答复。',
+	'只在某个答案下才有意义的追问，须在追问题上写 showIf，而不是仅标选填。不能用前面一道单选题的选项表达时，先问前题，等用户回答后再追问。',
 	'请求已经明确、答案可自行查证或用户已授权你判断时，直接推进，不制造问题。用户明确要求手写或纯文字时按其要求，不弹表单。',
 ].join('\n');
 
@@ -69,7 +70,7 @@ export default function replyFormExtension(pi: ExtensionAPI) {
 		name: 'ask_form',
 		label: FORM_LABEL,
 		description:
-			'Default interactive way to obtain a user-owned decision, preference, or missing requirement, even for a single question. Ask via single choice, multiple choice or free text; no need to ask permission to open the form first. A default is a suggestion, not consent. Use showIf for follow-ups to an earlier single choice. Hidden questions are omitted. On confirmation a visible blank uses its default if present, otherwise it is skipped. Do not infer consent or a value for skipped questions. If the user chooses manual input, wait for their written reply.',
+			`Default interactive way to obtain a user-owned decision, preference, or missing requirement, even for a single question. Ask via single choice, multiple choice or Markdown text. ${FOLLOWUP_GUIDE} Hidden questions are omitted. A default is a suggestion, not consent. On confirmation a visible blank uses its default if present, otherwise it is skipped. Do not infer consent or a value for skipped questions. If the user chooses manual input, wait for their written reply.`,
 		promptSnippet: 'Collect a needed user decision or clarification (one or more questions) in a reply form.',
 		promptGuidelines: [
 			'In the interactive terminal, use ask_form instead of asking for a decision in prose, even for one question. Batch related questions in one standalone call. Respect a request for plain text; when no user input is needed, proceed without asking.',

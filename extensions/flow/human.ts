@@ -1,6 +1,6 @@
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui';
-import { Draft, formParams, parseForm } from '../reply-form/model.ts';
+import { Draft, FOLLOWUP_GUIDE, formParams, parseForm } from '../reply-form/model.ts';
 import { createReplyUI } from '../reply-form/ui.ts';
 import type { Bag } from './contract.ts';
 import { clean } from './graph-lines.ts';
@@ -155,7 +155,7 @@ export class FlowHumanUI {
 		return {
 			name: 'flow_ask_form',
 			description:
-				'Ask the initiating user a decision or clarification for this Flow Action. Uses single, multiple or text questions. Only confirmed submission accepts answers/defaults; skipped questions and cancelled requests are not consent. Do not repeat a cancelled request.',
+				`Ask the initiating user a decision or clarification for this Flow Action. Use single choice, multiple choice or Markdown text. ${FOLLOWUP_GUIDE} Only confirmed submission accepts answers/defaults; skipped questions and cancelled requests are not consent. Do not repeat a cancelled request.`,
 			parameters: formParams,
 			execute: async (args, signal) => {
 				signal.throwIfAborted();

@@ -14,10 +14,11 @@ import {
 	type TUI,
 	type KeybindingsManager,
 } from '@earendil-works/pi-tui';
+import { markdownSourceFrame } from '../markdown-editor/editor.ts';
 import { type Draft, FORM_LABEL, MAX_TEXT_LENGTH } from './model.ts';
 
 type Page = 'question' | 'preview' | 'confirm' | 'reset';
-const kindLabels = { single: '单选', multi: '多选', text: '文本' };
+const kindLabels = { single: '单选', multi: '多选', text: '文本（支持 Markdown）' };
 const pasteStart = '\x1b[200~',
 	pasteEnd = '\x1b[201~';
 const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
@@ -295,7 +296,8 @@ export function createReplyUI(
 				for (const { segment } of graphemes.segment(value))
 					minEditorWidth = Math.max(minEditorWidth, 1 + visibleWidth(segment));
 			}
-			editorLines = editor.render(Math.max(minEditorWidth, width));
+			// Reuse /md's source rendering only. This field has no command provider or chat submit action.
+			editorLines = markdownSourceFrame(editor, editor.render(Math.max(minEditorWidth, width)));
 		}
 		// Don't let wrapped key hints push the answer off a small screen.
 		if (header.length + help.length + editorLines.length + warning.length + 7 > tui.terminal.rows) {

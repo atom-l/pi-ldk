@@ -2,6 +2,9 @@ import { Type } from 'typebox';
 import { Check } from 'typebox/value';
 
 export const FORM_LABEL = '回复表单';
+// Also used by Flow Actions, which do not inherit the main chat’s form-authoring instructions.
+export const FOLLOWUP_GUIDE =
+	'For a dependent follow-up, set showIf on that question. After a single choice id "has" ("是"/"否"), give the detail question "showIf":{"questionId":"has","equals":"是"}. required:false means optional, not hidden. If one earlier single choice cannot express the condition, ask the prerequisite first and wait.';
 const MAX_QUESTIONS = 24;
 const MAX_OPTIONS = 32;
 const MAX_OPTION = 160;
@@ -32,14 +35,14 @@ const questionSchema = Type.Object(
 				{ questionId: Type.String({ minLength: 1, maxLength: MAX_ID }), equals: option },
 				{
 					additionalProperties: false,
-					description: 'Show only when an earlier visible single-choice question resolves to this exact option.',
+					description: 'Required for a conditional follow-up: reference an earlier single choice by id and one exact option label. Leave out for independent questions.',
 				},
 			),
 		),
 		required: Type.Optional(
 			Type.Boolean({
 				description:
-					'Whether an answer is requested (default true). Advisory only: the user can leave any question blank.',
+					'Whether an answer is requested (default true). Advisory only: any visible question can be left blank. This flag does not control visibility; use showIf for that.',
 			}),
 		),
 	},
