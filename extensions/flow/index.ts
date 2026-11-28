@@ -112,12 +112,15 @@ export default function flowExtension(pi: ExtensionAPI) {
 		renderCall: toolHeading('查看定义'),
 		renderResult: presentDefinition,
 		description:
-			'List named flows or global actions in the session config root, or view the complete named definition. Local and anonymous actions are inside their owning flow.',
-		parameters: Type.Object({ kind: kindParam, name: Type.Optional(nameParam) }),
+			'List names in the session config root by omitting name or passing "". Pass an exact name from the list to read its complete definition. Local and anonymous actions are inside their owning flow.',
+		parameters: Type.Object({
+			kind: kindParam,
+			name: Type.Optional(Type.String({ description: 'Omit or pass "" to list names; otherwise use the exact definition name.' })),
+		}),
 		execute: async (_id, { kind, name }, _s, _u, ctx) => {
 			const root = storage(ctx);
 			return text(
-				name === undefined
+				name === undefined || name === ''
 					? { root, kind, names: listDefs(root, kind) }
 					: { root, kind, name, definition: readDef(root, kind, name) },
 			);
