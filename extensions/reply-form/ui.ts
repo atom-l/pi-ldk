@@ -123,7 +123,13 @@ export function createReplyUI(
 		editor = undefined;
 		if (q.kind === 'text') openEditor();
 	}
-	question(0);
+	question(0); // The first question cannot depend on an earlier one.
+
+	// index is always the original draft index; only the route and progress change.
+	function adjacent(step: -1 | 1) {
+		const visible = draft.visibleIndices();
+		return visible[visible.indexOf(index) + step];
+	}
 
 	function showPreview() {
 		page = 'preview';
@@ -190,7 +196,8 @@ export function createReplyUI(
 			return;
 		}
 		if (matchesKey(data, Key.shift('tab'))) {
-			if (page === 'preview' || index > 0) question(page === 'preview' ? index : index - 1);
+			const previous = page === 'preview' ? index : adjacent(-1);
+			if (previous !== undefined) question(previous);
 			return;
 		}
 		if (page === 'preview') {
@@ -202,7 +209,8 @@ export function createReplyUI(
 		}
 		if (matchesKey(data, Key.ctrl('p'))) return showPreview();
 		if (matchesKey(data, Key.tab)) {
-			if (index + 1 < questions.length) question(index + 1);
+			const next = adjacent(1);
+			if (next !== undefined) question(next);
 			else showPreview();
 			return;
 		}
@@ -263,13 +271,16 @@ export function createReplyUI(
 			];
 		}
 		const q = questions[index],
-			inPreview = page === 'preview';
+			inPreview = page === 'preview',
+			visible = draft.visibleIndices(),
+			position = visible.indexOf(index) + 1,
+			progress = `${position}/${visible.length}`;
 		const heading = inPreview
 			? '提交预览'
-			: `${FORM_LABEL}  ${index + 1}/${questions.length} · ${kindLabels[q.kind]} · ${q.required ? '建议作答' : '选填'}`;
+			: `${FORM_LABEL}  ${progress} · ${kindLabels[q.kind]} · ${q.required ? '建议作答' : '选填'}`;
 		const footer = inPreview
 			? `↑↓ 滚动 · Shift+Tab 回改 · Shift+Enter 提交 · Ctrl+R 重填 · Esc ${escapeLabel}`
-			: `${editor ? 'Enter 换行' : '↑↓ 移动 · 空格选择 · 退格清空'} · Tab ${index + 1 === questions.length ? '预览' : '下一题'} · Shift+Tab 上一题 · Ctrl+P 预览 · Shift+Enter 提交 · Ctrl+R 重填 · Esc ${escapeLabel}`;
+			: `${editor ? 'Enter 换行' : '↑↓ 移动 · 空格选择 · 退格清空'} · Tab ${position === visible.length ? '预览' : '下一题'} · Shift+Tab 上一题 · Ctrl+P 预览 · Shift+Enter 提交 · Ctrl+R 重填 · Esc ${escapeLabel}`;
 		let header = fg('accent', heading),
 			help = fg('muted', footer);
 		const warning = notice ? fg('warning', notice) : [];
@@ -288,7 +299,7 @@ export function createReplyUI(
 		}
 		// Don't let wrapped key hints push the answer off a small screen.
 		if (header.length + help.length + editorLines.length + warning.length + 7 > tui.terminal.rows) {
-			header = [theme.fg('accent', inPreview ? '提交预览' : `${index + 1}/${questions.length} ${kindLabels[q.kind]}`)];
+			header = [theme.fg('accent', inPreview ? '提交预览' : `${progress} ${kindLabels[q.kind]}`)];
 			help = [
 				theme.fg(
 					'muted',

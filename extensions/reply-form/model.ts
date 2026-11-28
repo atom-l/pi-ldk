@@ -27,6 +27,15 @@ const questionSchema = Type.Object(
 					'Optional prefill, not approval. Text: nonblank string. Single: one exact option. Multi: nonempty list of distinct exact options.',
 			}),
 		),
+		showIf: Type.Optional(
+			Type.Object(
+				{ questionId: Type.String({ minLength: 1, maxLength: MAX_ID }), equals: option },
+				{
+					additionalProperties: false,
+					description: 'Show only when an earlier visible single-choice question resolves to this exact option.',
+				},
+			),
+		),
 		required: Type.Optional(
 			Type.Boolean({
 				description:
@@ -52,6 +61,7 @@ export type Question = {
 	kind: (typeof kinds)[number];
 	options?: string[];
 	default?: Value;
+	showIf?: { questionId: string; equals: string };
 	required: boolean;
 };
 export type Form = { title: string; questions: Question[] };
@@ -93,12 +103,11 @@ function checkedValue(q: Question, value: Value): Value {
 export function parseForm(raw: unknown): Form {
 	if (!Check(formParams, raw)) throw new Error(`${FORM_LABEL}结构不符，请检查字段类型、数量、长度及选项是否重复`);
 	const title = label(raw.title ?? FORM_LABEL, '标题', MAX_TITLE);
-	const ids = new Set<string>();
+	const prior = new Map<string, Question>();
 	const questions = Array.from(raw.questions, (input, i): Question => {
 		const name = `第 ${i + 1} 题`;
 		const id = label(input.id, `${name} ID`, MAX_ID);
-		if (id.trim() !== id || ids.has(id)) throw new Error(`${name} ID 有首尾空白或重复`);
-		ids.add(id);
+		if (id.trim() !== id || prior.has(id)) throw new Error(`${name} ID 有首尾空白或重复`);
 		const q: Question = {
 			id,
 			prompt: label(input.prompt, `${name}题干`, MAX_PROMPT, true),
@@ -119,6 +128,14 @@ export function parseForm(raw: unknown): Form {
 			q.default = checkedValue(q, input.default);
 			if (empty(q.default)) throw new Error(`${name}默认值不能为空白，不预填请省略 default`);
 		}
+		if (input.showIf !== undefined) {
+			const { questionId, equals } = input.showIf;
+			const parent = prior.get(questionId);
+			if (parent?.kind !== 'single') throw new Error(`${name} showIf 必须引用前面的单选题`);
+			if (!parent.options!.includes(equals)) throw new Error(`${name} showIf 必须匹配该单选题的一个选项`);
+			q.showIf = { questionId, equals };
+		}
+		prior.set(id, q);
 		return q;
 	});
 	return { title, questions };
@@ -143,7 +160,7 @@ export class Draft {
 		return Array.isArray(value) ? [...value] : value;
 	}
 
-	// Keep empty edits visible in the editor. Resolve defaults only for preview/submission.
+	// Keep empty edits visible in the editor, even when the effective answer uses a default.
 	set(index: number, value: Value): void {
 		this.edits.set(index, checkedValue(this.question(index), value));
 	}
@@ -151,13 +168,32 @@ export class Draft {
 		this.edits.clear();
 	}
 
+	private nonblankEdit(index: number): Value | undefined {
+		const edit = this.edits.get(index);
+		return empty(edit) ? undefined : edit;
+	}
+
+	visibleIndices(): number[] {
+		const indices: number[] = [];
+		const visibleSingles = new Map<string, string>();
+		for (const [i, q] of this.form.questions.entries()) {
+			if (q.showIf && visibleSingles.get(q.showIf.questionId) !== q.showIf.equals) continue;
+			indices.push(i);
+			if (q.kind === 'single') {
+				const value = this.nonblankEdit(i) ?? q.default;
+				if (typeof value === 'string') visibleSingles.set(q.id, value);
+			}
+		}
+		return indices;
+	}
+
 	answers(): Answer[] {
-		return this.form.questions.map(({ id, prompt, default: fallback }, i) => {
-			const edit = this.edits.get(i);
-			const useEdit = edit !== undefined && !empty(edit);
-			const value = useEdit ? edit : fallback;
+		return this.visibleIndices().map((i) => {
+			const { id, prompt, default: fallback } = this.form.questions[i];
+			const edit = this.nonblankEdit(i);
+			const value = edit ?? fallback;
 			if (value === undefined) return { id, prompt, value: null, source: 'skipped' };
-			return { id, prompt, value: Array.isArray(value) ? [...value] : value, source: useEdit ? 'user' : 'default' };
+			return { id, prompt, value: Array.isArray(value) ? [...value] : value, source: edit !== undefined ? 'user' : 'default' };
 		});
 	}
 

@@ -21,9 +21,13 @@ function result(body: string, details: Details, terminate = false): AgentToolRes
 
 // No values from Draft (not even effective defaults) cross the tool boundary on dismissal.
 function written(form: Form, status: 'manual' | 'unavailable') {
-	const lines = form.questions.map(
-		(q, i) => `${i + 1}. ${q.prompt}${q.options ? `\n   选项：${q.options.join(' / ')}` : ''}`,
-	);
+	// Refer to the original numbering: the user has not submitted a branch.
+	// Describe each rule instead of exposing draft values or choosing a path for them.
+	const numbers = new Map(form.questions.map((q, i) => [q.id, i + 1]));
+	const lines = form.questions.map((q, i) => {
+		const when = q.showIf ? `仅当第 ${numbers.get(q.showIf.questionId)} 题适用且答案为「${q.showIf.equals}」时回答：` : '';
+		return `${i + 1}. ${when}${q.prompt}${q.options ? `\n   选项：${q.options.join(' / ')}` : ''}`;
+	});
 	const notice =
 		status === 'manual'
 			? '已切换为手写。没有提交表单或接受默认答案；请在原输入框回复。'
@@ -65,7 +69,7 @@ export default function replyFormExtension(pi: ExtensionAPI) {
 		name: 'ask_form',
 		label: FORM_LABEL,
 		description:
-			'Default interactive way to obtain a user-owned decision, preference, or missing requirement, even for a single question. Ask via single choice, multiple choice or free text; no need to ask permission to open the form first. A default is a suggestion, not consent. The user may submit a partial form. On confirmation, a blank uses its default if present, otherwise it is skipped. Do not infer consent or a value for skipped questions. If the user chooses manual input, wait for their written reply.',
+			'Default interactive way to obtain a user-owned decision, preference, or missing requirement, even for a single question. Ask via single choice, multiple choice or free text; no need to ask permission to open the form first. A default is a suggestion, not consent. Use showIf for follow-ups to an earlier single choice. Hidden questions are omitted. On confirmation a visible blank uses its default if present, otherwise it is skipped. Do not infer consent or a value for skipped questions. If the user chooses manual input, wait for their written reply.',
 		promptSnippet: 'Collect a needed user decision or clarification (one or more questions) in a reply form.',
 		promptGuidelines: [
 			'In the interactive terminal, use ask_form instead of asking for a decision in prose, even for one question. Batch related questions in one standalone call. Respect a request for plain text; when no user input is needed, proceed without asking.',
