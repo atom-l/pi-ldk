@@ -27,7 +27,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { SessionManager, type SessionInfo } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { rmSync } from "node:fs";
+import { lstatSync, rmSync, statSync, type BigIntStats } from "node:fs";
 
 type Ctx = ExtensionCommandContext;
 
@@ -38,6 +38,29 @@ async function listSessions(ctx: Ctx) {
 	const sessions = await SessionManager.list(cwd, sessionDir);
 	sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 	return sessions;
+}
+
+/** Delete only a confirmed, inactive file. After replacement, pass the new context. */
+function deleteInactiveSession(ctx: Ctx, path: string, selected: BigIntStats): void {
+	const active = ctx.sessionManager.getSessionFile();
+	try {
+		// A switch hook may have moved the old file and reused its name. Never unlink its replacement.
+		const target = lstatSync(path, { bigint: true });
+		if (!target.isFile() || target.dev !== selected.dev || target.ino !== selected.ino || target.birthtimeNs !== selected.birthtimeNs) {
+			ctx.ui.notify(`Not deleted: session file changed: ${path}`, "warning");
+			return;
+		}
+		const activeStat = active && statSync(active, { bigint: true, throwIfNoEntry: false });
+		if (active === path || (activeStat && activeStat.dev === target.dev && activeStat.ino === target.ino)) {
+			ctx.ui.notify("Not deleted: session file is still active", "warning");
+			return;
+		}
+		rmSync(path);
+	} catch (err) {
+		ctx.ui.notify(`Failed to delete ${path}: ${err instanceof Error ? err.message : String(err)}`, "warning");
+		return;
+	}
+	ctx.ui.notify("Session deleted", "info");
 }
 
 /** Build a readable one-line label for the session picker. */
@@ -227,32 +250,31 @@ export default function sessionsExtension(pi: ExtensionAPI): void {
 			if (!sel) return;
 			const target = sessions[options.indexOf(sel)];
 			const isCurrent = target.path === current;
+			let selected: BigIntStats;
+			try {
+				selected = lstatSync(target.path, { bigint: true });
+				if (!selected.isFile()) throw new Error("Not a regular session file");
+			} catch (err) {
+				ctx.ui.notify(`Cannot select ${target.path}: ${err instanceof Error ? err.message : String(err)}`, "warning");
+				return;
+			}
 			const warning = isCurrent
-				? "\n\nThis is the CURRENT session — a new empty session will start after deletion."
+				? "\n\nThis is the CURRENT session — a new empty session must start before this file is deleted."
 				: "";
 			const ok = await ctx.ui.confirm("Delete session?", `${target.path}${warning}`);
 			if (!ok) {
 				ctx.ui.notify("Cancelled", "info");
 				return;
 			}
-			// rmSync 对已被外部删除/权限不足的路径会抛(ENOENT/EPERM/EISDIR),
-			// 在 async handler 中即为未处理拒绝;这里降级为提示,不阻断后续流程。
-			try {
-				rmSync(target.path);
-			} catch (err) {
-				ctx.ui.notify(`Failed to delete ${target.path}: ${err instanceof Error ? err.message : String(err)}`, "warning");
+			if (!isCurrent) {
+				deleteInactiveSession(ctx, target.path, selected);
 				return;
 			}
-			if (isCurrent) {
-				const res = await ctx.newSession({
-					withSession: async (newCtx) => {
-						newCtx.ui.notify("Session deleted", "info");
-					},
-				});
-				if (res.cancelled) ctx.ui.notify("Cancelled", "info");
-			} else {
-				ctx.ui.notify("Session deleted", "info");
-			}
+			// A veto or failed replacement never reaches withSession; leave the original alone.
+			const res = await ctx.newSession({
+				withSession: async (newCtx) => deleteInactiveSession(newCtx, target.path, selected),
+			});
+			if (res.cancelled) ctx.ui.notify("Cancelled", "info");
 		},
 	});
 

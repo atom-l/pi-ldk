@@ -72,7 +72,7 @@ const GenerateParams = Type.Object({
 	),
 	count: Type.Optional(Type.Integer({ minimum: 1, maximum: 8, description: "Number of images to generate (default 1)." })),
 	size: Type.Optional(
-		Type.String({ description: 'Requested image size, e.g. "1024x1024". Forwarded as image_config.size unless overridden in config.' }),
+		Type.String({ description: 'Optional resolution. For a native Pi 1.7 OpenRouter or Radius image model use a provider-supported tier such as "2K". Pixel dimensions such as "1024x1024" require a legacy imageGeneration backend.' }),
 	),
 	referenceImages: Type.Optional(
 		Type.Array(Type.String(), {
@@ -166,11 +166,8 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 				details,
 				usage: result.usage
 					? {
-							input: result.usage.input,
-							output: result.usage.output,
-							cacheRead: result.usage.cacheRead,
-							cacheWrite: result.usage.cacheWrite,
-							totalTokens: result.usage.totalTokens,
+							// Keep the registry's optional token breakdowns (e.g. imageOutput).
+							...result.usage,
 							cost: result.usage.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 						}
 					: undefined,
@@ -257,7 +254,7 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 	pi.registerCommand("imagine", {
 		description:
 			"Generate images interactively: /imagine [prompt] — pickers ask for model, size, and count. " +
-			"Flags skip the matching picker (model=provider/id n=2 size=1024x1024 out=dir). /imagine list shows configured models.",
+			"Flags skip the matching picker (model=provider/id size=2K out=dir; legacy example: size=1024x1024 n=2). /imagine list shows configured models.",
 		handler: async (args, ctx) => {
 			let tokens: string[];
 			try { tokens = imagineTokens(args); } catch (error) { notify(ctx, String(error), 'error'); return; }

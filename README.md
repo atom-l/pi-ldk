@@ -9,7 +9,7 @@ pi install git:github.com/atom-l/pi-ldk        # 安装；加 @<tag 或提交> �
 pi -e git:github.com/atom-l/pi-ldk            # 仅本次试用，不改 settings
 ```
 
-本文按 **Pi 1.6.1** 校对。`peerDependencies: "*"` 表示复用宿主包，不是全版本兼容保证。扩展以 Pi 进程的系统权限运行，可访问文件、凭证和会话历史；安装前请审阅来源。
+开发和验收基线为 **Pi 1.7.0**。从源码开发时，`npm install` 按 `devDependencies` 安装指定版本；通过 Pi 安装时，五个 `peerDependencies: "*"` 复用宿主提供的包，不另装一套 Pi，也不表示兼容所有版本。扩展以 Pi 进程的系统权限运行，可访问文件、凭证和会话历史；安装前请审阅来源。
 
 ### 只加载部分扩展
 
@@ -26,7 +26,7 @@ pi -e git:github.com/atom-l/pi-ldk            # 仅本次试用，不改 setting
 | 功能（源码） | 入口 |
 |---|---|
 | [会话命令](extensions/sessions.ts) | `/session-new`（`/sn`、`/clear`）**开新会话，不删除已有会话文件，不是清屏**；`/session-list`（`/sl`、`/sessions`）切换会话。 |
-| 会话删除与合并 | `/session-delete`（`/sd`、`/sdel`）删选中的会话；`/session-delete-all`（`/sda`、`/sdel-all`）保留当前会话，确认后永久删除当前会话目录中列出的其他会话文件。`/session-merge`（`/sm`、`/merge`）合并对话转录并请求摘要；`/sm raw` 只合并转录。 |
+| 会话删除与合并 | `/session-delete`（`/sd`、`/sdel`）经确认后删除选中的会话；若选中当前会话，先开新会话，切换被否决则保留原文件。`/session-delete-all`（`/sda`、`/sdel-all`）保留当前会话，确认后永久删除当前会话目录中列出的其他会话文件。`/session-merge`（`/sm`、`/merge`）合并对话转录并请求摘要；`/sm raw` 只合并转录。 |
 | [模型归属](extensions/model-attribution.ts) | 在请求副本中标出早先回复的 provider/model，不往旧记录补写标签；若模型在新回复开头复述标签，会清除该前缀。 |
 | [MCP 适配器](extensions/mcp-adapter.ts) / [图片生成](extensions/image-gen) | `/mcp-adapter list`、`/imagine list`；[原生与旧配置如何共存](#mcp-和图片配置)。 |
 | [Flow](extensions/flow) / [回复表单](extensions/reply-form) | [固定步骤与端口](#flow-固定流程)：`/flow`、`/action`、`flow_guide`；[需要用户决定时](#回复表单)：`ask_form`。 |
@@ -48,10 +48,10 @@ pi -e git:github.com/atom-l/pi-ldk            # 仅本次试用，不改 setting
 
 代理默认不重试；显式 `retries` 也只对服务端声明只读且非破坏性的工具生效。改适配器配置用 `/mcp-adapter reload`；改原生配置用 `/reload`。
 
-**图片：** `/imagine [提示词]` 按可用模型和配置显示选择器；用 `model=provider/id`、`size=1024x1024`、`n=2` 跳过相应选择，`out=目录` 指定输出。`/imagine list`（或 `/imagine models`）列出模型和首选后端。模型用 `generate_image`，编辑已有图片用 `referenceImages`；两个入口都返回实际文件路径，不需要 Code Mode。
+**图片：** `/imagine [提示词]` 按可用模型和配置显示选择器；用 `model=provider/id`、`size=尺寸`、`n=张数` 显式指定参数，`out=目录` 指定输出。`/imagine list`（或 `/imagine models`）列出模型和首选后端。模型用 `generate_image`，编辑已有图片用 `referenceImages`；两个入口都返回实际文件路径，不需要 Code Mode。
 
 - Pi registry 中凭证可用的 `image` 模型无需 `imageGeneration: true`；旧网关、`imageGeneration` 和 `PI_IMAGE_GEN_MODEL` 仍可用。不同提供商模型重名时写完整 `provider/model-id`。项目模型配置只在受信项目读取，不自动改写配置。
-- 默认尺寸、单张优先原生；显式设置的旧传输仍可使用。Pi 1.6.1 的标准图片接口仅支持默认尺寸和单张，指定尺寸或多张需同名兼容配置。已知不支持的组合在生成前报错；旧生成 POST 不跟随重定向，原生失败不换后端重发。
+- 默认单张优先原生。Pi 1.7.0 的原生 OpenRouter / Radius 图片模型可用 `size=2K` 等分辨率档位（以模型支持为准）；`1024x1024` 等像素尺寸和多张仍用旧 `imageGeneration` 配置，不猜测换算，不把一次多张拆成多次请求。保留已配置的旧传输；旧生成 POST 不跟随重定向，原生失败不换后端重发。
 - 默认写 `generated-images/`。相对输出目录不能含 `..`；可用绝对路径。Windows 可用完整盘符（如 `/imagine out="D:\My Pictures\成品" 雪山`）或标准 UNC 路径，不用 `D:成品`。同名文件不覆盖；文件名可能经清理，以返回路径为准。
 
 <!-- ldk:flow-guide:start -->
@@ -67,7 +67,7 @@ Flow 是按显式步骤、端口和激活条件执行的图，不是 Skill。试
 - **手动恢复**：成功时会给出归档文件的完整路径，位于同一配置根的 `ldk-flow/trash/flows/` 下。在没有同名活动定义时，将该 JSON 按**原文件名**放回 `ldk-flow/flows/` 即可；如果该名称已重新使用，不要覆盖。归档不会阻止后来显式创建同名的新定义。保存和归档会检查同名写入冲突；若异常退出后一直提示 `Flow is busy`，先停止使用该配置根的所有写入进程，再移除报错指向的空锁目录，不要清理定义或回收文件。
 - 工作台用 `↑` / `↓` 或全屏单击选节点，`Enter` 看详情，`m` 打开菜单；`a` 添加、`e` 改属性、`l` 连线、`x` 断线、`c` 管理本流程的 Action。宽窗图文并排；窄窗折行或线路交叉时，`↳` 标目标、`↰` 标来源。`s` 或 `Ctrl+S` 保存；校验失败保留草稿，不静默覆盖外部修改。
 - 节点 `use` 可引用 `builtin:`、`global:`、`local:`（本 Flow 的 `actions`），或内联匿名 Action。自定义 Action 用 `extends` 继承；全局不能引用局部。重写 `inputs` 或 `outputs` 时替换整张端口表。多个节点复用同一定义，各自执行，不共享状态。
-- 首次访问定义时，宿主工作目录若已有 `.pi/` 就用它，否则用 `getAgentDir()`（支持 `PI_CODING_AGENT_DIR`，默认 `~/.pi/agent`）。本会话固定该根，`/reload` 重选。`ldk-flow/flows/`、`ldk-flow/actions/` 存 JSON，文件名是名称的 UTF-8 十六进制编码。定义不跨根合并，不随 `/wd` 或终端 `cd` 移动。
+- 首次访问定义时，宿主工作目录若已有 `.pi/` 就用它，否则用 `getAgentDir()`（支持 Pi 1.7 的 `--agent-dir` 或 `PI_CODING_AGENT_DIR`，默认 `~/.pi/agent`）。本会话固定该根，`/reload` 重选。`ldk-flow/flows/`、`ldk-flow/actions/` 存 JSON，文件名是名称的 UTF-8 十六进制编码。定义不跨根合并，不随 `/wd` 或终端 `cd` 移动。
 
 ### 消息和连线
 

@@ -1,5 +1,5 @@
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
-import type { ImageApi, ImageModel, ImagesInputContent } from '@earendil-works/pi-ai';
+import { PI_AI_VERSION, type ImageApi, type ImageModel, type ImagesInputContent } from '@earendil-works/pi-ai';
 import { resolveOutputDir } from './paths.ts';
 import { applyPromptTemplate, downloadImage, formatBytes, generateLegacy, loadImageModels, resolveReferenceImage, saveImages, selectModel, type GenerateOptions, type GenerateResult, type ImageModelEntry, type RawImage } from './core.ts';
 
@@ -42,16 +42,28 @@ export async function generate(ctx: ExtensionContext, opts: GenerateOptions, cho
   const selection = selectModel(choices ?? await catalog(ctx), opts.modelKey, opts.env);
   if (!selection.entry) throw new Error(selection.error);
   const entry = selection.entry as Choice, model = entry.native;
-  const special = opts.size || (opts.count !== undefined && opts.count !== 1) ||
-    (opts.referenceImages?.length && model && !model.input.includes('image'));
+  const unsupportedRefs = opts.referenceImages?.length && model && !model.input.includes('image');
   // Choose exactly once before any request. A provider error may already have
   // consumed credits; do not retry the operation on another backend.
   if (opts.count !== undefined && (!Number.isInteger(opts.count) || opts.count < 1 || opts.count > (entry.legacy ? entry.gen.maxImages ?? 4 : 1))) {
     throw new Error(`Requested count is not supported by ${entry.key} (max ${entry.legacy ? entry.gen.maxImages ?? 4 : 1})`);
   }
-  if (entry.legacy && (!model || customTransport(entry) || special)) return generateLegacy(opts,entry);
+  if (entry.legacy && (!model || customTransport(entry) || opts.size !== undefined || (opts.count ?? 1) !== 1 || unsupportedRefs)) {
+    return generateLegacy(opts,entry);
+  }
   if (!model) throw new Error(`Image model ${entry.key} is unavailable`);
-  if (special) throw new Error('原生图片接口仅支持默认尺寸、一次单张；参考图需要支持图片输入的模型。若需自定义参数，请配置旧 imageGeneration 后端。');
+  if (unsupportedRefs) throw new Error('参考图需要支持图片输入的模型，或配置旧 imageGeneration 后端。');
+  if (opts.size !== undefined) {
+    // 1.6 accepts unknown options without serializing them. Do not probe by generating.
+    const [major, minor] = PI_AI_VERSION.split('.').map(Number);
+    if (!(major > 1 || (major === 1 && minor >= 7)) || !['openrouter-images', 'pi-image'].includes(model.api)) {
+      throw new Error('此原生接口仅支持默认尺寸。指定 size 需要 Pi 1.7+ 的 openrouter-images / pi-image，或旧 imageGeneration 配置。');
+    }
+    // Forward the provider's resolution token verbatim, never reinterpret legacy WxH.
+    if (!/^[a-z\d][a-z\d._-]*$/i.test(opts.size) || /\d[x×]\d/i.test(opts.size)) {
+      throw new Error('原生 size 需要供应商支持的分辨率词（如 1K、2K、4K）。像素尺寸（如 1024x1024）需要旧 imageGeneration 配置。');
+    }
+  }
   const outputDir=resolveOutputDir(opts.cwd, opts.outputDir ?? entry.gen.outputDir ?? 'generated-images');
   const timeout=AbortSignal.timeout(entry.gen.timeoutMs ?? 300000);
   const signal=opts.signal ? AbortSignal.any([opts.signal,timeout]) : timeout;
@@ -69,7 +81,7 @@ export async function generate(ctx: ExtensionContext, opts: GenerateOptions, cho
   }
   signal.throwIfAborted();
   opts.onProgress?.(`Using ${entry.key} to generate 1 image (Pi registry)...`);
-  const result=await ctx.modelRegistry.generateImages(model,{input},{signal,maxRetries:0});
+  const result=await ctx.modelRegistry.generateImages(model,{input},{signal,maxRetries:0,...(opts.size !== undefined ? {size:opts.size} : {})});
   signal.throwIfAborted();
   if (result.stopReason!=='stop') throw new Error(result.errorMessage || `Image request ${result.stopReason}`);
   const raw: RawImage[]=result.output.flatMap(b=>b.type==='image'?[{kind:'b64' as const,data:b.data,mimeType:b.mimeType}]:[]);

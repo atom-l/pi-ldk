@@ -1,6 +1,6 @@
 {
   "name": "ldk",
-  "version": "0.22.0",
+  "version": "0.23.0",
   "description": "LDK — a PI package bundling custom extensions (session commands, model attribution, MCP adapter, image generation, embedded terminal, session working directory, styled footer, session agents, named flows and actions, interactive reply forms).",
   "keywords": [
     "pi-package"
@@ -29,6 +29,13 @@
   },
   "dependencies": {
     "iconv-lite": "^0.7.3"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "1.7.0",
+    "@earendil-works/pi-ai": "1.7.0",
+    "@earendil-works/pi-coding-agent": "1.7.0",
+    "@earendil-works/pi-tui": "1.7.0",
+    "typebox": "1.3.27"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

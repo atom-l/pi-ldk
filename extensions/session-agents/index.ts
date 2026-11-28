@@ -2564,34 +2564,26 @@ export default function (pi: ExtensionAPI) {
 
 	function parseSynthesis(text: string): { result: string; extras: string; insights: { kind: InsightKind; text: string }[] } {
 		const lines = text.split("\n");
-		let resultStart = -1;
-		let extrasStart = -1;
-		let insightsStart = -1;
+		let resultHeading = -1;
+		let extrasHeading = -1;
+		let insightsHeading = -1;
 		for (let i = 0; i < lines.length; i++) {
 			const match = lines[i].match(/^#{1,3}\s*(\S.*)$/);
 			if (!match) continue;
 			const title = match[1].trim().toLowerCase();
-			if (resultStart < 0 && /^(result|结果)/.test(title)) resultStart = i + 1;
-			else if (extrasStart < 0 && /^(extras?|额外信息|附加信息)/.test(title)) extrasStart = i + 1;
-			else if (insightsStart < 0 && /^(insights?|经验清单|经验记录)/.test(title)) insightsStart = i + 1;
+			if (resultHeading < 0 && /^(result|结果)/.test(title)) resultHeading = i;
+			else if (extrasHeading < 0 && /^(extras?|额外信息|附加信息)/.test(title)) extrasHeading = i;
+			else if (insightsHeading < 0 && /^(insights?|经验清单|经验记录)/.test(title)) insightsHeading = i;
 		}
 
-		const slice = (from: number, to: number): string => lines.slice(from, to).join("\n").trim();
-		let result: string;
-		let extras = "";
-		if (resultStart >= 0) {
-			const resultEnd =
-				[extrasStart, insightsStart, lines.length].filter((index) => index > resultStart).sort((a, b) => a - b)[0] ?? lines.length;
-			result = slice(resultStart, resultEnd);
-			if (extrasStart >= 0) {
-				const extrasEnd = insightsStart > extrasStart ? insightsStart : lines.length;
-				extras = slice(extrasStart, extrasEnd);
-			}
-		} else {
-			// 模型没按标题格式输出:整个文本当作结果。
-			result = text.trim();
-		}
-		if (!result) result = text.trim();
+		const headings = [resultHeading, extrasHeading, insightsHeading];
+		const section = (heading: number) => {
+			const end = Math.min(lines.length, ...headings.filter((index) => index > heading));
+			return lines.slice(heading + 1, end).join("\n").trim();
+		};
+		// For unstructured replies keep the existing whole-text fallback. An explicitly empty section stays empty.
+		const result = resultHeading < 0 ? text.trim() : section(resultHeading);
+		const extras = resultHeading >= 0 && extrasHeading >= 0 ? section(extrasHeading) : "";
 
 		const insights: { kind: InsightKind; text: string }[] = [];
 		const blocks = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)];
