@@ -31,7 +31,7 @@ type Wait = {
 };
 // Only currently waiting requests participate. Never cache results or transcript entries across runs.
 const waiting = new WeakMap<Manager, Set<Wait>>();
-const ownControl = new Set(['flow_run', 'flow_continue', 'flow_status', 'flow_cancel']);
+const ownControl = new Set(['flow_run', 'flow_step', 'flow_continue', 'flow_status', 'flow_cancel']);
 const sameArgs = (a: unknown, b: unknown) => isDeepStrictEqual(a, b);
 
 // Follow IDs only as far as the anchor. Never build model context or inspect earlier messages.

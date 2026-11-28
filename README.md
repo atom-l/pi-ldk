@@ -29,7 +29,7 @@ pi -e git:github.com/atom-l/pi-ldk            # 仅本次试用，不改 setting
 | 会话删除与合并 | `/session-delete`（`/sd`、`/sdel`）经确认后删除选中的会话；若选中当前会话，先开新会话，切换被否决则保留原文件。`/session-delete-all`（`/sda`、`/sdel-all`）保留当前会话，确认后永久删除当前会话目录中列出的其他会话文件。`/session-merge`（`/sm`、`/merge`）合并对话转录并请求摘要；`/sm raw` 只合并转录。 |
 | [模型归属](extensions/model-attribution.ts) | 在请求副本中标出早先回复的 provider/model，不往旧记录补写标签；若模型在新回复开头复述标签，会清除该前缀。 |
 | [MCP 适配器](extensions/mcp-adapter.ts) / [图片生成](extensions/image-gen) | `/mcp-adapter list`、`/imagine list`；[原生与旧配置如何共存](#mcp-和图片配置)。 |
-| [Flow](extensions/flow) / [回复表单](extensions/reply-form) | [固定步骤与端口](#flow-固定流程)：`/flow`、`/action`、`flow_guide`；[需要用户决定时](#回复表单)：`ask_form`。 |
+| [Flow](extensions/flow) / [回复表单](extensions/reply-form) | [主会话状态机与旧版流程图](#flow-固定流程)：`/flow`、`/action`、`flow_guide`；[需要用户决定时](#回复表单)：`ask_form`。 |
 | [子会话](extensions/session-agents) / [工作目录](extensions/workdir.ts) | [角色协作](#子会话工作台)：`/agent-mode`、`/agent-trace`；[会话范围](#会话工作目录)：`/wd`。 |
 | [循环保护](extensions/loop-guard) / [底栏](extensions/styled-footer.ts) | [`/loopguard status`](#循环保护) 查看最近暂停原因；[底栏](#美化底栏)显示路径、用量、模型和状态。 |
 | [Markdown 编辑器](extensions/markdown-editor) / [嵌入终端](extensions/terminal) | [`/md`](#markdown-编辑模式) 切换输入模式；[`/term`](#嵌入终端) 打开常驻 shell。 |
@@ -58,14 +58,37 @@ pi -e git:github.com/atom-l/pi-ldk            # 仅本次试用，不改 setting
 
 ## Flow 固定流程
 
-Flow 是按显式步骤、端口和激活条件执行的图，不是 Skill。试用：`/flow new 兼容性检查` → 保存默认的 `start → end` → 让模型调用 `flow_run {"name":"兼容性检查"}`。两个节点只传递 `null` 信号，不额外调用模型。编写新流程前，模型可用 `flow_guide` 按需读取本节；启动会话或运行流程不自动注入手册。
+**新 Flow 是当前主会话的状态机。** 它保存进度并提醒主模型当前该做什么，不另开会话、不运行 Action 模型，也不自动沿图执行。试用：`/flow new 兼容性检查` → 保存 → `/flow start 兼容性检查`，然后在当前聊天中开始工作。旧版端口图继续使用原执行器，不会自动转换。`flow_guide` 按需返回本节。
+
+### 编写主会话状态机
+
+`mode:"state"` 明确使用新语义。`context` 是作者提供、各步共用的背景（可省略）；`start` 指定起点。`actions` 每项是一个状态：`instruction` 告诉主模型在本步做什么，`exits` 写出各个直接后继和离开条件。也可以用 `use:"全局 Action 精确名"` 代替 `instruction`，引用通过 `/action new` 或 `flow_define` 保存的 `{"mode":"state","instruction":"……"}`；出口仍归当前 Flow。两种格式不能以同名保存互相覆盖。状态 ID 必须唯一；每个状态都须从起点可达，并至少保留一条最终通往完成出口的路径。
+
+```json
+{
+  "mode":"state", "name":"方案评审", "context":"先和用户对齐范围，再实施具体方案。", "start":"讨论",
+  "actions":{
+    "讨论":{"instruction":"澄清需求；如信息不足，继续对话。","exits":[
+      {"to":"调研","when":"需要补充证据"},
+      {"to":"实施","when":"已有可供定稿的具体方案","confirm":true}]},
+    "调研":{"instruction":"核实待定事项，将结论带回讨论。","exits":[{"to":"讨论","when":"已查到证据或明确了局限"}]},
+    "实施":{"instruction":"只落实此次获批的方案并验证。","exits":[{"to":null,"when":"约定工作和验收已完成"}]}
+  }
+}
+```
+
+- **启动与工作。** `flow_run {"name":"方案评审"}`（不要传 `input`）或 `/flow start 方案评审` 只进入起点。启动时冻结定义和引用的指令。本分支一次只有一个活动状态机；主模型在当前聊天中工作，可停留多轮，不需反复启动、假装流转或把聊天复制进定义。新一轮会提示活动状态；同轮以最近的工具回执为准。工具权限不变。背景、指令和获批方案会进入会话记录，不要写入凭证。
+- **推进一条边。** `flow_step` 传 `id`、`revision`、`from`（上一次回执的 `current`）、`to` 和 `reason`。程序校验实例、版本、当前状态和直接后继；普通 `when` 的真假由主模型根据证据判断。无边、过期或重复的申请不能推进。可以显式回退或自环；`to:null` 是需要申请的完成出口，不是进入节点后自动结束。单状态不支持同时激活多条边。
+- **需要用户确认的出口。** 对 `confirm:true` 须再传 `proposal`（本次具体方案全文）。只有在 Pi 的 TUI / RPC 对话框中明确批准，本次转换才生效；取消、Esc、无交互界面和普通聊天均不是批准。方案修改后须提交新提议。审批约束的是**流程进度**，不是文件或工具权限；不要在受保护步骤获批前先做工作。
+- **查看与结束。** `flow_status` 或 `/flow status [id]` 查看本分支；`flow_cancel` 或 `/flow cancel id` 放弃进度，不撤销已做的工作。重新打开同一已保存会话会恢复进度；`/tree` 按所在分支回放，新建或 fork 到另一会话不会接管原实例。无持久会话（如 `--no-session`）不能跨进程恢复。关掉待确认的窗口不会留下可重用的批准。
 
 ### 定义与编辑
 
 - `/flow` 管理命名流程，`/action` 管理全局 Action。均支持 `list`、`view 名称`（只读）、`new 名称`、`edit 名称`、`json 名称`（原始 JSON）。模型用 `flow_inspect` 时，省略 `name` 或传 `"name":""` 列出名称，传清单中的完整名称读取定义。`flow_define` 校验保存，不执行。
 - **移除 Flow**：`/flow delete 名称`（省略名称则从列表选择），或由模型调用 `flow_delete {"name":"完整名称"}`。两者都先显示名称与当前配置根，默认取消；只有用户选「移到回收目录」才生效。不会物理删除定义。归档后它不再出现在清单，也不能按名查看或新启动；已有运行按原快照继续，历史和全局 Action 保留。没有批量或免确认模式。
 - **手动恢复**：成功时会给出归档文件的完整路径，位于同一配置根的 `ldk-flow/trash/flows/` 下。在没有同名活动定义时，将该 JSON 按**原文件名**放回 `ldk-flow/flows/` 即可；如果该名称已重新使用，不要覆盖。归档不会阻止后来显式创建同名的新定义。保存和归档会检查同名写入冲突；若异常退出后一直提示 `Flow is busy`，先停止使用该配置根的所有写入进程，再移除报错指向的空锁目录，不要清理定义或回收文件。
-- 工作台用 `↑` / `↓` 或全屏单击选节点，`Enter` 看详情，`m` 打开菜单；`a` 添加、`e` 改属性、`l` 连线、`x` 断线、`c` 管理本流程的 Action。宽窗图文并排；窄窗折行或线路交叉时，`↳` 标目标、`↰` 标来源。`s` 或 `Ctrl+S` 保存；校验失败保留草稿，不静默覆盖外部修改。
+- `/flow new`、`/action new` 默认编辑状态机和状态 Action；`new-graph` 明确新建旧版端口图或其 Action。编辑已有名称按原格式打开。以下有关端口、模板、并行和关口的说明**只适用于旧版图**。
+- 旧图工作台用 `↑` / `↓` 或全屏单击选节点，`Enter` 看详情，`m` 打开菜单；`a` 添加、`e` 改属性、`l` 连线、`x` 断线、`c` 管理本流程的 Action。宽窗图文并排；窄窗折行或线路交叉时，`↳` 标目标、`↰` 标来源。`s` 或 `Ctrl+S` 保存；校验失败保留草稿，不静默覆盖外部修改。
 - 节点 `use` 可引用 `builtin:`、`global:`、`local:`（本 Flow 的 `actions`），或内联匿名 Action。自定义 Action 用 `extends` 继承；全局不能引用局部。重写 `inputs` 或 `outputs` 时替换整张端口表。多个节点复用同一定义，各自执行，不共享状态。
 - 首次访问定义时，宿主工作目录若已有 `.pi/` 就用它，否则用 `getAgentDir()`（支持 Pi 1.7 的 `--agent-dir` 或 `PI_CODING_AGENT_DIR`，默认 `~/.pi/agent`）。本会话固定该根，`/reload` 重选。`ldk-flow/flows/`、`ldk-flow/actions/` 存 JSON，文件名是名称的 UTF-8 十六进制编码。定义不跨根合并，不随 `/wd` 或终端 `cd` 移动。
 
@@ -103,7 +126,7 @@ Flow 是按显式步骤、端口和激活条件执行的图，不是 Skill。试
 
 快照以 **join 输入口名**为键；每条记录有 `status`，成功含 `outputs`，失败含 `error`。默认输出及 join 模板收到的输入均为 `{out:{type:"object",value:快照}}`。迟到结果记日志，不修改快照。
 
-### 可运行示例：两路回执，任意一路结束即可推进
+### 旧图示例：两路回执，任意一路结束即可推进
 
 将以下 JSON 粘贴到 `/flow json 并行回执` 并保存；或调用 `flow_define`，设 `kind:"flow"`、`name:"并行回执"`、`definition` 为下列对象。再调用 `flow_run {"name":"并行回执"}`。两个 worker 各自调用模型，终点只收到先结束那一路的记录。
 

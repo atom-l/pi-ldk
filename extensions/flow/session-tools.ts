@@ -17,7 +17,7 @@ type Execute = (signal: AbortSignal) => Promise<Outcome>;
 
 /** Only a live outer ExtensionToolContext can execute a nested tool. Never copy execute
  * or prepareArguments from the registry; this catalog only contains declarations. */
-const control = new Set(['flow_run', 'flow_continue', 'flow_cancel', 'flow_status']);
+const control = new Set(['flow_run', 'flow_step', 'flow_continue', 'flow_cancel', 'flow_status']);
 
 export function actionToolset(
 	ctx: ExtensionContext,

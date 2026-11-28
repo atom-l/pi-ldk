@@ -17,7 +17,8 @@ import {
 } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { getAgentDir, type ExtensionContext } from '@earendil-works/pi-coding-agent';
-import type { Action, Flow } from './contract.ts';
+import type { Action } from './contract.ts';
+import { isStateDefinition } from './state-contract.ts';
 
 type Kind = 'flow' | 'action';
 const limit = 4 * 1024 * 1024;
@@ -114,11 +115,12 @@ function revision(path: string, { stat, bytes } = readBytes(path)): string {
 		.update(bytes)
 		.digest('hex');
 }
-export function readFlowSnapshot(root: string, name: string): { definition: Flow; revision: string } {
-	const path = existingPath(root, 'flow', name),
+export function readSnapshot(root: string, kind: Kind, name: string): { definition: unknown; revision: string } {
+	const path = existingPath(root, kind, name),
 		file = readBytes(path);
 	return { definition: JSON.parse(file.bytes.toString('utf8')), revision: revision(path, file) };
 }
+export const readFlowSnapshot = (root: string, name: string) => readSnapshot(root, 'flow', name);
 export function flowRevision(root: string, name: string): string {
 	return revision(existingPath(root, 'flow', name));
 }
@@ -158,13 +160,17 @@ export function archiveFlow(root: string, name: string, expectedRevision: string
 		return archived;
 	});
 }
-/** Flow only: undefined replaces unconditionally, null creates only, a token edits only that revision. */
+// The original helper's fifth argument applies to Flows only.
 export function saveDef(root: string, kind: Kind, name: string, value: unknown, expectedFlowRevision?: string | null): void {
+	saveSnapshot(root, kind, name, value, kind === 'flow' ? expectedFlowRevision : undefined);
+}
+/** Within one format: undefined creates/replaces, null creates only, a token edits only that revision. */
+export function saveSnapshot(root: string, kind: Kind, name: string, value: unknown, expectedRevision?: string | null): void {
 	const file = filename(name),
 		json = JSON.stringify(value, null, 2);
 	if (json === undefined || Buffer.byteLength(json) + 1 > limit)
 		throw new Error('Invalid definition or definition exceeds 4 MiB');
-	const dir = area(root, kind, kind !== 'flow' || expectedFlowRevision == null);
+	const dir = area(root, kind, expectedRevision == null);
 	const conflict = () => new Error(`Flow changed; reopen before saving: ${name}`);
 	if (!dir) throw conflict();
 	const path = join(dir, file),
@@ -172,9 +178,12 @@ export function saveDef(root: string, kind: Kind, name: string, value: unknown, 
 	const replace = () => {
 		const dest = lstatSync(path, { throwIfNoEntry: false });
 		if (dest && !dest.isFile()) throw new Error(`Not a regular definition: ${path}`);
-		if (kind === 'flow' && expectedFlowRevision !== undefined) {
-			const matches = expectedFlowRevision === null ? !dest : dest && revision(path) === expectedFlowRevision;
-			if (!matches) throw conflict();
+		if (dest && expectedRevision === null) throw conflict();
+		const previous = dest ? readBytes(path) : undefined;
+		if (typeof expectedRevision === 'string' && (!previous || revision(path, previous) !== expectedRevision)) throw conflict();
+		// Check under the same lock as rename: concurrent authors must not silently switch engines.
+		if (previous && isStateDefinition(JSON.parse(previous.bytes.toString('utf8'))) !== isStateDefinition(value)) {
+			throw new Error(`Cannot replace ${kind} with a different Flow format: ${name}. Use a new name.`);
 		}
 		renameSync(tmp, path);
 	};
@@ -186,8 +195,7 @@ export function saveDef(root: string, kind: Kind, name: string, value: unknown, 
 		} finally {
 			closeSync(fd);
 		}
-		if (kind === 'flow') withFlowLock(path, replace);
-		else replace();
+		withFlowLock(path, replace);
 	} finally {
 		try {
 			unlinkSync(tmp);
@@ -197,5 +205,8 @@ export function saveDef(root: string, kind: Kind, name: string, value: unknown, 
 	}
 }
 export function globalsFor(root: string): Record<string, Action> {
-	return Object.fromEntries(listDefs(root, 'action').map((name) => [name, readDef(root, 'action', name) as Action]));
+	return Object.fromEntries(listDefs(root, 'action').flatMap((name) => {
+		const action = readDef(root, 'action', name);
+		return isStateDefinition(action) ? [] : [[name, action as Action]];
+	}));
 }

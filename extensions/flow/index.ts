@@ -2,7 +2,10 @@ import { readFileSync } from 'node:fs';
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { compile, validateAction, type Action, type Flow } from './contract.ts';
-import { archiveFlow, flowRevision, globalsFor, listDefs, readDef, readFlowSnapshot, rootFor, saveDef } from './store.ts';
+import { archiveFlow, flowRevision, globalsFor, listDefs, readDef, readSnapshot, rootFor, saveSnapshot } from './store.ts';
+import { compileState, isStateDefinition, validateStateAction } from './state-contract.ts';
+import { stateBook } from './state-runtime.ts';
+import { stateWorkbench } from './state-workbench.ts';
 import { runBook } from './runs.ts';
 import { clean, diagramFrom } from './graph-lines.ts';
 import { flowWorkbench } from './workbench.ts';
@@ -42,7 +45,14 @@ export function extractFlowGuide(markdown: string): string {
 	return guide;
 }
 
-function starter(kind: Kind, name: string): Action | Flow {
+function starter(kind: Kind, name: string, legacy: boolean): unknown {
+	if (!legacy) {
+		const instruction = '在主会话中完成约定的工作，并核对结果。';
+		return kind === 'action' ? { mode: 'state', instruction } : {
+			mode: 'state', name, context: '', start: '工作',
+			actions: { 工作: { instruction, exits: [{ to: null, when: '本次约定的工作已完成。' }] } },
+		};
+	}
 	if (kind === 'action') return { extends: 'builtin:action', template: '将 in 消息原样返回到 out 端口。' };
 	return {
 		name,
@@ -50,15 +60,22 @@ function starter(kind: Kind, name: string): Action | Flow {
 		edges: [{ from: ['start', 'out'], to: ['end', 'in'] }],
 	};
 }
-function put(root: string, kind: Kind, name: string, value: unknown, expectedFlowRevision?: string | null) {
+function statePlan(root: string, name: string, value: unknown) {
+	const plan = compileState(value, (ref) => readDef(root, 'action', ref));
+	if (plan.name !== name) throw new Error('State Flow.name must match its stored name.');
+	return plan;
+}
+function put(root: string, kind: Kind, name: string, value: unknown, expectedRevision?: string | null) {
 	if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Definition must be a JSON object.');
-	const globals = globalsFor(root);
+	const state = isStateDefinition(value);
 	if (kind === 'flow') {
 		if ((value as Flow).name !== name) throw new Error('Flow.name must match the name being saved.');
-		compile(value, globals);
-	} else validateAction(name, value as Action, { ...globals, [name]: value as Action });
-	saveDef(root, kind, name, value, expectedFlowRevision);
-	return { root, kind, name, saved: true };
+		if (state) statePlan(root, name, value);
+		else compile(value, globalsFor(root));
+	} else if (state) validateStateAction(value);
+	else validateAction(name, value as Action, { ...globalsFor(root), [name]: value as Action });
+	saveSnapshot(root, kind, name, value, expectedRevision);
+	return { root, kind, name, saved: true, ...(state ? { mode: 'state' } : {}) };
 }
 
 /** Explicit raw mode, also used by RPC clients that only provide Pi's basic editor. */
@@ -88,6 +105,11 @@ async function jsonEditor(
 
 export default function flowExtension(pi: ExtensionAPI) {
 	const runs = runBook(pi);
+	const states = stateBook(pi);
+	const listRuns = (ctx: ExtensionContext) => [
+		...(runs.inspect(ctx) as { id: string; name: string; phase: string }[]), ...states.inspect(ctx),
+	];
+	const cancelRun = (ctx: ExtensionContext, id: string) => states.owns(ctx, id) ? states.cancel(ctx, id) : runs.cancel(id);
 	let pinnedRoot: string | undefined;
 	let epoch = 0;
 	let scope = new AbortController();
@@ -109,7 +131,7 @@ export default function flowExtension(pi: ExtensionAPI) {
 		name: 'flow_guide',
 		label: 'Flow: definition guide',
 		description:
-			'Get the Flow/Action authoring contract, builtin port defaults, typed messages, fork/join policies and a runnable example. Read before authoring a new graph.',
+			'Read before authoring a Flow or Action. Includes the main-session state machine contract and example, and a separate compatibility guide for legacy port graphs.',
 		parameters: Type.Object({}),
 		execute: async () => text(extractFlowGuide(readFileSync(new URL('../../README.md', import.meta.url), 'utf8'))),
 	});
@@ -141,7 +163,7 @@ export default function flowExtension(pi: ExtensionAPI) {
 		renderCall: toolHeading('保存定义'),
 		renderResult: presentDefinition,
 		description:
-			'Create or replace a named Flow or global Action. Pass the complete JSON definition (see flow_guide). Flow-local actions live in flow.actions; inline node definitions are anonymous. Validation and save do not execute anything.',
+			'Save a complete named Flow or global Action. Use mode:"state" for a workflow driven by the current conversation. Read flow_guide for the schema. Saving never executes work, converts formats or changes a running snapshot.',
 		parameters: Type.Object({
 			kind: kindParam,
 			name: nameParam,
@@ -153,7 +175,7 @@ export default function flowExtension(pi: ExtensionAPI) {
 		execute: async (_id, p, _s, _u, ctx) =>
 			toolText(
 				put(storage(ctx), p.kind, p.name, p.definition),
-				p.kind === 'flow' ? { diagram: diagramFrom(p.definition as Flow) } : {},
+				p.kind === 'flow' && !isStateDefinition(p.definition) ? { diagram: diagramFrom(p.definition as Flow) } : {},
 			),
 	});
 	function requireDeleteUI(ctx: ExtensionContext) {
@@ -203,19 +225,25 @@ export default function flowExtension(pi: ExtensionAPI) {
 		renderResult: renderRun,
 		exposure: 'model-only',
 		description:
-			'Run a named flow with a fixed snapshot of its actions. Input keys are START OUTPUT port names, values are typed {type,value} messages. Returns the end result or a pending human gate; do not restart a waiting run. Use flow_status for progress and late results.',
+			'Start a named Flow. A state Flow only enters its first Action; do the work in this conversation, stay there as long as needed, then use flow_step for one declared exit. Do not restart an active Flow. Only legacy port graphs execute workers and take typed input.',
 		parameters: Type.Object({
 			name: nameParam,
 			input: Type.Optional(
 				Type.Object(
 					{},
-					{ additionalProperties: true, description: 'Initial port messages. Omit for default null start.' },
+					{ additionalProperties: true, description: 'Legacy port graphs only: initial port messages. Omit this field entirely for a state Flow.' },
 				),
 			),
 		}),
 		execute: async (_id, p, s, update, ctx) => {
 			const root = storage(ctx);
-			const graph = compile(readDef(root, 'flow', p.name), globalsFor(root));
+			const definition = readDef(root, 'flow', p.name);
+			if (isStateDefinition(definition)) {
+				if (p.input !== undefined) throw new Error('State Flows use the main conversation, not legacy port input.');
+				(s ?? ctx.signal)?.throwIfAborted();
+				return toolText(states.start(ctx, statePlan(root, p.name, definition)));
+			}
+			const graph = compile(definition, globalsFor(root));
 			const progress =
 				ctx.mode === 'tui' && update
 					? (frame: RunFrame) => update(toolText(`${frame.name} · ${frame.phase}`, { frame }))
@@ -227,6 +255,17 @@ export default function flowExtension(pi: ExtensionAPI) {
 				result.phase === 'failed' || result.phase === 'cancelled',
 			);
 		},
+	});
+	pi.registerTool({
+		name: 'flow_step', label: 'Flow: advance one state', exposure: 'model-only', executionMode: 'sequential',
+		renderCall: toolHeading('申请流转'), renderResult: renderRun,
+		description: 'Propose exactly one direct exit of the current state Flow. Use the id, revision and from returned by flow_run or flow_status. A null target finishes only on a declared completion exit. Explain the evidence in reason. A protected exit requires the full concrete proposal for this transition. Never infer approval from chat or retry a declined proposal unprompted.',
+		parameters: Type.Object({
+			id: Type.String(), revision: Type.Integer({ minimum: 0 }), from: Type.String(),
+			to: Type.Union([Type.String(), Type.Null()]), reason: Type.String({ minLength: 1, maxLength: 4096 }),
+			proposal: Type.Optional(Type.String({ maxLength: 16384, description: 'Full, specific content to put before the user for this transition.' })),
+		}, { additionalProperties: false }),
+		execute: async (_id, p, s, _u, ctx) => toolText(await states.step(ctx, p, s ?? ctx.signal)),
 	});
 	pi.registerTool({
 		name: 'flow_continue',
@@ -243,6 +282,7 @@ export default function flowExtension(pi: ExtensionAPI) {
 			toolCallId: Type.Optional(Type.String()),
 		}),
 		execute: async (callId, p, s, update, ctx) => {
+			if (states.owns(ctx, p.id)) throw new Error('Use flow_step for a state Flow; flow_continue is for legacy port graphs.');
 			const tick =
 				ctx.mode === 'tui' && update
 					? (frame: RunFrame) => update(toolText(`${frame.name} · ${frame.phase}`, { frame }))
@@ -263,10 +303,13 @@ export default function flowExtension(pi: ExtensionAPI) {
 		renderCall: toolHeading('流程状态'),
 		renderResult: renderRun,
 		description:
-			'View run summaries in this session branch, or one run’s steps, pending human gates, final result and late worker records.',
+			'Inspect this branch’s Flow runs. Pass id to get the state Flow’s current Action, revision and legal exits, or a legacy run’s journal.',
 		parameters: Type.Object({ id: Type.Optional(Type.String()) }),
-		execute: async (_id, p, _s, _u, ctx) =>
-			toolText(runs.inspect(ctx, p.id), p.id ? { frame: runs.views.get(p.id, false, ctx) } : {}),
+		execute: async (_id, p, _s, _u, ctx) => {
+			if (!p.id) return toolText(listRuns(ctx));
+			if (states.owns(ctx, p.id)) return toolText(states.inspect(ctx, p.id));
+			return toolText(runs.inspect(ctx, p.id), { frame: runs.views.get(p.id, false, ctx) });
+		},
 	});
 	pi.registerTool({
 		name: 'flow_cancel',
@@ -274,7 +317,7 @@ export default function flowExtension(pi: ExtensionAPI) {
 		description:
 			'Request cancellation of an active run including unfinished workers. Does not undo completed side effects.',
 		parameters: Type.Object({ id: Type.String() }),
-		execute: async (_id, p) => text(runs.cancel(p.id)),
+		execute: async (_id, p, _s, _u, ctx) => text(cancelRun(ctx, p.id)),
 	});
 
 	async function deleteCommand(ctx: ExtensionCommandContext, root: string, specified?: string) {
@@ -299,6 +342,7 @@ export default function flowExtension(pi: ExtensionAPI) {
 			show(ctx, { root, definition: v });
 			return;
 		}
+		if (isStateDefinition(v)) return stateWorkbench(ctx, kind, name, v);
 		if (kind === 'flow')
 			await flowWorkbench(ctx, v as Flow, globalsFor(root), {
 				readonly: true,
@@ -317,25 +361,21 @@ export default function flowExtension(pi: ExtensionAPI) {
 		create: boolean,
 		revision: number,
 		raw = false,
+		legacy = false,
 	) {
 		if (revision !== epoch) throw new Error('会话或分支已切换，请重新打开。');
 		if (create && listDefs(root, kind).includes(name)) throw new Error(`Already exists: ${name}`);
-		const snapshot = !create && kind === 'flow' ? readFlowSnapshot(root, name) : undefined;
-		const original = create ? undefined : snapshot ? snapshot.definition : readDef(root, kind, name);
+		const snapshot = create ? undefined : readSnapshot(root, kind, name);
 		const save = (v: unknown) => {
 			if (epoch !== revision) throw new Error('会话或分支已切换，未保存。');
-			if (kind === 'flow') {
-				// Compare under the same store lock as archiving. An old editor must not resurrect its deleted Flow.
-				put(root, kind, name, v, snapshot?.revision ?? null);
-			} else {
-				const current = listDefs(root, kind).includes(name) ? readDef(root, kind, name) : undefined;
-				if (JSON.stringify(current) !== JSON.stringify(original))
-					throw new Error('定义在编辑期间已被更改，未覆盖。请重新打开。');
-				put(root, kind, name, v);
-			}
+			put(root, kind, name, v, snapshot?.revision ?? null);
 		};
-		let draft = structuredClone(original ?? starter(kind, name));
+		let draft = structuredClone(snapshot?.definition ?? starter(kind, name, legacy));
 		if (raw || ctx.mode !== 'tui') return jsonEditor(ctx, root, kind, name, draft, save);
+		if (isStateDefinition(draft)) return stateWorkbench(ctx, kind, name, draft, (v) => {
+			if (!isStateDefinition(v)) throw new Error('状态定义必须保留 mode:"state"；旧图请使用 new-graph。');
+			save(v);
+		});
 		const globals = globalsFor(root);
 		if (kind === 'flow') return flowWorkbench(ctx, draft as Flow, globals, { readonly: false, root, save });
 		for (;;) {
@@ -364,7 +404,7 @@ export default function flowExtension(pi: ExtensionAPI) {
 		pi.registerCommand(kind, {
 			description:
 				kind === 'flow'
-					? '编辑命名流程 / 查看运行；/flow delete [名称] 移到回收目录，/flow answer <id> 回答人工关口。'
+					? '管理主会话状态机和旧版流程图；/flow start 名称 进入起点，/flow status 查看进度。'
 					: '查看、新建或编辑全局 Action；Flow 专有 Action 在 /flow 内编辑。',
 			handler: async (args, ctx) => {
 				try {
@@ -375,22 +415,29 @@ export default function flowExtension(pi: ExtensionAPI) {
 						await deleteCommand(ctx, root, arg || undefined);
 						return;
 					}
+					if (kind === 'flow' && op === 'start') {
+						const definition = readDef(root, kind, arg);
+						if (!isStateDefinition(definition)) throw new Error('该定义是旧版执行图，请用 flow_run 运行。');
+						show(ctx, states.start(ctx, statePlan(root, arg, definition)));
+						return;
+					}
 					if (kind === 'flow' && op === 'answer') {
+						if (states.owns(ctx, arg)) throw new Error('状态机由主会话使用 flow_step 申请具体流转；此命令只回答旧版关口。');
 						await runs.answer(ctx, arg);
 						return;
 					}
 					if (kind === 'flow' && op === 'cancel') {
-						ctx.ui.notify(format(runs.cancel(arg)), 'info');
+						ctx.ui.notify(format(cancelRun(ctx, arg)), 'info');
 						return;
 					}
 					if (kind === 'flow' && op === 'status') {
 						if (ctx.mode !== 'tui') {
-							show(ctx, runs.inspect(ctx, arg || undefined));
+							show(ctx, !arg ? listRuns(ctx) : states.owns(ctx, arg) ? states.inspect(ctx, arg) : runs.inspect(ctx, arg));
 							return;
 						}
 						let id = arg;
 						if (!id) {
-							const list = runs.inspect(ctx) as { id: string; name: string; phase: string }[];
+							const list = listRuns(ctx);
 							if (!list.length) {
 								ctx.ui.notify('本分支暂无运行', 'info');
 								return;
@@ -401,6 +448,10 @@ export default function flowExtension(pi: ExtensionAPI) {
 							id = list[list.length - 1 - labels.indexOf(selected)].id;
 						}
 						if (revision !== epoch) return;
+						if (states.owns(ctx, id)) {
+							show(ctx, states.inspect(ctx, id));
+							return;
+						}
 						const view = runs.views.openFull(ctx, id);
 						try {
 							await showRun(ctx, () => {
@@ -430,18 +481,18 @@ export default function flowExtension(pi: ExtensionAPI) {
 						await editDefinition(ctx, root, kind, arg, !names.includes(arg), revision, true);
 						return;
 					}
-					if (op === 'new' || op === 'edit') {
+					if (op === 'new' || op === 'new-graph' || op === 'edit') {
 						const name =
 							arg ||
-							(op === 'new'
+							(op !== 'edit'
 								? (await ctx.ui.input(`新 ${kind} 名称 · ${clean(root)}`))?.trim()
 								: await chooseName(ctx, `编辑 ${kind} · ${root}`, names));
-						if (name) await editDefinition(ctx, root, kind, name, op === 'new', revision);
+						if (name) await editDefinition(ctx, root, kind, name, op !== 'edit', revision, false, op === 'new-graph');
 						return;
 					}
 					if (op)
 						throw new Error(
-							`/${kind} [list | view 名称 | new 名称 | edit 名称 | json 名称${kind === 'flow' ? ' | delete [名称] | status [id] | answer id | cancel id' : ''}]`,
+							`/${kind} [list | view 名称 | new 名称 | new-graph 名称 | edit 名称 | json 名称${kind === 'flow' ? ' | start 名称 | delete [名称] | status [id] | answer id | cancel id' : ''}]`,
 						);
 					const choices = ['新建…', ...names.map((n, i) => `${i + 1}. 编辑：${clean(n)}`)];
 					if (kind === 'flow' && names.length) choices.push('删除 Flow…');
